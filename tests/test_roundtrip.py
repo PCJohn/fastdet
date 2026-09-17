@@ -64,15 +64,32 @@ def test_artifact_blob_matches_live_runtime(fitted: tuple[Detector, Path], tmp_p
 
 
 def test_prune_top_k(fitted: tuple[Detector, Path]) -> None:
-    """prune(top_k) keeps exactly that many ranked columns."""
+    """prune(top_k) keeps that many ranked columns, ascending, and invalidates the fit."""
     det, _images_dir = fitted
     assert det.base_names is not None
+    assert det.runtime is not None  # fitted
 
     kept = det.prune(top_k=64)
     assert kept == 64
     assert det.col_keep is not None
     assert len(det.col_keep) == 64
     assert np.all(np.diff(det.col_keep) > 0)
+
+    # Re-pruning changes the design matrix, so the fitted booster no longer
+    # matches it: the detector must refuse to score rather than mix them.
+    assert det.booster is None
+    assert det.runtime is None
+    with pytest.raises(RuntimeError, match="not fitted"):
+        det.predict_proba(np.zeros((32, 32, 3), dtype=np.uint8))
+
+
+def test_prune_before_fit_keeps_detector_usable(small_config: Config) -> None:
+    """Pruning an unfitted detector is the normal path and clears nothing."""
+    det = Detector(small_config)
+    kept = det.prune(top_k=32)
+    assert kept == 32
+    assert det.booster is None
+    assert det.config.train.top_k_features == 32
 
 
 def test_model_config_only_constructor() -> None:

@@ -106,8 +106,12 @@ class Detector:
         """Select the top-``top_k`` ranked columns from the front-end's design.
 
         Returns the number of columns kept.  ``top_k <= 0`` keeps everything.
-        Requires the full column names, available after :meth:`fit` has built
-        the training cache (or after :meth:`load`).
+
+        Column selection defines the design matrix the booster is trained on, so
+        it must happen *before* fitting.  Calling this on a fitted detector would
+        leave the kept columns and the blob's feature indices describing
+        different matrices, so it discards the fitted booster and runtime
+        instead: refit before scoring again.
         """
         top_k = self.config.train.top_k_features if top_k is None else top_k
         if self.base_names is None:
@@ -116,6 +120,11 @@ class Detector:
             self.feature_ranks = load_ranking(self.config.train.feature_ranks)
         self.col_keep = select_columns(self.base_names, self.feature_ranks, top_k)
         self.config.train.top_k_features = int(top_k)
+        if self.booster is not None or self.runtime is not None:
+            self.booster = None
+            self.runtime = None
+            self.feature_names = None
+            self.metrics.pop("pr_auc", None)
         return len(self.col_keep)
 
     def _columns_for(self, names: list[str]) -> Int64Array:
@@ -151,6 +160,8 @@ class Detector:
         print(f"[fastdet] train={len(train_pairs)} val={len(val_pairs)} images")
         train_cache = FeatureCache(train_pairs, cfg.train, "train")
         self.base_names = train_cache.base_names
+        self.booster = None  # prune() requires an unfitted detector
+        self.runtime = None
         self.prune()
 
         img_ids, local_ids, labels = sample_training_cells(
@@ -184,6 +195,12 @@ class Detector:
         if self.booster is None or self.col_keep is None or self.base_names is None:
             msg = "no fitted booster; call fit() first"
             raise RuntimeError(msg)
+        # The blob addresses features positionally in gathered order, and
+        # gather() emits columns in ascending index order, so col_keep must be
+        # strictly ascending or every split would read the wrong column.
+        if np.any(np.diff(self.col_keep) <= 0):
+            msg = "col_keep must be strictly ascending; the blob indexes columns positionally"
+            raise RuntimeError(msg)
         level_shift = [feature_level_bits(self.base_names[int(i)])[1] for i in self.col_keep]
         with tempfile.TemporaryDirectory() as tmp:
             json_path = Path(tmp) / "model.json"
@@ -193,17 +210,13 @@ class Detector:
         return build_blob(model_json, level_shift, shuffle_tables=self.config.export.shuffle_tables)
 
     # -- inference ----------------------------------------------------------
-    def predict_proba(
-        self, image: str | Path | UInt8Array, grid: int = GRID
-    ) -> NDArray[np.floating[Any]]:
-        """Per-cell positive probability for one image as a ``grid x grid`` map.
+    def design_matrix(self, image: str | Path | UInt8Array) -> NDArray[np.floating[Any]]:
+        """Kept-column features for every cell: a ``(GRID * GRID, n_features)`` matrix.
 
-        ``image`` is a path or a BGR ``uint8`` array.  The map is the model's
-        raw cell scores; resize it to the source resolution to overlay.
+        This is exactly the matrix :meth:`predict_proba` scores, in the row-major
+        layout both runtimes expect, so it is also how fixtures for the C++
+        runtime are produced.
         """
-        if self.runtime is None:
-            msg = "detector is not fitted; call fit() or load()"
-            raise RuntimeError(msg)
         if isinstance(image, (str, os.PathLike)):
             decoded = read_image(str(image))
             if decoded is None:
@@ -212,10 +225,20 @@ class Detector:
         else:
             decoded = np.asarray(image)
         level_maps, broadcast_vecs = self.extractor.extract(decoded)
-        design = self.extractor.gather(
+        return self.extractor.gather(
             level_maps, broadcast_vecs, np.arange(GRID * GRID), col_keep=self.col_keep
         )
-        return self.runtime.predict_grid(design, grid=grid)
+
+    def predict_proba(self, image: str | Path | UInt8Array) -> NDArray[np.floating[Any]]:
+        """Per-cell positive probability for one image as a ``GRID x GRID`` map.
+
+        ``image`` is a path or a BGR ``uint8`` array.  The map is the model's
+        raw cell scores; resize it to the source resolution to overlay.
+        """
+        if self.runtime is None:
+            msg = "detector is not fitted; call fit() or load()"
+            raise RuntimeError(msg)
+        return self.runtime.predict_grid(self.design_matrix(image), grid=GRID)
 
     # -- persistence --------------------------------------------------------
     def export(self, path: str | Path) -> Path:

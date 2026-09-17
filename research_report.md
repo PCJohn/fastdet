@@ -3,9 +3,12 @@
 **Project:** `imseg` (training/eval) on top of `imfeat` (single-pass CPU feature extractor)
 **Task:** per-cell text/no-text segmentation on a 64×64 grid, as an OCR region proposer
 **Period:** Sep 2026
-**Status at time of writing:** PR-AUC 0.810–0.829 depending on configuration; model inference
-3.71 ms/image single-threaded (down from ~302 ms); feature extraction 8.2 ms/image.
-**Shipped configuration (§7):** `d7 × 2400`, PR-AUC ≈ 0.811, model ≈ 5.7 ms single-threaded.
+**Status at time of writing:** PR-AUC 0.810–0.829 depending on configuration; feature
+extraction 8.2 ms/image.
+**Shipped configuration (§7):** `d7 × 2400`, PR-AUC ≈ 0.8106 (mean of 3 seeds), model ≈ 5.7 ms
+single-threaded — down from ~302 ms at the start of the inference work.
+**Cheaper measured point:** `d7 × 1200` at **3.71 ms** (1.90 traversal + 1.81 binning). The
+runtime ladder in §3.8 is reported at `d7 × 1200`; §7.1 records the trade between the two.
 
 ---
 
@@ -301,7 +304,7 @@ corrupted every tree after the first.
 | symmetric scalar | 21.1 | 0.92 | CatBoost d7×800 |
 | symmetric AVX2 no-gather | 5.83 | 0.254 | d7×800 |
 | symmetric AVX2 gather-leaf | 4.88 | 0.213 | d7×800 |
-| symmetric d7×1200, block 1024 | 5.97 | 0.173 | shipped quality config |
+| symmetric d7×1200, block 1024 | 5.97 | 0.173 | config used for the runtime ladder below |
 | + 4-bit `vpshufb` tables | 2.40 | — | `border_count=15` |
 | + nibble-packed | **1.90** | — | floor with leaves stubbed: 0.587 ms |
 
@@ -528,9 +531,9 @@ The shipped point (0.810 @ 3.71 ms) is ~81× cheaper than the best-quality point
    ignore band, is probably the right target.
 4. **Leaf lookup is the new traversal floor** (~1.3 of 1.90 ms). Int16 leaf quantization with
    integer accumulation, or fewer trees, are the remaining levers.
-5. **`d7 × 2400` measured +0.0008 vs the HGB reference at 14.7 ms predicted traversal.** On the
-   nibble substrate that is far cheaper than it was when the cheapest-tie rule selected
-   `d7 × 1200`; worth re-deciding.
+5. ~~`d7 × 2400` vs `d7 × 1200`~~ — **decided**, see §7: `d7 × 2400` ships. The quality
+   difference between the two at `border_count 15` was never measured head to head, so the
+   size of the trade is recorded as unverified in §7.1.
 
 ---
 
@@ -553,8 +556,10 @@ per-feature borders, `level_shift[]` trailer, and 16-byte `vpshufb` tables per s
 Scoring: nibble-packed colmaj matrix, `_mm256_shuffle_epi8` per depth step, gather-leaf
 accumulation, sigmoid at the end.
 
-**Expected numbers:** PR-AUC ≈ 0.811 (288-image val, `split_seed` 42); model ≈ 5.7 ms; `imfeat`
-8.2 ms; all single-threaded.
+**Expected numbers, shipped `d7 × 2400`:** PR-AUC ≈ 0.8106 (288-image val, `split_seed` 42,
+mean of 3 seeds); model ≈ 5.7 ms; `imfeat` 8.2 ms; pipeline ≈ 13.9 ms.
+**Expected numbers, cheaper `d7 × 1200`:** model 3.71 ms (1.90 traversal + 1.81 binning);
+pipeline ≈ 11.9 ms. All single-threaded.
 
 **Gates that must pass:** blob decode bit-exact vs the trainer (< 1e-5 on probabilities);
 fused/coarse binning identical to the full binner (0 mismatches); every traversal variant
@@ -583,6 +588,33 @@ re-decided in favour of the larger model. The shipped package (`fastdet`) freeze
 `d7 × 2400` beat the HGB reference in all three seeds (mean +0.0010) and was chosen over
 `d7 × 1200`. The Python and C++ runtimes were verified to agree bit-for-bit on a frozen fixture
 (scalar vs AVX2 max abs diff 0.0; decoded probabilities vs trainer < 3e-8).
+
+### 7.1 The `d7 × 1200` -> `d7 × 2400` trade, and what is still unmeasured
+
+The stated latency goal for the model was **< 5 ms single-threaded**. The shipped
+configuration is ~5.7 ms, i.e. the goal was knowingly traded away for quality. What is on
+record:
+
+| config | model ms | PR-AUC | note |
+| --- | --- | --- | --- |
+| `d7 x 1200`, `border_count 15` | **3.71** | *not measured* | the runtime ladder in §3.8 |
+| `d7 x 1200`, `border_count 254` | — | 0.8102 (seed 42) | §3.8 sweep row |
+| `d7 x 2400`, `border_count 15` | **≈ 5.7** | 0.8106 (mean of 3 seeds) | **shipped** |
+| `d7 x 2400`, `border_count 254` | — | 0.8118 (seed 42) | §3.8 sweep row |
+
+**Two measurements were never taken, so the size of the trade is unverified:**
+
+1. **`d7 x 1200` at `border_count 15`, seeds 42/43/44.** Without it, the quality bought by the
+   extra ~2 ms is only inferable from the 254-bin sweep rows (+0.0016 at seed 42), which is
+   inside the seed-to-seed spread.
+2. **`border_count` 15 vs 254 at a fixed tree count, seeds 42/43/44.** The 4-bit quantization
+   is described as quality-neutral throughout, but it was never measured against the 254-bin
+   model; the total drift from the HGB float reference (0.8110) is therefore the sum of an
+   unverified quantization term and the symmetric-tree term (mean ≈ −0.0023, §3.8).
+
+Anyone continuing this work should run both before treating `d7 x 2400` as settled. If (1)
+shows `d7 x 1200` within noise of `d7 x 2400`, the default should move back to the 3.71 ms
+configuration and the < 5 ms goal is met without a quality concession.
 
 The model is exported as a single `FDT1` container. Research scripts and the HGB path stay in
 the legacy `imseg` tree; `fastdet` holds only the training pipeline, the two runtimes, and the

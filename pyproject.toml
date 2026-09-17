@@ -89,3 +89,6 @@ ignore_missing_imports = true
 testpaths = ["tests"]
 pythonpath = ["src"]
 addopts = "-ra"
+markers = [
+    "slow: builds and runs the C++ runtime (needs a compiler and an AVX2 host)",
+]

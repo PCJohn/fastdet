@@ -6,9 +6,13 @@ model, then exports the result as **one self-contained file**. A Python runtime
 and a dependency-free C++ runtime read the same bytes and produce identical
 scores.
 
-Measured on the reference dataset: pooled validation PR-AUC ≈ 0.811; full C++
-model ≈ 5.7 ms per 64×64 image, single-threaded. What was tried, and what was
-rejected, is recorded in [`research_report.md`](research_report.md).
+Measured on the reference dataset with the default `d7 × 2400` booster: pooled
+validation PR-AUC ≈ 0.8106 (mean of three seeds); full C++ model ≈ 5.7 ms per
+64×64 image, single-threaded, on top of ≈ 8.2 ms of feature extraction. Halving
+the tree count (`Detector(n_trees=1200)`) measures 3.71 ms; the quality of that
+configuration was never measured head to head, so the size of the trade is
+open — see §7.1 of the report. What was tried, and what was rejected, is
+recorded in [`research_report.md`](research_report.md).
 
 ## Install
 
@@ -198,6 +202,11 @@ that into the pipeline. Top-512 costs no measurable PR-AUC and shrinks both the
 design matrix and the exported model. Pruning reduces model cost only: the
 front-end still computes all 996 columns, so it does not speed up `imfeat`.
 
+Column selection defines the matrix the booster is trained on, so `prune()` is a
+pre-`fit` step. Calling it on a fitted detector discards the booster and the
+runtime rather than leaving the kept columns and the blob's feature indices
+describing different matrices; refit before scoring again.
+
 ### Export and bundling
 
 [`build_blob`](src/fastdet/exporter.py#L144) reads the JSON that CatBoost writes
@@ -313,20 +322,27 @@ fastdet_score.exe model.fdt fixtures.f32 [expected.f32] [iters]
 ```
 
 `fixtures.f32` is `4 * 4096 * n_features` bytes of little-endian float32 holding
-the 64×64 cells of one image. With `expected.f32`, the program also reports the
-maximum absolute probability error.
+the 64×64 cells of one image, row-major — exactly what
+`Detector.design_matrix(image)` returns. With `expected.f32` (4096 float32, e.g.
+`Detector.predict_proba(image).reshape(-1)`), the program also reports the
+maximum absolute probability error and exits non-zero if any gate fails.
 
 ## Development
 
 ```sh
-python -m pytest          # fit, export one file, reload, score end to end
-python -m ruff check .    # full "ALL" ruleset
+python -m pytest                    # fit, export one file, reload, score end to end
+python -m pytest -m slow             # also build and gate the C++ runtime
+python -m ruff check .              # full "ALL" ruleset
 python -m black --check .
 python -m mypy --strict .
 ```
 
-The test suite fits a tiny synthetic detector, exports it, reloads it, and
-asserts the Python and C++ runtimes reproduce scores bit-for-bit.
+The default suite fits a tiny synthetic detector, exports it, reloads it, and
+asserts the reloaded model reproduces scores exactly. `tests/test_cpp_runtime.py`
+(marked `slow`) additionally compiles `cpp/fastdet_score.cpp`, feeds it the same
+artifact plus a fixture built by `Detector.design_matrix`, and fails if the C++
+scorer diverges from the Python one or if its internal binner/traversal gates
+fail. It skips when no compiler or no AVX2 host is available.
 
 ## Layout
 
@@ -336,6 +352,6 @@ fastdet/
   src/fastdet/               # config, images, features, dataset, training,
                              # exporter, artifact, runtime, metrics, detector
   src/fastdet/data/          # bundled frozen feature ranking
-  tests/                     # end-to-end round-trip tests
+  tests/                     # end-to-end round-trip + C++ runtime gate
   research_report.md         # full research log and negative results
 ```
