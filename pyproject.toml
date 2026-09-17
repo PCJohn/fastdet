@@ -1,0 +1,91 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fastdet"
+version = "0.1.0"
+description = "Fast per-cell text detection over the imfeat feature pyramid"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+dependencies = [
+    "numpy",
+    "opencv-python",
+    "imfeat",
+    "catboost",
+]
+
+[project.optional-dependencies]
+yaml = ["PyYAML"]
+dev = [
+    "pytest",
+    "ruff",
+    "black",
+    "mypy",
+    "types-PyYAML",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+fastdet = ["data/feature_ranks.json", "py.typed"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+# Full rule set, minus only rules that provably conflict with Black or with a
+# deliberate, documented design choice (see the comments next to each ignore).
+select = ["ALL"]
+ignore = [
+    "COM812",   # conflicts with Black's trailing-comma handling
+    "COM819",   # conflicts with Black's trailing-comma handling
+    "ISC001",   # conflicts with Black's implicit-string-concatenation formatting
+    "Q000",     # conflicts with Black's quote normalization
+    "Q001",     # conflicts with Black's quote normalization
+    "Q002",     # conflicts with Black's quote normalization
+    "Q003",     # conflicts with Black's quote normalization
+    "W191",     # conflicts with Black's indentation
+    "E501",     # conflicts with Black's line length (Black owns wrapping)
+    "D203",     # conflicts with D211 (no blank line before a class docstring)
+    "D213",     # conflicts with D212 (summary on the first line)
+    "CPY001",   # no per-file copyright banner in this project
+    "T201",     # progress reporting to stdout is this package's CLI contract
+    "ANN401",   # Any is unavoidable at JSON/YAML/config boundaries
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests exercise private hooks and assert on internals.
+"tests/**" = ["S101", "D103", "PLR2004", "SLF001", "ANN201"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.isort]
+known-first-party = ["fastdet"]
+
+[tool.black]
+line-length = 100
+target-version = ["py310"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+files = ["src/fastdet", "tests"]
+mypy_path = "src"
+warn_unreachable = true
+show_error_codes = true
+pretty = true
+
+[[tool.mypy.overrides]]
+module = ["cv2.*", "imfeat.*", "catboost.*", "yaml.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-ra"

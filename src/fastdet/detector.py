@@ -1,0 +1,245 @@
+"""The user-facing detector: fit, prune, predict, export, load.
+
+A :class:`Detector` owns a :class:`~fastdet.config.Config`, the front-end
+(:class:`~fastdet.features.FeatureExtractor`), and a fitted booster.  Scoring at
+inference goes through the exported single-file artifact's Python runtime, so
+``predict_proba`` and the C++ runtime consume identical bytes.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import json
+import os
+import tempfile
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+import numpy as np
+from numpy.typing import NDArray
+
+from .artifact import ModelArtifact
+from .config import Config, ModelConfig
+from .dataset import build_split, gather_training_matrix, sample_training_cells
+from .exporter import build_blob
+from .features import GRID, FeatureCache, FeatureExtractor, feature_level_bits
+from .images import read_image
+from .metrics import pooled_pr_auc, score_validation_per_image
+from .runtime import ImysModel, parse_blob
+from .training import fit_booster, load_ranking, select_columns
+
+if TYPE_CHECKING:
+    from catboost import CatBoostClassifier
+
+__all__ = ["Detector"]
+
+Int64Array = NDArray[np.int64]
+UInt8Array = NDArray[np.uint8]
+
+
+class Detector:
+    """Per-cell text detector over the frozen multi-level feature front-end.
+
+    Examples:
+        >>> det = Detector()                              # frozen defaults
+        >>> det = Detector(depth=7, n_trees=2400)         # tweak the booster
+        >>> det = Detector(config=Config.from_yaml("cfg.yaml"))
+        >>> det = Detector.from_config_file("cfg.yaml")
+        >>> det.fit("images/", "masks/")                  # doctest: +SKIP
+        >>> det.export("model.fdt")                       # doctest: +SKIP
+        >>> det = Detector.load("model.fdt")              # doctest: +SKIP
+        >>> prob = det.predict_proba("page.png")          # doctest: +SKIP
+    """
+
+    def __init__(self, config: Config | ModelConfig | None = None, **model_overrides: Any) -> None:
+        """Build a detector, optionally overriding individual model fields.
+
+        ``config`` may be a full :class:`Config` or just a :class:`ModelConfig`;
+        ``**model_overrides`` (e.g. ``depth=7``) are applied on top of it.
+        """
+        resolved = config or Config()
+        # Accept a plain ModelConfig too, so Detector(ModelConfig(depth=7)) works.
+        if isinstance(resolved, ModelConfig):
+            resolved = Config(model=resolved)
+        if model_overrides:
+            model = dataclasses.replace(resolved.model, **model_overrides)
+            resolved = dataclasses.replace(resolved, model=model)
+        self.config = resolved
+
+        self.booster: CatBoostClassifier | None = None  # when training in-process
+        self.runtime: ImysModel | None = None  # scoring engine (fitted or loaded)
+        self.col_keep: Int64Array | None = None  # kept columns into the full design
+        self.base_names: list[str] | None = None  # full (unpruned) column names
+        self.feature_names: list[str] | None = None  # kept column names
+        self.feature_ranks: dict[str, Any] | None = None
+        self.metrics: dict[str, Any] = {}
+        self.val_ids: list[str] = []
+        self._extractor: FeatureExtractor | None = None
+
+    # -- construction paths -------------------------------------------------
+    @classmethod
+    def from_config_file(cls, path: str | Path) -> Detector:
+        """Build a detector from a JSON or YAML config file."""
+        return cls(config=Config.from_file(path))
+
+    @classmethod
+    def load(cls, path: str | Path) -> Detector:
+        """Load a detector from a single-file artifact written by :meth:`export`."""
+        artifact = ModelArtifact.load(path)
+        det = cls(config=artifact.config)
+        det.runtime = parse_blob(artifact.blob)
+        det.feature_names = list(artifact.feature_names)
+        det.base_names = det.extractor.base_names
+        det.col_keep = det._columns_for(det.feature_names)
+        det.metrics = dict(artifact.metadata)
+        return det
+
+    @property
+    def extractor(self) -> FeatureExtractor:
+        """The front-end extractor for this detector's config (built once)."""
+        if self._extractor is None:
+            self._extractor = FeatureExtractor(self.config.train)
+        return self._extractor
+
+    # -- feature selection --------------------------------------------------
+    def prune(self, top_k: int | None = None) -> int:
+        """Select the top-``top_k`` ranked columns from the front-end's design.
+
+        Returns the number of columns kept.  ``top_k <= 0`` keeps everything.
+        Requires the full column names, available after :meth:`fit` has built
+        the training cache (or after :meth:`load`).
+        """
+        top_k = self.config.train.top_k_features if top_k is None else top_k
+        if self.base_names is None:
+            self.base_names = self.extractor.base_names
+        if self.feature_ranks is None:
+            self.feature_ranks = load_ranking(self.config.train.feature_ranks)
+        self.col_keep = select_columns(self.base_names, self.feature_ranks, top_k)
+        self.config.train.top_k_features = int(top_k)
+        return len(self.col_keep)
+
+    def _columns_for(self, names: list[str]) -> Int64Array:
+        """Indices of ``names`` in the extractor's canonical column order."""
+        index = {n: i for i, n in enumerate(self.extractor.base_names)}
+        missing = [n for n in names if n not in index]
+        if missing:
+            msg = (
+                f"artifact feature names do not match this config's front-end "
+                f"({len(missing)} missing, e.g. {missing[:3]})"
+            )
+            raise ValueError(msg)
+        cols = np.array([index[n] for n in names], dtype=np.int64)
+        return cols[np.argsort(cols)]
+
+    # -- training -----------------------------------------------------------
+    def fit(
+        self,
+        images_dir: str | Path,
+        masks_dir: str | Path,
+        *,
+        evaluate: bool = True,
+    ) -> Detector:
+        """Train on an images/masks directory pair.
+
+        Builds the group-aware split, caches features, prunes columns, fits the
+        symmetric booster, and (by default) records pooled validation PR-AUC.
+        """
+        images_dir, masks_dir = str(images_dir), str(masks_dir)
+        cfg = self.config
+        _pairs, train_pairs, val_pairs = build_split(images_dir, masks_dir, cfg.train)
+
+        print(f"[fastdet] train={len(train_pairs)} val={len(val_pairs)} images")
+        train_cache = FeatureCache(train_pairs, cfg.train, "train")
+        self.base_names = train_cache.base_names
+        self.prune()
+
+        img_ids, local_ids, labels = sample_training_cells(
+            train_cache, cfg.train, seed=cfg.model.random_seed
+        )
+        design = gather_training_matrix(train_cache, img_ids, local_ids, self.col_keep)
+        print(f"[fastdet] X={design.shape} positives={int(labels.sum()):,}")
+        self.booster = fit_booster(design, labels, cfg.model)
+        self._refresh_runtime()
+
+        if evaluate:
+            val_cache = FeatureCache(val_pairs, cfg.train, "val")
+            scores, targets, _grids = score_validation_per_image(
+                self.booster, val_cache, col_keep=self.col_keep
+            )
+            pr_auc = pooled_pr_auc(np.concatenate(scores), np.concatenate(targets).astype(bool))
+            self.metrics["pr_auc"] = pr_auc
+            self.val_ids = [Path(pair[0]).name for pair in val_pairs]
+            print(f"[fastdet] validation pooled PR-AUC = {pr_auc:.4f}")
+        return self
+
+    def _refresh_runtime(self) -> None:
+        """(Re)parse the in-memory export of the fitted booster."""
+        blob, info = self._build_blob()
+        self.runtime = parse_blob(blob)
+        self.metrics.update(info)
+        if self.col_keep is not None and self.base_names is not None:
+            self.feature_names = [self.base_names[int(i)] for i in self.col_keep]
+
+    def _build_blob(self) -> tuple[bytes, dict[str, Any]]:
+        if self.booster is None or self.col_keep is None or self.base_names is None:
+            msg = "no fitted booster; call fit() first"
+            raise RuntimeError(msg)
+        level_shift = [feature_level_bits(self.base_names[int(i)])[1] for i in self.col_keep]
+        with tempfile.TemporaryDirectory() as tmp:
+            json_path = Path(tmp) / "model.json"
+            self.booster.save_model(str(json_path), format="json")
+            with json_path.open(encoding="utf-8") as fh:
+                model_json = json.load(fh)
+        return build_blob(model_json, level_shift, shuffle_tables=self.config.export.shuffle_tables)
+
+    # -- inference ----------------------------------------------------------
+    def predict_proba(
+        self, image: str | Path | UInt8Array, grid: int = GRID
+    ) -> NDArray[np.floating[Any]]:
+        """Per-cell positive probability for one image as a ``grid x grid`` map.
+
+        ``image`` is a path or a BGR ``uint8`` array.  The map is the model's
+        raw cell scores; resize it to the source resolution to overlay.
+        """
+        if self.runtime is None:
+            msg = "detector is not fitted; call fit() or load()"
+            raise RuntimeError(msg)
+        if isinstance(image, (str, os.PathLike)):
+            decoded = read_image(str(image))
+            if decoded is None:
+                msg = f"could not read image {image!r}"
+                raise ValueError(msg)
+        else:
+            decoded = np.asarray(image)
+        level_maps, broadcast_vecs = self.extractor.extract(decoded)
+        design = self.extractor.gather(
+            level_maps, broadcast_vecs, np.arange(GRID * GRID), col_keep=self.col_keep
+        )
+        return self.runtime.predict_grid(design, grid=grid)
+
+    # -- persistence --------------------------------------------------------
+    def export(self, path: str | Path) -> Path:
+        """Write the fitted model as ONE self-contained file and return its path."""
+        if self.booster is None:
+            msg = "no fitted booster; call fit() first"
+            raise RuntimeError(msg)
+        artifact = self.build_artifact()
+        written = artifact.save(path)
+        print(f"[fastdet] wrote {written} ({written.stat().st_size:,} bytes)")
+        return written
+
+    def build_artifact(self) -> ModelArtifact:
+        """Assemble the single-file artifact for the fitted model."""
+        if self.booster is None or self.base_names is None or self.col_keep is None:
+            msg = "no fitted booster; call fit() first"
+            raise RuntimeError(msg)
+        blob, info = self._build_blob()
+        metadata = dict(self.metrics)
+        metadata.update(info)
+        metadata["val_ids"] = list(self.val_ids)
+        return ModelArtifact(
+            config=self.config,
+            feature_names=[self.base_names[int(i)] for i in self.col_keep],
+            blob=blob,
+            metadata=metadata,
+        )
