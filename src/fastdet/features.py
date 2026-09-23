@@ -552,8 +552,15 @@ class FeatureExtractor:
             if copy.broadcast:
                 run[:] = broadcast_vecs[copy.size][copy.src]
             else:
-                bank = level_maps[copy.size][copy.bank][..., copy.src]  # (side, side, n)
-                run.reshape(n_cols, side, side)[...] = bank.transpose(2, 0, 1)
+                whole = level_maps[copy.size][copy.bank]
+                if isinstance(copy.src, slice) and copy.src == slice(0, whole.shape[-1]):
+                    # the whole bank: one 2-D transpose in OpenCV (blocked; ~1.5x NumPy's)
+                    cv2.transpose(
+                        whole.reshape(-1, whole.shape[-1]), run.reshape(n_cols, side * side)
+                    )
+                else:
+                    bank = whole[..., copy.src]  # (side, side, n)
+                    run.reshape(n_cols, side, side)[...] = bank.transpose(2, 0, 1)
             pos += run.size
         return out
 

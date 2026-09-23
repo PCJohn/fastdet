@@ -865,6 +865,70 @@ std::vector<Stage> parse_stages(const char* text, bool* ok) {
 
 }  // namespace
 
+// ---------------------------------------------------------------------------------------------
+// C API for in-process use (fastdet.native loads this through ctypes).
+
+#if defined(_WIN32)
+#define FASTDET_API extern "C" __declspec(dllexport)
+#else
+#define FASTDET_API extern "C" __attribute__((visibility("default")))
+#endif
+
+struct FastdetHandle {
+  ImysModel model;
+  TiledModel tiled;
+  std::vector<size_t> offset;
+  hwy::AlignedFreeUniquePtr<uint8_t[]> fine, coarse;
+};
+
+// Parses an FDT1 container (or a bare IMSY blob) from memory; nullptr on failure.
+FASTDET_API void* fastdet_open(const uint8_t* bytes, size_t size) {
+  std::string raw(reinterpret_cast<const char*>(bytes), size);
+  const uint8_t* blob = nullptr;
+  size_t blob_size = 0;
+  if (!find_blob(raw, &blob, &blob_size)) return nullptr;
+  auto* h = new FastdetHandle();
+  if (!load_imys(blob, blob_size, &h->model)) {
+    delete h;
+    return nullptr;
+  }
+  h->tiled = build_tiled(h->model);
+  h->offset = native_offsets(h->model);
+  h->fine = hwy::AllocateAligned<uint8_t>(static_cast<size_t>(h->tiled.n_fine) * kCells + 64);
+  h->coarse = hwy::AllocateAligned<uint8_t>(static_cast<size_t>(h->tiled.n_coarse) * kTiles + 64);
+  return h;
+}
+
+FASTDET_API void fastdet_close(void* handle) {
+  delete static_cast<FastdetHandle*>(handle);
+}
+
+// Number of floats the native fixture holds (Detector.native_matrix), and the grid's cell count.
+FASTDET_API size_t fastdet_native_size(void* handle) {
+  return static_cast<FastdetHandle*>(handle)->offset.back();
+}
+FASTDET_API size_t fastdet_cells(void*) {
+  return kCells;
+}
+FASTDET_API const char* fastdet_target() {
+  return hwy::TargetName(HWY_TARGET);
+}
+
+// Scores one image: `native` holds fastdet_native_size floats, `out` receives kCells probabilities
+// in row-major grid order.  With use_exit the model's calibrated stages apply (lazy binning, coarse
+// tier once per tile, early exit); without, every tree runs on every cell.  Returns 0 on success.
+FASTDET_API int fastdet_score(void* handle, const float* native, float* out, int use_exit) {
+  auto* h = static_cast<FastdetHandle*>(handle);
+  ScoreOptions opt;
+  if (use_exit && !h->model.stages.empty()) {
+    opt.stages = &h->model.stages;
+    opt.lazy = true;
+  }
+  score_cells(h->model, h->tiled, native, h->offset, h->fine.get(), h->coarse.get(), out, opt);
+  return 0;
+}
+
+#ifndef FASTDET_LIBRARY
 int main(int argc, char** argv) {
   if (argc < 3) {
     std::fprintf(stderr, "usage: %s model.fdt fixture.f32 [expected.f32] [iters] [stages trees:theta,...]\n", argv[0]);
@@ -1019,3 +1083,4 @@ int main(int argc, char** argv) {
   }
   return 0;
 }
+#endif  // FASTDET_LIBRARY

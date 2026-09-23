@@ -25,6 +25,7 @@ from .exporter import build_blob
 from .features import GRID, FeatureCache, FeatureExtractor, feature_level_bits
 from .images import read_image
 from .metrics import pooled_pr_auc, score_validation_per_image
+from .native import NativeScorer, load_native
 from .runtime import ImysModel, parse_blob
 from .training import (
     calibrate_exit_stages,
@@ -75,6 +76,7 @@ class Detector:
         self.booster: CatBoostClassifier | None = None  # when training in-process
         self.runtime: ImysModel | None = None  # scoring engine (fitted or loaded)
         self.exit_stages: list[tuple[int, float]] = []  # calibrated at fit time, stored in the blob
+        self.native: NativeScorer | None = None  # in-process C++ scorer, when its library is built
         self.col_keep: Int64Array | None = None  # kept columns into the full design
         self.base_names: list[str] | None = None  # full (unpruned) column names
         self.feature_names: list[str] | None = None  # kept column names
@@ -100,6 +102,7 @@ class Detector:
         det.col_keep = det._columns_for(det.feature_names)
         det.metrics = dict(artifact.metadata)
         det.exit_stages = list(det.runtime.exit_stages)
+        det.native = load_native(artifact.blob)
         return det
 
     @property
@@ -234,6 +237,7 @@ class Detector:
         blob, info = self._build_blob()
         runtime = parse_blob(blob)
         self.runtime = runtime
+        self.native = load_native(blob)  # the same engine a loaded model uses, when it is built
         self.metrics.update(info)
         if self.col_keep is not None and self.base_names is not None:
             self.feature_names = [self.base_names[int(i)] for i in self.col_keep]
@@ -309,9 +313,11 @@ class Detector:
         if self.runtime is None:
             msg = "detector is not fitted; call fit() or load()"
             raise RuntimeError(msg)
-        return self.runtime.predict_grid(
-            self.design_matrix(image), grid=GRID, use_exit=self.config.model.use_exit
-        )
+        use_exit = self.config.model.use_exit
+        if self.native is not None:  # the C++ scorer, on the native-resolution features
+            probabilities = self.native.score(self.native_matrix(image), use_exit=use_exit)
+            return probabilities.reshape(GRID, GRID)
+        return self.runtime.predict_grid(self.design_matrix(image), grid=GRID, use_exit=use_exit)
 
     # -- persistence --------------------------------------------------------
     def export(self, path: str | Path) -> Path:

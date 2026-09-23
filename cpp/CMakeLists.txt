@@ -38,3 +38,13 @@ FetchContent_MakeAvailable(highway)
 
 add_executable(fastdet_score fastdet_score.cpp)
 target_link_libraries(fastdet_score PRIVATE hwy)
+
+# The same scorer as a shared library with a small C API (see the end of fastdet_score.cpp),
+# loaded by fastdet.native through ctypes so Detector.predict_proba scores in-process.
+add_library(fastdet_native SHARED fastdet_score.cpp)
+target_compile_definitions(fastdet_native PRIVATE FASTDET_LIBRARY=1)
+target_link_libraries(fastdet_native PRIVATE hwy)
+set_target_properties(fastdet_native PROPERTIES POSITION_INDEPENDENT_CODE ON C_VISIBILITY_PRESET default)
+if(NOT MSVC)
+  set_target_properties(hwy PROPERTIES POSITION_INDEPENDENT_CODE ON)
+endif()
