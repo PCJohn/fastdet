@@ -124,7 +124,7 @@ def _random_model(
 
     counts = rng.integers(2, 2 * THRESHOLDS_PER_FEATURE, n_features)  # mean ~= the real model's
     borders = [np.sort(rng.uniform(0.05, 0.95, int(c))).tolist() for c in counts]
-    coarse_trees = int(round(N_TREES * coarse_fraction))
+    coarse_trees = round(N_TREES * coarse_fraction)
     coarse_pools = [s for s in pools if s <= COARSE_MAX_SIDE]
     coarse_weights = np.array([LEVEL_SHARE[s] for s in coarse_pools], dtype=float)
     coarse_weights /= coarse_weights.sum()

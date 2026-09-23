@@ -1,0 +1,6 @@
+# Formatting for cpp/: Google style, wide lines (the SIMD code reads better unbroken).
+BasedOnStyle: Google
+ColumnLimit: 120
+AllowShortIfStatementsOnASingleLine: WithoutElse
+AllowShortLoopsOnASingleLine: true
+AllowShortFunctionsOnASingleLine: Inline
