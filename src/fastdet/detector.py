@@ -44,6 +44,9 @@ Int64Array = NDArray[np.int64]
 UInt8Array = NDArray[np.uint8]
 
 
+_LARGE_MATRIX_GIB = 8.0  # above this the fit prints how to shrink the training matrix
+
+
 class Detector:
     """Per-cell text detector over the frozen multi-level feature front-end.
 
@@ -179,10 +182,20 @@ class Detector:
             train_cache, cfg.train, seed=cfg.model.random_seed
         )
         design = gather_training_matrix(train_cache, img_ids, local_ids, self.col_keep)
-        print(f"[fastdet] X={design.shape} positives={int(labels.sum()):,}")
+        gib = design.nbytes / 2**30
+        print(
+            f"[fastdet] X={design.shape} positives={int(labels.sum()):,} ({gib:.1f} GiB float32; "
+            "the fit quantises it to 4 bits and frees this copy)"
+        )
+        if gib > _LARGE_MATRIX_GIB:
+            print(
+                f"[fastdet] {gib:.0f} GiB is a large training matrix: neg_pos_ratio or max_train_cells "
+                "(TrainConfig) keep it in RAM, task_type='GPU' (ModelConfig) fits it faster"
+            )
         kept = self.col_keep if self.col_keep is not None else np.arange(len(self.base_names))
         sides = [feature_level_bits(self.base_names[int(i)])[0] for i in kept]
         self.booster = fit_booster(design, labels, cfg.model, feature_sides=sides)
+        del design
         self.exit_stages = []
         runtime = self._refresh_runtime()
         if cfg.model.use_exit:

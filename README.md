@@ -407,6 +407,36 @@ Timings printed: `tile binner`, `simd traversal` (every tree on every cell),
 `model total` (binning + full traversal) and `model, as shipped` (lazy binning,
 coarse tier per tile, early exit) -- the last one is the production number.
 
+## Training time and memory
+
+The fit is dominated by CatBoost on the training matrix (`n_cells x n_features`
+float32: 6.7 M cells x 1178 columns is 32 GiB). What the pipeline does about it, and
+the knobs that matter:
+
+* **The matrix is quantised once and released.** `fit()` builds one CatBoost `Pool`,
+  quantises it to `border_count` bins (4 bits per value) and drops the float matrix;
+  every stage and chunk of the fit reuses it. Peak memory is roughly the float
+  matrix plus a quarter, for the moment the pool is built. `fit()` prints the
+  matrix size; above 8 GiB it also prints the knobs below. A "CatBoost is using
+  more CPU RAM than the limit" warning means the machine is swapping: shrink the
+  matrix.
+* **Fewer cells** (`TrainConfig`): `neg_pos_ratio=3` keeps three negatives per
+  positive (about a quarter of the cells at a 7% positive rate), `max_train_cells`
+  caps the total; both are sweepable (`fastdet-tune --neg-pos-ratio none,3,5`), and
+  `scale_pos_weight` re-weights positives without discarding data.
+* **GPU** (`ModelConfig.task_type="GPU"`): CatBoost trains on any CUDA GPU its wheel
+  can see (Windows and Linux, no toolkit install), several times faster on millions
+  of cells; the quantised pool must fit in GPU memory (4 bits per value: 6.7 M x 1178
+  is ~4 GB, fine for a 6 GB card). The chunked quantisation-aware fit uploads the
+  pool once per chunk of `leaf_chunk` trees, so a GPU pays off most for big
+  matrices. Inference never uses the GPU.
+* **Fewer fits**: the quantisation-aware fit is 150 chunked fits for 2400 trees. At
+  8-bit leaves the rounding is one decision in ~25,000, so `quantisation_aware=False`
+  (one fit per stage) is the fast path; keep it on for 4-bit leaves, where it is
+  worth a few PR-AUC points.
+* `thread_count=-1` already uses every core; the front-end feature pass is a few
+  milliseconds per image and is not where the time goes.
+
 ## Hyperparameter tuning (`fastdet-tune`)
 
 `fastdet-tune` fits one detector per combination of the knobs you name, scores the
@@ -444,6 +474,8 @@ them with their current defaults). The ones worth sweeping:
 | `--border-count` | 15 | split candidates per feature (max 15); 7 makes binning ~40% cheaper |
 | `--leaf-bits` | 8 | leaf code width, 4 or 8; 4 halves the fine-tree cost (quantisation-aware fit) |
 | `--leaf-chunk` | 16 | trees per quantisation step and scorer pass (<= 17) |
+| `--quantisation-aware` | true | chunked fit on the quantised running score; `false` = one fit per stage (fast path at 8-bit) |
+| `--task-type` | CPU | `GPU` trains on CUDA (see Training time and memory) |
 | `--coarse-fraction` | 0.667 | share of trees restricted to tile-constant features (evaluated once per tile); 0 disables tiering |
 | `--coarse-max-side` | 16 | largest feature grid that counts as tile-constant |
 | `--use-exit` | true | early exit on |

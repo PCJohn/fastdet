@@ -15,6 +15,8 @@ from numpy.typing import NDArray  # noqa: TC002 -- used in dataclass field annot
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
+    from catboost import Pool
+
     from .config import ModelConfig
 
 __all__ = [
@@ -198,9 +200,26 @@ def _leaf_table(booster: CatBoostClassifier, n_trees: int) -> NDArray[np.float64
     return table
 
 
-def _fit_stage(  # noqa: PLR0913 -- a private helper with one call site per stage
+def make_pool(
     features: NDArray[np.floating],
     labels: NDArray[np.bool_] | NDArray[np.integer[Any]],
+    model_cfg: ModelConfig,
+) -> Pool:
+    """The training set as a CatBoost ``Pool`` quantised once (``border_count`` cuts per column).
+
+    Quantising up front turns the ``n_cells x n_features`` float32 matrix into 4-bit
+    bins, so the float matrix can be released and every stage and chunk of the fit
+    skips its own border search; the borders are the same the fit would find.
+    """
+    from catboost import Pool  # noqa: PLC0415 -- optional heavy import
+
+    pool = Pool(features, labels)
+    pool.quantize(border_count=int(model_cfg.border_count))
+    return pool
+
+
+def _fit_stage(  # noqa: PLR0913 -- a private helper with one call site per stage
+    pool: Pool,
     params: Mapping[str, Any],
     *,
     n_trees: int,
@@ -219,21 +238,13 @@ def _fit_stage(  # noqa: PLR0913 -- a private helper with one call site per stag
     ``bits`` the stage is one fit.  ``ignored`` hides feature columns from this
     stage (resolution tiering).
     """
-    from catboost import Pool  # noqa: PLC0415 -- optional heavy import
-
     stage = dict(params)
     if ignored:
         stage["ignored_features"] = list(ignored)
     step = chunk if bits is not None else n_trees
     models: list[CatBoostClassifier] = []
     score = running
-    # One Pool, quantised once: every chunk's fit then skips the border search on the
-    # 100k-row matrix (the borders are the same for every fit anyway, so the merged
-    # model has one border set), which is most of a small fit's time.
-    pool = Pool(features, labels, baseline=score)
-    pool.quantize(
-        border_count=int(stage["border_count"]), ignored_features=stage.get("ignored_features")
-    )
+    pool.set_baseline(np.asarray(score, dtype=np.float64).reshape(-1, 1))
     for start in range(0, n_trees, step):
         size = min(step, n_trees - start)
         fitted = CatBoostClassifier(iterations=size, boost_from_average=False, **stage)
@@ -244,7 +255,7 @@ def _fit_stage(  # noqa: PLR0913 -- a private helper with one call site per stag
         indexes = fitted.calc_leaf_indexes(pool)
         scale, bias = fitted.get_scale_and_bias()
         score = score + scale * table[np.arange(size)[None, :], indexes].sum(axis=1) + bias
-        pool.set_baseline(score.reshape(-1, 1))
+        pool.set_baseline(np.asarray(score, dtype=np.float64).reshape(-1, 1))
         models.append(fitted)
     return models, score
 
@@ -280,12 +291,17 @@ def fit_booster(
         "verbose": False,
         "allow_writing_files": False,
         "thread_count": -1,
+        "task_type": model_cfg.task_type,
     }
+    if model_cfg.task_type == "GPU":
+        params["devices"] = "0"
     bits = model_cfg.leaf_bits if model_cfg.quantisation_aware else None
     coarse_trees = model_cfg.coarse_trees if model_cfg.coarse_trees < model_cfg.n_trees else 0
+    pool = make_pool(features, labels, model_cfg)
+    del features  # the quantised pool is the training set from here on (4 bits per value)
     if bits is None and not coarse_trees:
         booster = CatBoostClassifier(iterations=model_cfg.n_trees, **params)
-        booster.fit(features, labels)
+        booster.fit(pool)
         return booster
 
     from catboost import sum_models  # noqa: PLC0415 -- optional heavy import
@@ -301,8 +317,7 @@ def fit_booster(
             msg = f"no column has side <= coarse_max_side={model_cfg.coarse_max_side}"
             raise ValueError(msg)
         coarse, score = _fit_stage(
-            features,
-            labels,
+            pool,
             params,
             n_trees=coarse_trees,
             chunk=model_cfg.leaf_chunk,
@@ -312,8 +327,7 @@ def fit_booster(
         )
         models += coarse
     fine, _score = _fit_stage(
-        features,
-        labels,
+        pool,
         params,
         n_trees=model_cfg.n_trees - coarse_trees,
         chunk=model_cfg.leaf_chunk,
