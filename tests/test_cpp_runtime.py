@@ -12,13 +12,9 @@ Skipped when cmake is unavailable or the scorer cannot be built.
 
 from __future__ import annotations
 
-import os
 import re
-import shutil
 import struct
 import subprocess
-import sys
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -28,44 +24,11 @@ from fastdet import Config, Detector
 from fastdet.exporter import build_blob
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from numpy.typing import NDArray
 
-CPP_DIR = Path(__file__).resolve().parents[1] / "cpp"
 GRID_CELLS = 64 * 64
-
-
-def _build(build_dir: Path) -> Path:
-    """Configure and build the scorer with CMake (Highway, as in imfeat); return it.
-
-    Highway is fetched by CMake; set ``FASTDET_HWY_DIR`` to a local Highway
-    checkout to build offline.
-    """
-    cmake = shutil.which("cmake")
-    if cmake is None:
-        pytest.skip("cmake not available")
-    configure = [cmake, "-S", str(CPP_DIR), "-B", str(build_dir), "-DCMAKE_BUILD_TYPE=Release"]
-    if os.environ.get("FASTDET_HWY_DIR"):
-        configure.append(f"-DFETCHCONTENT_SOURCE_DIR_HIGHWAY={os.environ['FASTDET_HWY_DIR']}")
-    build = [cmake, "--build", str(build_dir), "--config", "Release", "--target", "fastdet_score"]
-    for step in (configure, build):
-        result = subprocess.run(  # noqa: S603 -- argv is cmake and fixed arguments
-            step, capture_output=True, text=True, check=False
-        )
-        if result.returncode != 0:
-            pytest.skip(
-                f"could not build the C++ runtime:\n{result.stdout[-1500:]}{result.stderr[-1500:]}"
-            )
-    name = "fastdet_score.exe" if sys.platform == "win32" else "fastdet_score"
-    found = sorted(build_dir.rglob(name))
-    if not found:
-        pytest.skip("C++ build produced no fastdet_score binary")
-    return found[0]
-
-
-@pytest.fixture(scope="module")
-def scorer(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    """The scorer binary, built once for this module."""
-    return _build(tmp_path_factory.mktemp("cpp_build"))
 
 
 def _write_f32(path: Path, values: NDArray[np.floating]) -> None:

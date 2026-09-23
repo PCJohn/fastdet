@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import cv2
@@ -11,8 +16,6 @@ import pytest
 from fastdet import Config, ModelConfig, TrainConfig
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
     from numpy.typing import NDArray
 
 IMAGE_SIZE = 160
@@ -71,3 +74,40 @@ def small_config() -> Config:
             max_train_cells=20_000,
         ),
     )
+
+
+CPP_DIR = Path(__file__).resolve().parents[1] / "cpp"
+
+
+def _build_scorer(build_dir: Path) -> Path:
+    """Configure and build the scorer with CMake (Highway, as in imfeat); return it.
+
+    Highway is fetched by CMake; set ``FASTDET_HWY_DIR`` to a local Highway
+    checkout to build offline.
+    """
+    cmake = shutil.which("cmake")
+    if cmake is None:
+        pytest.skip("cmake not available")
+    configure = [cmake, "-S", str(CPP_DIR), "-B", str(build_dir), "-DCMAKE_BUILD_TYPE=Release"]
+    if os.environ.get("FASTDET_HWY_DIR"):
+        configure.append(f"-DFETCHCONTENT_SOURCE_DIR_HIGHWAY={os.environ['FASTDET_HWY_DIR']}")
+    build = [cmake, "--build", str(build_dir), "--config", "Release", "--target", "fastdet_score"]
+    for step in (configure, build):
+        result = subprocess.run(  # noqa: S603 -- argv is cmake and fixed arguments
+            step, capture_output=True, text=True, check=False
+        )
+        if result.returncode != 0:
+            pytest.skip(
+                f"could not build the C++ runtime:\n{result.stdout[-1500:]}{result.stderr[-1500:]}"
+            )
+    name = "fastdet_score.exe" if sys.platform == "win32" else "fastdet_score"
+    found = sorted(build_dir.rglob(name))
+    if not found:
+        pytest.skip("C++ build produced no fastdet_score binary")
+    return found[0]
+
+
+@pytest.fixture(scope="session")
+def scorer(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """The C++ scorer binary, built once per test session."""
+    return _build_scorer(tmp_path_factory.mktemp("cpp_build"))
