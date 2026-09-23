@@ -219,39 +219,61 @@ def parse_extra_scales(spec: str) -> list[ExtraScale]:
     return out
 
 
+_COORD_PLANES: dict[int, tuple[FloatArray, FloatArray]] = {}
+_MORPH_KERNELS: dict[int, NDArray[np.uint8]] = {}
+
+
+def _coord_planes(grid_size: int) -> tuple[FloatArray, FloatArray]:
+    """Normalised cell coordinates in [-0.5, 0.5] as ``(xx, yy)`` planes, built once per size."""
+    planes = _COORD_PLANES.get(grid_size)
+    if planes is None:
+        axis = (np.arange(grid_size, dtype=np.float32) / float(grid_size - 1) - 0.5).astype(
+            np.float32
+        )
+        yy = np.repeat(axis[:, None], grid_size, axis=1)
+        xx = np.repeat(axis[None, :], grid_size, axis=0)
+        planes = _COORD_PLANES[grid_size] = (np.ascontiguousarray(xx), np.ascontiguousarray(yy))
+    return planes
+
+
+def _morph_kernel(size: int) -> NDArray[np.uint8]:
+    kernel = _MORPH_KERNELS.get(size)
+    if kernel is None:
+        kernel = _MORPH_KERNELS[size] = np.ones((size, size), np.uint8)
+    return kernel
+
+
+def _box(pooled: FloatArray, size: int) -> FloatArray:
+    return np.asarray(
+        cv2.boxFilter(pooled, -1, (size, size), normalize=True, borderType=cv2.BORDER_REFLECT),
+        dtype=np.float32,
+    )
+
+
 def compute_context_values(pooled: FloatArray, grid_size: int) -> FloatArray:
     """Small-scale context from imfeat's per-cell luminance mean: ``(grid, grid, 5)``.
 
     ``ctx_x``/``ctx_y`` are normalized cell coordinates in [-0.5, 0.5];
     ``ctx_surr3`` is a Laplacian (cell minus 3x3 mean), ``ctx_ring35`` the
     difference between the 5x5 and 3x3 means and ``ctx_range3`` the 3x3
-    max-minus-min.
+    max-minus-min.  Written straight into one ``(grid, grid, 5)`` block: these
+    arrays are tiny, so the cost is per-call overhead, and every avoided
+    intermediate is a measurable share of the front-end.
     """
     channels = len(CONTEXT_FEATURE_NAMES)
+    out = np.empty((grid_size, grid_size, channels), dtype=np.float32)
     if grid_size < _CTX1_MIN_GRID:
-        return np.zeros((grid_size, grid_size, channels), dtype=np.float32)
-    blur3 = np.asarray(
-        cv2.boxFilter(
-            pooled, -1, (_CTX1_SIZE, _CTX1_SIZE), normalize=True, borderType=cv2.BORDER_REFLECT
-        ),
-        dtype=np.float32,
-    )
-    blur5 = np.asarray(
-        cv2.boxFilter(
-            pooled, -1, (_CTX2_SIZE, _CTX2_SIZE), normalize=True, borderType=cv2.BORDER_REFLECT
-        ),
-        dtype=np.float32,
-    )
-    kernel = np.ones((_CTX1_SIZE, _CTX1_SIZE), np.uint8)
-    dilate3 = np.asarray(cv2.dilate(pooled, kernel), dtype=np.float32)
-    erode3 = np.asarray(cv2.erode(pooled, kernel), dtype=np.float32)
-    axis = np.arange(grid_size, dtype=np.float32)
-    denom = float(grid_size - 1)
-    yy = np.repeat((axis / denom - 0.5)[:, None], grid_size, axis=1)
-    xx = np.repeat((axis / denom - 0.5)[None, :], grid_size, axis=0)
-    return np.stack([xx, yy, pooled - blur3, blur5 - blur3, dilate3 - erode3], axis=-1).astype(
-        np.float32
-    )
+        out.fill(0.0)
+        return out
+    xx, yy = _coord_planes(grid_size)
+    out[..., 0] = xx
+    out[..., 1] = yy
+    blur3 = _box(pooled, _CTX1_SIZE)
+    np.subtract(pooled, blur3, out=out[..., 2])
+    np.subtract(_box(pooled, _CTX2_SIZE), blur3, out=out[..., 3])
+    kernel = _morph_kernel(_CTX1_SIZE)
+    np.subtract(cv2.dilate(pooled, kernel), cv2.erode(pooled, kernel), out=out[..., 4])
+    return out
 
 
 def compute_context2_values(pooled: FloatArray, grid_size: int) -> FloatArray:
@@ -261,22 +283,14 @@ def compute_context2_values(pooled: FloatArray, grid_size: int) -> FloatArray:
     max-minus-min; together they cover wider surroundings than ``context``.
     """
     channels = len(CONTEXT2_FEATURE_NAMES)
+    out = np.empty((grid_size, grid_size, channels), dtype=np.float32)
     if grid_size < _CTX2_MIN_GRID:
-        return np.zeros((grid_size, grid_size, channels), dtype=np.float32)
-    blur9 = np.asarray(
-        cv2.boxFilter(
-            pooled,
-            -1,
-            (_CTX2_SURROUND, _CTX2_SURROUND),
-            normalize=True,
-            borderType=cv2.BORDER_REFLECT,
-        ),
-        dtype=np.float32,
-    )
-    kernel = np.ones((_CTX2_SIZE, _CTX2_SIZE), np.uint8)
-    dilate5 = np.asarray(cv2.dilate(pooled, kernel), dtype=np.float32)
-    erode5 = np.asarray(cv2.erode(pooled, kernel), dtype=np.float32)
-    return np.stack([pooled - blur9, dilate5 - erode5], axis=-1).astype(np.float32)
+        out.fill(0.0)
+        return out
+    np.subtract(pooled, _box(pooled, _CTX2_SURROUND), out=out[..., 0])
+    kernel = _morph_kernel(_CTX2_SIZE)
+    np.subtract(cv2.dilate(pooled, kernel), cv2.erode(pooled, kernel), out=out[..., 1])
+    return out
 
 
 def compute_global_stats(global_raw: FloatArray, orig_h: int, orig_w: int) -> FloatArray:

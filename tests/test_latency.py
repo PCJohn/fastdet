@@ -241,9 +241,11 @@ def test_model_inference_latency(scorer: Path, scratch: Path) -> None:
         paths = [scratch / name for name in ("m.imsy", "f.f32", "e.f32")]
         for path, payload in zip(paths, (blob, native.tobytes(), expected.tobytes()), strict=True):
             path.write_bytes(payload)
-        out = _run_scorer(scorer, *paths)
-        assert "0 mismatches PASS" in out  # binner agrees with the reference binner
-        assert "BIT-IDENTICAL" in out  # SIMD traversal agrees with the scalar one
+        runs = [_run_scorer(scorer, *paths) for _ in range(2)]
+        for out in runs:
+            assert "0 mismatches PASS" in out  # binner agrees with the reference binner
+            assert "BIT-IDENTICAL" in out  # SIMD traversal agrees with the scalar one
+        out = min(runs, key=lambda text: _ms("model total", text))  # the less disturbed run
         label = f"random, {n_features} columns, {bits}-bit leaves"
         _report_model(label, out)
     print("   'as shipped' uses a synthetic exit stage that keeps half of the tiles after the")

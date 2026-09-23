@@ -699,6 +699,7 @@ void bin_except_side64(const ImysModel& m, const TiledModel& tm, const float* xn
 struct ScoreOptions {
   const std::vector<Stage>* stages = nullptr;  // nullptr: no early exit
   bool lazy = false;                           // bin side-64 features after the coarse tier
+  bool prebinned = false;                      // planes already hold this image's bins (timing only)
   size_t* packs_finished = nullptr;
 };
 
@@ -712,10 +713,13 @@ void score_cells_simd(const ImysModel& m, const TiledModel& tm, const float* xn,
   const size_t l64 = hn::Lanes(d64);
   const uint32_t depth = m.depth;
   const bool lazy = opt.lazy && m.coarse_trees > 0;
-  if (lazy)
+  if (opt.prebinned) {
+    // timing runs: the planes hold this image's bins from a previous call
+  } else if (lazy) {
     bin_except_side64(m, tm, xn, offset, fine, coarse);
-  else
+  } else {
     bin_tiles(m, tm, xn, offset, fine, coarse);
+  }
   auto total = hwy::AllocateAligned<int64_t>(kCells);  // tile-major: tile * 16 + cell
   auto acc32 = hwy::AllocateAligned<int32_t>(kCells);  // the chunks of the current shift, unshifted
   auto bsum = hwy::AllocateAligned<uint8_t>(NP * kCells);
@@ -736,7 +740,7 @@ void score_cells_simd(const ImysModel& m, const TiledModel& tm, const float* xn,
   for (size_t a = 0; a < active.size(); ++a) active[a] = static_cast<uint16_t>(a * kPack);
   size_t next_stage = 0;
   double offsets_done = 0.0;
-  bool side64_binned = !lazy;
+  bool side64_binned = !lazy || opt.prebinned;
   for (uint32_t c = 0; c < m.n_chunks; ++c) {
     const uint32_t t0 = m.chunk_start(c), t1 = m.chunk_end(c);
     if (!side64_binned && t0 >= m.coarse_trees) {  // the fine tier starts: bin what it needs where it runs
@@ -1063,8 +1067,12 @@ int main(int argc, char** argv) {
       [&] { score_cells(model, tiled, xn.data(), offset, fine.get(), coarse.get(), simd_out.data(), plain); }, iters);
   std::printf("tile binner      : %8.3f ms (p50, %d iters)\n", ms_bin, iters);
   std::printf("scalar traversal : %8.3f ms (%.3f ns/probe)\n", ms_scalar, 1e6 * ms_scalar / (probes * kCells));
-  std::printf("simd traversal   : %8.3f ms (binning + every tree on every cell)\n",
-              ms_full - ms_bin < 0 ? 0.0 : ms_full - ms_bin);
+  ScoreOptions walk_only = plain;
+  walk_only.prebinned = true;  // the planes hold this image's bins from the run above
+  const double ms_walk = time_it(
+      [&] { score_cells(model, tiled, xn.data(), offset, fine.get(), coarse.get(), simd_out.data(), walk_only); },
+      iters);
+  std::printf("simd traversal   : %8.3f ms (every tree on every cell, planes already binned)\n", ms_walk);
   std::printf("model total      : %8.3f ms (binning + every tree on every cell)\n", ms_full);
   if (!stages.empty()) {
     ScoreOptions exit_opt;
