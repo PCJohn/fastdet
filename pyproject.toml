@@ -16,8 +16,12 @@ dependencies = [
     "catboost",
 ]
 
+[project.scripts]
+fastdet-tune = "fastdet.tune:main"
+
 [project.optional-dependencies]
 yaml = ["PyYAML"]
+tune = ["matplotlib"]  # charts for fastdet-tune
 dev = [
     "pytest",
     "ruff",

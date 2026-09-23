@@ -407,6 +407,64 @@ Timings printed: `tile binner`, `simd traversal` (every tree on every cell),
 `model total` (binning + full traversal) and `model, as shipped` (lazy binning,
 coarse tier per tile, early exit) -- the last one is the production number.
 
+## Hyperparameter tuning (`fastdet-tune`)
+
+`fastdet-tune` fits one detector per combination of the knobs you name, scores the
+held-out split exactly as the shipped runtime does (quantised leaves, coarse tier,
+early exit), and writes a report folder:
+
+* `report.md` -- one row per combination (only the swept knobs appear as columns) with
+  PR-AUC (primary), ROC-AUC, best F1 and its threshold, precision / recall / IoU at that
+  threshold, fit time, model size and, when the C++ library is built, `predict_proba`
+  latency; the framegate text heuristic as a baseline row; the best run's full config.
+* `pr.png`, `roc.png` -- precision-recall and ROC curves of the best runs and the baseline.
+* `results.json`, `models/<key>.fdt` -- every run's config, metrics and exported model.
+  Re-running with the same `--out` resumes: finished combinations are skipped.
+
+```
+pip install -e ".[tune]"                     # matplotlib, for the charts
+fastdet-tune --images data/images --masks data/masks --out tune_report \
+    --n-trees 1200,2400 --leaf-bits 4,8 --coarse-fraction 0.5,0.667
+```
+
+That is 2 x 2 x 2 = 8 fits. Every knob takes a comma-separated list and the sweep is
+their Cartesian product, so name few knobs at a time; a knob you do not name keeps its
+default, which is the tuned production value. `--max-runs 2` smoke-tests a sweep,
+`--report-only` rebuilds the report and charts from `results.json`, `--no-baseline`
+skips the heuristic. Tuples take `/`: `--levels 64/32/16/8`.
+
+Every field of `ModelConfig` and `TrainConfig` is a knob (`fastdet-tune --help` lists
+them with their current defaults). The ones worth sweeping:
+
+| knob | default | what it does |
+|---|---|---|
+| `--n-trees` | 2400 | boosting iterations; latency grows linearly, quality saturates |
+| `--depth` | 7 | tree depth; 7 varying splits is the scorer's limit |
+| `--learning-rate` | 0.1 | shrinkage; lower needs more trees |
+| `--border-count` | 15 | split candidates per feature (max 15); 7 makes binning ~40% cheaper |
+| `--leaf-bits` | 8 | leaf code width, 4 or 8; 4 halves the fine-tree cost (quantisation-aware fit) |
+| `--leaf-chunk` | 16 | trees per quantisation step and scorer pass (<= 17) |
+| `--coarse-fraction` | 0.667 | share of trees restricted to tile-constant features (evaluated once per tile); 0 disables tiering |
+| `--coarse-max-side` | 16 | largest feature grid that counts as tile-constant |
+| `--use-exit` | true | early exit on |
+| `--exit-keep-prob` | 0.05 | cells ending at or above this probability are never stopped |
+| `--exit-margin` | 2.0 | raw-score safety margin under the calibrated thresholds |
+| `--exit-stage-fractions` | 0/0.125/0.25/0.5/0.75 | where in the fine tier the stages sit |
+| `--top-k-features` | 0 (all) | keep the top-k gain-ranked columns; 512 halves binning |
+| `--thumb`, `--stride` | 1024, 4 | front-end resize target and imfeat sampling stride |
+| `--levels` | 64/32/16/8/4/2 | pyramid grids (finest must be 64) |
+| `--feature-mode`, `--imfeat-space` | raw_plus_global_context_ext, hsv | feature banks and colour space |
+| `--gt-cell-thresh` | 0.10 | mask coverage at which a cell is a positive |
+| `--val-frac`, `--split-seed` | 0.15, 42 | held-out share of near-duplicate groups and the split seed |
+| `--neg-pos-ratio`, `--max-train-cells` | none | training-cell sampling |
+
+Reading the report: PR-AUC is the number to rank by (the positive rate is a few
+percent, so ROC-AUC flatters everything); `thr*` is the probability threshold with the
+best F1 on the validation split, a reasonable operating point to ship; the latency
+column is the whole in-process path (front-end + model) on the machine running the
+sweep. Keep `--val-frac` and `--split-seed` fixed across a sweep so every run sees the
+same held-out images.
+
 ## Development
 
 ```sh

@@ -32,7 +32,14 @@ _DEFAULT_NAMES = ["libfastdet_native.so"]
 def _candidate_dirs() -> list[Path]:
     here = Path(__file__).resolve().parent
     root = here.parent.parent  # <repo>/src/fastdet -> <repo>
-    builds = ("cpp/build", "build", "cpp/build/Release", "build/Release")
+    builds = (
+        "cpp/build",
+        "build",
+        "cpp/build/Release",
+        "build/Release",
+        "build/pytest-cpp",
+        "build/pytest-cpp/Release",
+    )
     return [here / "_native", *(root / build for build in builds)]
 
 
