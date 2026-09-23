@@ -227,16 +227,24 @@ def _fit_stage(  # noqa: PLR0913 -- a private helper with one call site per stag
     step = chunk if bits is not None else n_trees
     models: list[CatBoostClassifier] = []
     score = running
+    # One Pool, quantised once: every chunk's fit then skips the border search on the
+    # 100k-row matrix (the borders are the same for every fit anyway, so the merged
+    # model has one border set), which is most of a small fit's time.
+    pool = Pool(features, labels, baseline=score)
+    pool.quantize(
+        border_count=int(stage["border_count"]), ignored_features=stage.get("ignored_features")
+    )
     for start in range(0, n_trees, step):
         size = min(step, n_trees - start)
         fitted = CatBoostClassifier(iterations=size, boost_from_average=False, **stage)
-        fitted.fit(Pool(features, labels, baseline=score))
+        fitted.fit(pool)
         table = _leaf_table(fitted, size)
         if bits is not None:
             table = quantise_leaves(table, bits, chunk)
-        indexes = fitted.calc_leaf_indexes(Pool(features))
+        indexes = fitted.calc_leaf_indexes(pool)
         scale, bias = fitted.get_scale_and_bias()
         score = score + scale * table[np.arange(size)[None, :], indexes].sum(axis=1) + bias
+        pool.set_baseline(score.reshape(-1, 1))
         models.append(fitted)
     return models, score
 

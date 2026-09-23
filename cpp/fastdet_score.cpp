@@ -153,7 +153,7 @@ bool load_imys(const uint8_t* p, size_t size, ImysModel* m) {
   const uint32_t n_stages = rd32(44);
   size_t off = 48;
   auto take = [&](size_t bytes) { const uint8_t* q = p + off; off += bytes; return q; };
-  if (m->depth == 0 || m->depth > 8 || (m->leaf_bits != 4 && m->leaf_bits != 8) || m->leaf_chunk == 0 || m->leaf_chunk > 17) return false;
+  if (m->depth == 0 || m->depth > 7 || (m->leaf_bits != 4 && m->leaf_bits != 8) || m->leaf_chunk == 0 || m->leaf_chunk > 17) return false;
   m->tree_offsets.resize(m->n_trees + 1); std::memcpy(m->tree_offsets.data(), take(4 * (m->n_trees + 1)), 4 * (m->n_trees + 1));
   m->tree_base.resize(m->n_trees + 1); std::memcpy(m->tree_base.data(), take(4 * (m->n_trees + 1)), 4 * (m->n_trees + 1));
   const size_t n_splits = static_cast<size_t>(m->n_trees) * m->depth;
@@ -398,8 +398,10 @@ TiledModel build_tiled(const ImysModel& m) {
       dst[idx] = src[old_idx];
       tm.code32[m.tree_offsets[t] + idx] = src[old_idx];
     }
+    // v >= 1: per leaf group, NP planes of its 2^v codes (what the fine-tree kernel shuffles);
+    // v == 0: NP planes of all 2^depth codes (the tile-constant lookup shuffles those directly).
     uint8_t* planes = tm.nib.get() + static_cast<size_t>(m.tree_offsets[t]) * np;
-    const uint32_t width = 1u << v, groups = n_leaves / width;
+    const uint32_t width = v ? 1u << v : n_leaves, groups = n_leaves / width;
     for (uint32_t g = 0; g < groups; ++g)
       for (uint32_t k = 0; k < np; ++k)
         for (uint32_t i = 0; i < width; ++i) planes[(g * np + k) * width + i] = static_cast<uint8_t>((dst[g * width + i] >> (4 * k)) & 15);
@@ -545,6 +547,33 @@ HWY_NOINLINE void tree_codes_over_packs(const TiledTree& tr, const uint16_t* act
   }
 }
 
+// A tile-constant tree: its leaf group per tile IS the leaf index, so the code of every tile is
+// one byte shuffle per 16-entry sub-table of the 128-code table, merged by a blend tree on the
+// high group bits, 16*kPack tiles per vector; added into per-tile byte sums (one per plane).
+template <uint32_t NP>
+HWY_NOINLINE void coarse_tree_codes(const uint8_t* nib, const uint8_t* group, uint32_t depth, uint8_t* tsum) {
+  // 128 codes = 8 sub-tables of 16.  Instead of a blend tree, each sub-table's shuffle index gets
+  // bit 7 set in the lanes that belong to another sub-table (a byte shuffle returns 0 there), and
+  // the eight results are ORed: no blends, which cost two uops each on most x86 cores.
+  const PackB db;
+  const size_t lanes = hn::Lanes(db);
+  const uint32_t width = 1u << depth, subs = width > 16 ? width / 16 : 1;
+  const auto low = hn::Set(db, 15), off = hn::Set(db, 0x80);
+  for (size_t i = 0; i < kTiles; i += lanes) {
+    const auto idx = hn::LoadU(db, group + i);
+    const auto high = hn::ShiftRight<4>(idx);
+    hn::VFromD<PackB> sel[8];  // per sub-table: low index, or 0x80 in lanes of other sub-tables
+    for (uint32_t sub = 0; sub < subs; ++sub)
+      sel[sub] = hn::Or(hn::And(idx, low), hn::AndNot(hn::VecFromMask(db, hn::Eq(high, hn::Set(db, static_cast<uint8_t>(sub)))), off));
+    for (uint32_t k = 0; k < NP; ++k) {
+      auto v = hn::TableLookupBytes(hn::LoadDup128(db, nib + k * width), sel[0]);
+      for (uint32_t sub = 1; sub < subs; ++sub) v = hn::Or(v, hn::TableLookupBytes(hn::LoadDup128(db, nib + k * width + sub * 16), sel[sub]));
+      uint8_t* sum = tsum + k * kTiles + i;
+      hn::StoreU(hn::Add(hn::LoadU(db, sum), v), db, sum);
+    }
+  }
+}
+
 template <uint32_t NP>
 void run_tree(const TiledTree& tr, const uint16_t* active, size_t n_active, uint8_t* bsum) {
   switch (tr.v) {
@@ -611,10 +640,21 @@ void score_cells_simd(const ImysModel& m, const TiledModel& tm, const float* xn,
   if (lazy) bin_except_side64(m, tm, xn, offset, fine, coarse);
   else bin_tiles(m, tm, xn, offset, fine, coarse);
   auto total = hwy::AllocateAligned<int64_t>(kCells);  // tile-major: tile * 16 + cell
+  auto acc32 = hwy::AllocateAligned<int32_t>(kCells);  // the chunks of the current shift, unshifted
   auto bsum = hwy::AllocateAligned<uint8_t>(NP * kCells);
+  auto tsum = hwy::AllocateAligned<uint8_t>(NP * kTiles + 64);  // per-tile byte sums of the coarse trees
   auto group = hwy::AllocateAligned<uint8_t>(kTiles + 64);
-  std::vector<int32_t> flat(kTiles);
   std::fill(total.get(), total.get() + kCells, int64_t{0});
+  std::fill(acc32.get(), acc32.get() + kCells, 0);
+  int acc_shift = m.n_chunks ? m.shifts[0] : 0;
+  const hn::Rebind<int32_t, hn::ScalableTag<int64_t>> dh32;  // int32 half-width vectors matching d64
+  auto fold_acc = [&](int shift) {  // total += acc32 << shift, acc32 = 0
+    for (size_t cell = 0; cell < kCells; cell += l64) {
+      const auto v = hn::PromoteTo(d64, hn::LoadU(dh32, acc32.get() + cell));
+      hn::StoreU(hn::Add(hn::LoadU(d64, total.get() + cell), hn::ShiftLeftSame(v, shift)), d64, total.get() + cell);
+    }
+    std::fill(acc32.get(), acc32.get() + kCells, 0);
+  };
   std::vector<uint16_t> active(kTiles / kPack);
   for (size_t a = 0; a < active.size(); ++a) active[a] = static_cast<uint16_t>(a * kPack);
   size_t next_stage = 0;
@@ -626,8 +666,9 @@ void score_cells_simd(const ImysModel& m, const TiledModel& tm, const float* xn,
       bin_side64_lazy(m, tm, xn, offset, active.data(), active.size(), fine);
       side64_binned = true;
     }
+    if (m.shifts[c] != acc_shift) { fold_acc(acc_shift); acc_shift = m.shifts[c]; }
     std::memset(bsum.get(), 0, NP * kCells);
-    std::fill(flat.begin(), flat.end(), 0);
+    std::memset(tsum.get(), 0, NP * kTiles);
     for (uint32_t t = t0; t < t1; ++t) {
       const size_t s0 = static_cast<size_t>(t) * depth;
       TiledTree tr;
@@ -644,27 +685,32 @@ void score_cells_simd(const ImysModel& m, const TiledModel& tm, const float* xn,
         if (j == tr.v) for (size_t i = 0; i < kTiles; i += hn::Lanes(d8)) hn::Store(hn::TableLookupBytes(table, hn::LoadU(d8, bins + i)), d8, g + i);
         else for (size_t i = 0; i < kTiles; i += hn::Lanes(d8)) hn::Store(hn::Or(hn::Load(d8, g + i), hn::TableLookupBytes(table, hn::LoadU(d8, bins + i))), d8, g + i);
       }
-      if (tr.v == 0) {  // tile-constant tree: one gathered code per tile
-        const int32_t* code = tm.code32.data() + m.tree_offsets[t];
-        for (size_t i = 0; i < kTiles; i += hn::Lanes(d32))
-          hn::StoreU(hn::Add(hn::LoadU(d32, flat.data() + i), hn::GatherIndex(d32, code, hn::PromoteTo(d32, hn::LoadU(dq, g + i)))), d32, flat.data() + i);
+      if (tr.v == 0) {  // tile-constant tree: its code per tile by byte shuffles
+        coarse_tree_codes<NP>(tr.nib, g, depth, tsum.get());
       } else {
         run_tree<NP>(tr, active.data(), active.size(), bsum.get());
       }
       offsets_done += m.offsets[t];
     }
-    // widen this chunk's byte sums and tile totals into the running totals of the active packs
-    const int shift = m.shifts[c];
+    // widen this chunk's byte sums (cells) and tile sums (coarse trees) into the int32 accumulator
+    const hn::ScalableTag<int32_t> dw32;
+    const hn::Rebind<uint8_t, decltype(dw32)> dq32;
+    const size_t l32 = hn::Lanes(dw32);
     for (const uint16_t first : active) {
-      for (size_t i = 0; i < kPack * kTileCells; i += l64) {
-        const size_t cell = first * kTileCells + i;
-        auto v = hn::PromoteTo(d64, hn::PromoteTo(d32, hn::LoadU(dq, bsum.get() + cell)));
-        if constexpr (NP == 2) v = hn::Add(v, hn::ShiftLeft<4>(hn::PromoteTo(d64, hn::PromoteTo(d32, hn::LoadU(dq, bsum.get() + kCells + cell)))));
-        v = hn::Add(v, hn::Set(d64, static_cast<int64_t>(flat[cell / kTileCells])));
-        hn::StoreU(hn::Add(hn::LoadU(d64, total.get() + cell), hn::ShiftLeftSame(v, shift)), d64, total.get() + cell);
+      for (size_t tile = first; tile < first + kPack; ++tile) {
+        int32_t tile_code = tsum[tile];
+        if constexpr (NP == 2) tile_code += static_cast<int32_t>(tsum[kTiles + tile]) << 4;
+        const auto per_tile = hn::Set(dw32, tile_code);
+        for (size_t i = 0; i < kTileCells; i += l32) {
+          const size_t cell = tile * kTileCells + i;
+          auto v = hn::PromoteTo(dw32, hn::LoadU(dq32, bsum.get() + cell));
+          if constexpr (NP == 2) v = hn::Add(v, hn::ShiftLeft<4>(hn::PromoteTo(dw32, hn::LoadU(dq32, bsum.get() + kCells + cell))));
+          hn::StoreU(hn::Add(hn::Add(hn::LoadU(dw32, acc32.get() + cell), v), per_tile), dw32, acc32.get() + cell);
+        }
       }
     }
     if (opt.stages && next_stage < opt.stages->size() && (*opt.stages)[next_stage].trees == t1) {
+      fold_acc(acc_shift);
       const double theta = (*opt.stages)[next_stage++].theta;
       // integer threshold: total * 2^e_min + offsets_done >= theta  <=>  total >= ceil((theta - offsets_done) / 2^e_min)
       const double lim = std::ceil(std::ldexp(theta - offsets_done, -m.e_min));
@@ -679,6 +725,7 @@ void score_cells_simd(const ImysModel& m, const TiledModel& tm, const float* xn,
       active.resize(kept);
     }
   }
+  fold_acc(acc_shift);
   if (opt.packs_finished) *opt.packs_finished = active.size();
   std::vector<float> raw(kCells);
   for (size_t r = 0; r < kGrid; ++r)

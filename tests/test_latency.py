@@ -18,6 +18,7 @@ Python runtime on the way.
 
 **A random model is only an approximation of a trained one**, and traversal cost
 depends on its shape, so two properties are calibrated against a real trained model
+COARSE_MAX_SIDE = 16  # features constant inside a 4x4 tile: the coarse tier's features
 (``THRESHOLDS_PER_FEATURE`` and ``LEVEL_SHARE`` below).  For the real number, point
 the benchmark at an exported model instead::
 
@@ -62,6 +63,7 @@ THRESHOLDS_PER_FEATURE = 6
 # the least certain input here -- the printed "splits per tree that vary" line is
 # what to compare against a real model's.
 LEVEL_SHARE = {64: 0.38, 32: 0.20, 16: 0.14, 8: 0.13, 4: 0.07, 2: 0.05, 1: 0.04}
+COARSE_MAX_SIDE = 16  # features constant inside a 4x4 tile: what the coarse tier may split on
 _ITERS = 10
 _REPS = 15
 
@@ -93,9 +95,19 @@ def _p50_min(fn: Any, reps: int = _REPS) -> tuple[float, float]:
 
 
 def _random_model(
-    n_features: int, seed: int = 0, leaf_bits: int = 8
+    n_features: int,
+    seed: int = 0,
+    leaf_bits: int = 8,
+    coarse_fraction: float = 2.0 / 3.0,
+    keep_tiles: float = 0.5,
 ) -> tuple[bytes, NDArray[np.float32], NDArray[np.float32]]:
-    """A random model of the shipped shape: ``(blob, native fixture, dense fixture)``."""
+    """A random model of the shipped shape: ``(blob, native fixture, dense fixture)``.
+
+    The first ``coarse_fraction`` of the trees split only on tile-constant features
+    (side <= 16), like a fitted model's coarse tier.  Random leaves cannot be
+    calibrated, so the exit stage after the coarse tier is synthetic: its threshold is
+    set so that about ``keep_tiles`` of the tiles stay alive on the random fixture.
+    """
     rng = np.random.default_rng(seed)
     names = FeatureExtractor(_config(512).train).base_names
     step = max(1, len(names) // n_features)
@@ -112,10 +124,19 @@ def _random_model(
 
     counts = rng.integers(2, 2 * THRESHOLDS_PER_FEATURE, n_features)  # mean ~= the real model's
     borders = [np.sort(rng.uniform(0.05, 0.95, int(c))).tolist() for c in counts]
+    coarse_trees = int(round(N_TREES * coarse_fraction))
+    coarse_pools = [s for s in pools if s <= COARSE_MAX_SIDE]
+    coarse_weights = np.array([LEVEL_SHARE[s] for s in coarse_pools], dtype=float)
+    coarse_weights /= coarse_weights.sum()
     trees = []
-    for _ in range(N_TREES):
+    for tree in range(N_TREES):
         splits = []
-        for side in rng.choice(pools, size=DEPTH, p=weights):
+        chosen = (
+            rng.choice(coarse_pools, size=DEPTH, p=coarse_weights)
+            if tree < coarse_trees
+            else rng.choice(pools, size=DEPTH, p=weights)
+        )
+        for side in chosen:
             feature = int(rng.choice(by_side[int(side)]))
             cut = borders[feature][int(rng.integers(len(borders[feature])))]
             splits.append({"float_feature_index": feature, "border": cut})
@@ -128,7 +149,9 @@ def _random_model(
         },
         "oblivious_trees": trees,
     }
-    blob, _info = build_blob(model_json, level_shift=shifts, leaf_bits=leaf_bits)
+    blob, _info = build_blob(
+        model_json, level_shift=shifts, leaf_bits=leaf_bits, coarse_trees=coarse_trees
+    )
 
     native = np.concatenate(
         [rng.uniform(0.0, 1.0, side * side).astype(np.float32) for side in sides]
@@ -140,6 +163,18 @@ def _random_model(
         position += side * side
         factor = GRID // side
         dense[:, column] = np.repeat(np.repeat(block, factor, 0), factor, 1).ravel()
+    # synthetic exit stage: keep about keep_tiles of the tiles after the coarse tier
+    runtime = parse_blob(blob)
+    partial = runtime.partial_scores(runtime.bins(dense), [coarse_trees])[0]
+    tile_max = partial.reshape(GRID // 4, 4, GRID // 4, 4).max(axis=(1, 3)).ravel()
+    theta = float(np.quantile(tile_max, 1.0 - keep_tiles))
+    blob, _info = build_blob(
+        model_json,
+        level_shift=shifts,
+        leaf_bits=leaf_bits,
+        coarse_trees=coarse_trees,
+        exit_stages=[(coarse_trees, theta)],
+    )
     return blob, native, dense
 
 
@@ -165,10 +200,16 @@ def _report_model(name: str, out: str) -> None:
     """Print one model-inference row, with the tree shape it was measured on."""
     target = re.search(r"simd target: (\S+?),", out)
     varying = re.search(r"trees by varying splits: (.+)", out)
+    shipped = re.search(r"model, as shipped:\s*([\d.]+) ms", out)
     print(
         f"   {name:<24s} bin features {_ms('tile binner', out):6.3f} ms"
         f" + walk trees {_ms('simd traversal', out):6.3f} ms"
         f" = {_ms('model total', out):6.3f} ms   [{target.group(1) if target else '?'}]"
+        + (
+            f"\n{'':27s} as shipped (coarse tier per tile, exit, lazy binning): {float(shipped.group(1)):6.3f} ms"
+            if shipped
+            else ""
+        )
     )
     if varying:
         print(
@@ -205,9 +246,9 @@ def test_model_inference_latency(scorer: Path, scratch: Path) -> None:
         assert "BIT-IDENTICAL" in out  # SIMD traversal agrees with the scalar one
         label = f"random, {n_features} columns, {bits}-bit leaves"
         _report_model(label, out)
-    print("   A random model has no tile-constant tier and no exit stages, so this is the")
-    print("   full traversal; a fitted model runs its coarse tier once per tile and exits")
-    print("   early (see 'model, as shipped' in the scorer's output on a real model).")
+    print("   'as shipped' uses a synthetic exit stage that keeps half of the tiles after the")
+    print("   coarse tier (random leaves cannot be calibrated); a fitted model's stages are")
+    print("   calibrated on its training images and its share of alive tiles depends on the frame.")
 
 
 def _strides_for(size: int) -> tuple[int, ...]:
