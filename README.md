@@ -447,7 +447,7 @@ early exit), and writes a report folder:
   PR-AUC (primary), ROC-AUC, best F1 and its threshold, precision / recall / IoU at that
   threshold, fit time, model size and, when the C++ library is built, `predict_proba`
   latency; the framegate text heuristic as a baseline row; the best run's full config.
-* `pr.png`, `roc.png` -- precision-recall and ROC curves of the best runs and the baseline.
+* `curves.png` -- precision-recall and ROC curves side by side, for the best runs and the baseline.
 * `results.json`, `models/<key>.fdt` -- every run's config, metrics and exported model.
   Re-running with the same `--out` resumes: finished combinations are skipped.
 
@@ -461,7 +461,11 @@ That is 2 x 2 x 2 = 8 fits. Every knob takes a comma-separated list and the swee
 their Cartesian product, so name few knobs at a time; a knob you do not name keeps its
 default, which is the tuned production value. `--max-runs 2` smoke-tests a sweep,
 `--report-only` rebuilds the report and charts from `results.json`, `--no-baseline`
-skips the heuristic. Tuples take `/`: `--levels 64/32/16/8`.
+skips the heuristic, `--native-lib path/to/fastdet_native.{dll,so,dylib}` (or the
+`FASTDET_NATIVE_LIB` variable) fills the latency column from the in-process scorer.
+Tuples take `/`: `--levels 64/32/16/8`. Runs that share front-end settings reuse the
+extracted features and the perceptual-hash split cache, so only the first run of a
+sweep pays for extraction.
 
 Every field of `ModelConfig` and `TrainConfig` is a knob (`fastdet-tune --help` lists
 them with their current defaults). The ones worth sweeping:

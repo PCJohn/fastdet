@@ -80,6 +80,7 @@ class Detector:
         self.runtime: ImysModel | None = None  # scoring engine (fitted or loaded)
         self.exit_stages: list[tuple[int, float]] = []  # calibrated at fit time, stored in the blob
         self.native: NativeScorer | None = None  # in-process C++ scorer, when its library is built
+        self.train_cache: FeatureCache | None = None  # the last fit's training features (reusable)
         self.col_keep: Int64Array | None = None  # kept columns into the full design
         self.base_names: list[str] | None = None  # full (unpruned) column names
         self.feature_names: list[str] | None = None  # kept column names
@@ -161,18 +162,28 @@ class Detector:
         masks_dir: str | Path,
         *,
         evaluate: bool = True,
+        train_cache: FeatureCache | None = None,
     ) -> Detector:
         """Train on an images/masks directory pair.
 
         Builds the group-aware split, caches features, prunes columns, fits the
         symmetric booster, and (by default) records pooled validation PR-AUC.
+        ``train_cache`` reuses the training features of an earlier fit with the same
+        front-end settings and split (what ``fastdet-tune`` does between runs).
         """
         images_dir, masks_dir = str(images_dir), str(masks_dir)
         cfg = self.config
         _pairs, train_pairs, val_pairs = build_split(images_dir, masks_dir, cfg.train)
 
         print(f"[fastdet] train={len(train_pairs)} val={len(val_pairs)} images")
-        train_cache = FeatureCache(train_pairs, cfg.train, "train")
+        if train_cache is not None and (
+            train_cache.cfg != cfg.train or train_cache.img_paths != [p[0] for p in train_pairs]
+        ):
+            msg = "train_cache was built with different front-end settings or a different split"
+            raise ValueError(msg)
+        if train_cache is None:
+            train_cache = FeatureCache(train_pairs, cfg.train, "train")
+        self.train_cache = train_cache
         self.base_names = train_cache.base_names
         self.booster = None  # prune() requires an unfitted detector
         self.runtime = None
@@ -184,8 +195,10 @@ class Detector:
         design = gather_training_matrix(train_cache, img_ids, local_ids, self.col_keep)
         gib = design.nbytes / 2**30
         print(
-            f"[fastdet] X={design.shape} positives={int(labels.sum()):,} ({gib:.1f} GiB float32; "
-            "the fit quantises it to 4 bits and frees this copy)"
+            f"[fastdet] training matrix: {design.shape[0]:,} cells x {design.shape[1]} features, "
+            f"{int(labels.sum()):,} positives, {gib:.1f} GiB as float32 (CatBoost bins every feature into "
+            f"border_count={cfg.model.border_count} intervals for training and this copy is then freed; "
+            f"leaf values are stored at {cfg.model.leaf_bits} bits)"
         )
         if gib > _LARGE_MATRIX_GIB:
             print(

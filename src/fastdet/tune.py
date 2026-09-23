@@ -9,7 +9,7 @@ early exit), and writes:
   PR-AUC, ROC-AUC, best F1 and its threshold, precision / recall / IoU at that
   threshold, fit time, model size and (when the C++ library is built) latency; the
   framegate text heuristic as a baseline row; the best combination's full config.
-* ``pr.png`` / ``roc.png`` -- curves of the baseline and the best runs.
+* ``curves.png`` -- precision-recall and ROC curves, side by side, of the best runs and the baseline.
 * ``results.json`` -- every run's config and metrics; re-running resumes from it.
 
 Every field of :class:`~fastdet.config.ModelConfig` and
@@ -26,6 +26,7 @@ import dataclasses
 import hashlib
 import itertools
 import json
+import os
 import sys
 import time
 from dataclasses import fields
@@ -41,6 +42,7 @@ from .dataset import build_split
 from .detector import Detector
 from .features import _MEAN_IDX, GRID, RAW_FEATURE_NAMES, RAW_PER_CHANNEL, SPACE_INFO, FeatureCache
 from .metrics import pooled_pr_auc, score_validation_per_image
+from .native import native_library_path
 
 __all__ = ["framegate_text_heuristic", "main", "run_sweep"]
 
@@ -268,7 +270,7 @@ def _latency_ms(det: Detector, image: NDArray[np.uint8], reps: int = 10) -> floa
     return 1e3 * float(np.median(times))
 
 
-def run_sweep(  # noqa: PLR0913 -- the whole sweep in one readable function
+def run_sweep(  # noqa: PLR0913, PLR0915 -- the whole sweep in one readable function
     images_dir: Path,
     masks_dir: Path,
     out_dir: Path,
@@ -293,7 +295,9 @@ def run_sweep(  # noqa: PLR0913 -- the whole sweep in one readable function
         f"[fastdet-tune] {len(combos)} combination(s) over {sorted(sweep)}; {len(done & {_run_key(c) for c in combos})} already done"
     )
 
-    caches: dict[str, FeatureCache] = {}
+    caches: dict[str, tuple[FeatureCache, FeatureCache]] = (
+        {}
+    )  # (train, val) features, last front-end
     curves: dict[str, tuple[Float64Array, NDArray[np.bool_]]] = {}
     baseline_done = False
     for i, overrides in enumerate(combos, 1):
@@ -305,14 +309,21 @@ def run_sweep(  # noqa: PLR0913 -- the whole sweep in one readable function
         label = ", ".join(f"{k}={v}" for k, v in sorted(overrides.items())) or "defaults"
         print(f"[fastdet-tune] run {i}/{len(combos)}: {label}", flush=True)
         t0 = time.perf_counter()
-        det = Detector(cfg).fit(images_dir, masks_dir, evaluate=False)
+        # features are the same for every run with the same front-end settings: keep the latest
+        # train / val caches and hand the train one to fit() (fit time then excludes extraction)
+        reuse = caches.get(train_key)
+        det = Detector(cfg).fit(
+            images_dir, masks_dir, evaluate=False, train_cache=reuse[0] if reuse else None
+        )
         fit_s = time.perf_counter() - t0
-        if train_key not in caches:
-            _all, _train_pairs, val_pairs = build_split(
-                str(images_dir), str(masks_dir), cfg.train, phash_cache=None
-            )
-            caches[train_key] = FeatureCache(val_pairs, cfg.train, "val")
-        cache = caches[train_key]
+        if reuse is None:
+            _all, _train_pairs, val_pairs = build_split(str(images_dir), str(masks_dir), cfg.train)
+            if det.train_cache is None:
+                msg = "fit() left no training cache"
+                raise RuntimeError(msg)
+            caches.clear()
+            caches[train_key] = (det.train_cache, FeatureCache(val_pairs, cfg.train, "val"))
+        cache = caches[train_key][1]
         scores, labels = _validation_scores(det, cache)
         metrics = summarise(scores, labels)
         model_path = out_dir / "models" / f"{key}.fdt"
@@ -479,35 +490,29 @@ def _write_charts(out_dir: Path, ranked: list[dict[str, Any]], swept: list[str])
         )
     if not entries:
         return []
-    written = []
-    for name, kind in (("pr.png", "pr"), ("roc.png", "roc")):
-        fig, ax = plt.subplots(figsize=(7, 5.5))
-        for label, scores, labels in entries:
-            style = "--" if label.startswith("baseline") else "-"
-            if kind == "pr":
-                recall, precision, _ = pr_curve(scores, labels)
-                ax.plot(recall, precision, style, label=label)
-            else:
-                fpr, tpr, auc = roc_curve(scores, labels)
-                ax.plot(fpr, tpr, style, label=f"{label} AUC {auc:.3f}")
-        if kind == "pr":
-            ax.set_xlabel("recall")
-            ax.set_ylabel("precision")
-            ax.set_title("Precision-recall (pooled validation cells)")
-        else:
-            ax.plot([0, 1], [0, 1], ":", color="grey")
-            ax.set_xlabel("false positive rate")
-            ax.set_ylabel("true positive rate")
-            ax.set_title("ROC (pooled validation cells)")
+    fig, (ax_pr, ax_roc) = plt.subplots(1, 2, figsize=(13, 5.5))
+    for label, scores, labels in entries:
+        style = "--" if label.startswith("baseline") else "-"
+        recall, precision, _ = pr_curve(scores, labels)
+        ax_pr.plot(recall, precision, style, label=label)
+        fpr, tpr, auc = roc_curve(scores, labels)
+        ax_roc.plot(fpr, tpr, style, label=f"{label} ROC-AUC {auc:.3f}")
+    ax_pr.set_xlabel("recall")
+    ax_pr.set_ylabel("precision")
+    ax_pr.set_title("Precision-recall (pooled validation cells)")
+    ax_roc.plot([0, 1], [0, 1], ":", color="grey")
+    ax_roc.set_xlabel("false positive rate")
+    ax_roc.set_ylabel("true positive rate")
+    ax_roc.set_title("ROC (pooled validation cells)")
+    for ax in (ax_pr, ax_roc):
         ax.set_xlim(0, 1)
         ax.set_ylim(0, 1.02)
         ax.grid(alpha=0.3)
-        ax.legend(fontsize=7, loc="best")
-        fig.tight_layout()
-        fig.savefig(out_dir / name, dpi=130)
-        plt.close(fig)
-        written.append(name)
-    return written
+        ax.legend(fontsize=7, loc="lower left" if ax is ax_pr else "lower right")
+    fig.tight_layout()
+    fig.savefig(out_dir / "curves.png", dpi=130)
+    plt.close(fig)
+    return ["curves.png"]
 
 
 # ---------------------------------------------------------------------------------------------
@@ -544,6 +549,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="rebuild report.md and the charts from results.json",
     )
+    parser.add_argument(
+        "--native-lib",
+        type=Path,
+        default=None,
+        help="the fastdet_native shared library (else FASTDET_NATIVE_LIB or the build directories); "
+        "with it the latency column is measured in-process",
+    )
     for name, (section, f) in _knob_fields().items():
         default = f.default if f.default is not dataclasses.MISSING else None
         parser.add_argument(
@@ -573,6 +585,13 @@ def sweep_from_args(args: argparse.Namespace) -> dict[str, list[Any]]:
 def main(argv: list[str] | None = None) -> int:
     """Entry point of ``fastdet-tune``."""
     args = build_parser().parse_args(argv)
+    if args.native_lib is not None:
+        os.environ["FASTDET_NATIVE_LIB"] = str(args.native_lib)
+    if native_library_path() is None:
+        print(
+            "[fastdet-tune] no fastdet_native library found (build cpp/ and pass --native-lib or set "
+            "FASTDET_NATIVE_LIB): the latency column will be empty"
+        )
     sweep = sweep_from_args(args)
     if args.report_only:
         results_path = args.out / "results.json"

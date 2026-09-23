@@ -98,8 +98,7 @@ def test_sweep_writes_report_and_charts(tiny_dataset: tuple[Path, Path], tmp_pat
     text = report.read_text()
     assert "| run | n_trees | PR-AUC" in text
     assert "baseline: framegate heuristic" in text
-    assert (out / "pr.png").exists()
-    assert (out / "roc.png").exists()
+    assert (out / "curves.png").exists()
     assert len(list((out / "models").glob("*.fdt"))) == 2
     # resuming does not refit
     report2 = run_sweep(images_dir, masks_dir, out, sweep, top_charts=2)
