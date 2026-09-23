@@ -200,6 +200,19 @@ levels/combos 64,32,16,8, mode raw_plus_global_bard_context_ext
 996 columns = 912 raw (4 levels × 114 × 2 scales) + 28 global (7 × 4) + 28 bard (7 × 4)
 + 20 context (5 × 4) + 8 ctx2 (2 × 4). `imfeat` cost 8.2 ms/image single-threaded.
 
+**Superseded (Sep 2026).** Two changes since this section was written. (1) `bard` now
+ships inside imfeat's raw block (7 columns per channel, verified to 2.4e-7 against the
+numpy bank it replaced), so fastdet computes no image features itself; imfeat also grew a
+9-column texture block, for 54 columns per channel. (2) The front-end was switched to
+framegate's single imfeat pass — 1024 px square, HSV, stride 4, 64×64 finest grid, six
+levels (64…2), no extra scale — so a framegate process can feed fastdet directly. That
+front-end is 1178 columns: 972 raw (6 levels × 162), 30 context + 12 ctx2 (6 levels ×
+5 and × 2; the coarsest levels are zero where the kernels do not fit), and a 164-wide
+global block carried once at the finest level. Note that it reintroduces HSV, which §3.1
+measured at ~−0.03 against CIELAB on the old pipeline. No model has been trained on it
+yet: every PR-AUC and latency figure in this report applies to earlier front-ends, and the
+bundled feature ranking must be regenerated before pruning.
+
 **Top split-gain importances** (500k-cell run, 0.8234 PR-AUC, F1 0.7443, IoU 0.5927,
 MCC 0.7272 vs framegate 0.4211 / 0.4285 / 0.2727 / 0.3847):
 

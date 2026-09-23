@@ -60,18 +60,21 @@ class ModelConfig:
 class TrainConfig:
     """Front-end, sampling and pruning knobs (how features become a dataset)."""
 
-    levels: tuple[int, ...] = (64, 32, 16, 8)  # Pyramid levels, coarsest cell LxL, finest=64.
-    feature_mode: str = "raw_plus_global_bard_context_ext"  # Which feature banks to build.
-    thumb: int = 512  # Square resize target the feature pyramid is computed on.
-    stride: int = 2  # imfeat sampling stride at the primary scale.
-    extra_scales: str = "256:1"  # Extra imfeat scales, 'thumb:stride;...' ('' disables).
+    # The front-end matches framegate's single imfeat pass (1024 px square, HSV,
+    # stride 4, 64x64 finest grid, six dyadic levels) so a framegate process can
+    # hand its Pyramid straight to a fastdet model instead of running a second pass.
+    levels: tuple[int, ...] = (64, 32, 16, 8, 4, 2)  # Grid sizes per level; finest must be 64.
+    feature_mode: str = "raw_plus_global_context_ext"  # Which feature banks to build.
+    thumb: int = 1024  # Square resize target the feature pyramid is computed on.
+    stride: int = 4  # imfeat sampling stride at the primary scale.
+    extra_scales: str = ""  # Extra imfeat scales, 'thumb:stride;...' ('' disables).
     resize_interp: str = "area"  # Thumbnail resize kernel: 'area' or 'nearest'.
-    imfeat_space: str = "lab"  # Color space fed to imfeat: hsv|lab|luv|yuv.
-    bank_gray: str = "lstar"  # Channel driving the stroke/context banks: v|y|lstar.
-    bard_lags: tuple[int, ...] = (1, 2, 4)  # Bar-detector neighbor distances, in pixels.
-    bard_tau: float = 8.0  # Per-pixel contrast floor (grey levels) for the bar detector.
+    imfeat_space: str = "hsv"  # Color space fed to imfeat: hsv|lab|luv|yuv.
     gt_cell_thresh: float = 0.10  # Cell coverage >= this is a positive training label.
-    top_k_features: int = 512  # Columns kept after importance pruning (<= full width; 0 = all).
+    # 0 = keep every column.  The bundled ranking is keyed to the raw column names
+    # of an older imfeat build; regenerate it from a full-width fit before pruning
+    # again (see training.default_feature_ranks_path).
+    top_k_features: int = 0
     feature_ranks: str | None = None  # Gain-ranking JSON; None = the bundled frozen ranking.
     split_seed: int = 42  # Seed for the group-aware train/val split.
     val_frac: float = 0.15  # Fraction of near-duplicate groups held out for validation.
@@ -82,7 +85,12 @@ class TrainConfig:
     def __post_init__(self) -> None:
         """Normalize multi-valued fields and validate the front-end knobs."""
         self.levels = tuple(sorted({int(v) for v in self.levels}, reverse=True))
-        self.bard_lags = tuple(int(v) for v in self.bard_lags)
+        if not self.levels or self.levels[0] != _FINEST_GRID:
+            msg = f"levels must start at the {_FINEST_GRID}x{_FINEST_GRID} output grid"
+            raise ValueError(msg)
+        if any(v < 1 or v & (v - 1) for v in self.levels):
+            msg = "levels must be powers of two (dyadic pyramid)"
+            raise ValueError(msg)
         if self.feature_mode not in _FEATURE_MODE_TAGS:
             msg = f"unknown feature_mode {self.feature_mode!r}"
             raise ValueError(msg)
@@ -126,7 +134,6 @@ class Config:
         """Return the fully resolved config as plain JSON-compatible data."""
         d = dataclasses.asdict(self)
         d["train"]["levels"] = list(self.train.levels)
-        d["train"]["bard_lags"] = list(self.train.bard_lags)
         return d
 
     @classmethod
@@ -137,8 +144,6 @@ class Config:
         train_d = dict(data.get("train") or {})
         if "levels" in train_d:
             train_d["levels"] = tuple(train_d["levels"])
-        if "bard_lags" in train_d:
-            train_d["bard_lags"] = tuple(train_d["bard_lags"])
         train = TrainConfig(**train_d)
         export = ExportConfig(**(data.get("export") or {}))
         return cls(model=model, train=train, export=export)
@@ -182,12 +187,15 @@ class Config:
 
 
 # Imported lazily to keep this module importable without the feature stack.
+_FINEST_GRID = 64  # The output grid; mirrors features.GRID.
 _SPACE_LETTERS = {"hsv", "lab", "luv", "yuv"}
+# The bar detector ("bard") is no longer a fastdet bank: imfeat computes it inside
+# the raw block, so it arrives with "raw" and needs no tag of its own.
 _FEATURE_MODE_TAGS = {
     "raw": ["raw"],
     "raw_plus_global": ["raw", "global"],
-    "raw_plus_global_bard": ["raw", "global", "bard"],
-    "raw_plus_global_bard_context_ext": ["raw", "global", "bard", "context", "ctx2"],
+    "raw_plus_global_context": ["raw", "global", "context"],
+    "raw_plus_global_context_ext": ["raw", "global", "context", "ctx2"],
 }
 
 

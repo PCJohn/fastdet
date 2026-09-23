@@ -6,13 +6,13 @@ model, then exports the result as **one self-contained file**. A Python runtime
 and a dependency-free C++ runtime read the same bytes and produce identical
 scores.
 
-Measured on the reference dataset with the default `d7 × 2400` booster: pooled
-validation PR-AUC ≈ 0.8106 (mean of three seeds); full C++ model ≈ 5.7 ms per
-64×64 image, single-threaded, on top of ≈ 8.2 ms of feature extraction. Halving
-the tree count (`Detector(n_trees=1200)`) measures 3.71 ms; the quality of that
-configuration was never measured head to head, so the size of the trade is
-open — see §7.1 of the report. What was tried, and what was rejected, is
-recorded in [`research_report.md`](research_report.md).
+The front-end matches [framegate](https://github.com/PCJohn/framegate)'s single
+imfeat pass (1024 px square, HSV, stride 4, 64×64 finest grid, six levels), so a
+framegate process can feed its own features to a fastdet model. **No model has
+been trained or measured on this front-end yet**: the quality and latency figures
+in [`research_report.md`](research_report.md) describe earlier front-ends
+(512 px, CIELAB, an extra 256 px scale) and do not transfer. Regenerate the
+feature ranking from a full-width fit before pruning (see *Pruning*).
 
 ## Install
 
@@ -71,8 +71,8 @@ that was measured on the reference data. No GPU and no config file are needed.
 
 Columns are ranked once by split gain on the frozen front-end; the ranking ships
 in the package (`src/fastdet/data/feature_ranks.json`). Pruning keeps the top
-`top_k` columns — 512 of 996 by default, at no measurable quality cost. Choose a
-different subset before fitting:
+`top_k` columns (`0` = keep all, the default until the ranking is regenerated
+for the current front-end). Choose a subset before fitting:
 
 ```python
 from fastdet import Detector
@@ -117,23 +117,27 @@ source resolution to crop or overlay. The C++ runtime scores the same file; see
 
 ### Features
 
-Each image is resized to a 512×512 thumbnail (`INTER_AREA`), converted to
-CIELAB, and passed to `imfeat` at four pyramid levels (64/32/16/8 cells) plus an
-extra 256 px scale. For every cell of the finest 64×64 grid, the front-end
-concatenates the features of all levels into one row:
+Each image is squashed to a 1024×1024 thumbnail (`INTER_AREA`; the aspect ratio
+is kept as a global feature instead), converted to HSV, and passed to `imfeat`
+once at stride 4 with six pyramid levels (64/32/16/8/4/2 cells) — framegate's
+exact configuration. For every cell of the finest 64×64 grid, the front-end
+concatenates the features of all levels into one row (1178 columns):
 
-- `raw` — imfeat's 3×38 block per cell, per scale;
-- `global` — seven whole-image statistics, broadcast to every cell;
-- `bard` — a multi-lag bar detector that fires when a pixel is darker or
-  brighter than its neighbours on both sides;
-- `context`, `ctx2` — small- and large-scale surround, ring, and range of the
-  pooled grey mean.
+- `raw` — imfeat's per-channel block per cell, per scale. This includes the
+  multi-lag bar detector (`bard_*`), which fires when a pixel is darker or
+  brighter than its neighbours on both sides: it is the one new feature that
+  survived ablation (research report §3.5), and it now lives in imfeat rather
+  than here;
+- `global` — imfeat's whole-image block plus the original frame's aspect ratio
+  and log area, broadcast to every cell;
+- `context`, `ctx2` — small- and large-scale surround, ring, and range of
+  imfeat's per-cell luminance mean.
 
-The frozen front-end yields 996 columns per cell. The banks are documented at
-the top of [`features.py`](src/fastdet/features.py#L10); the assembly lives in
-[`FeatureExtractor.extract`](src/fastdet/features.py#L695) and
-[`FeatureExtractor.gather`](src/fastdet/features.py#L724). `bard` is the one new
-bank that survived ablation (research report §3.5).
+**fastdet computes no image features of its own.** Every per-pixel quantity
+comes from imfeat in a single pass; the banks above are cheap reductions of its
+output. The assembly lives in
+[`FeatureExtractor.extract`](src/fastdet/features.py) and
+[`FeatureExtractor.gather`](src/fastdet/features.py).
 
 ### Labels and split
 
@@ -198,9 +202,22 @@ One full-width training run produces a split-gain ranking; the bundled JSON
 stores the descending column names.
 [`select_columns`](src/fastdet/training.py#L45) keeps the highest-ranked columns
 in canonical order, and [`Detector.prune`](src/fastdet/detector.py#L105) wires
-that into the pipeline. Top-512 costs no measurable PR-AUC and shrinks both the
-design matrix and the exported model. Pruning reduces model cost only: the
-front-end still computes all 996 columns, so it does not speed up `imfeat`.
+that into the pipeline. Pruning reduces model cost only: the front-end still
+computes every column, so it does not speed up `imfeat`.
+
+> **Note.** The bundled ranking was produced against an older front-end whose
+> columns differ, so `top_k_features` defaults to `0` (keep everything).
+> Regenerate it from a full-width fit with
+> [`build_ranking`](src/fastdet/training.py):
+>
+> ```python
+> full = Detector().fit(images_dir, masks_dir)          # top_k_features = 0
+> ranking = build_ranking(full.booster, full.feature_names)
+> Path("ranks.json").write_text(json.dumps(ranking))
+> cfg = Config()
+> cfg.train.top_k_features, cfg.train.feature_ranks = 512, "ranks.json"
+> det = Detector(cfg).fit(images_dir, masks_dir)
+> ```
 
 Column selection defines the matrix the booster is trained on, so `prune()` is a
 pre-`fit` step. Calling it on a fitted detector discards the booster and the
@@ -304,28 +321,89 @@ capped at `MAX_BORDER_COUNT = 15` because a bin must fit a nibble.
 ## C++ runtime
 
 `cpp/fastdet_score.cpp` is a dependency-free reader and scorer for the same
-file. It ships one AVX2 nibble traversal plus a scalar reference path and a
-fused packed binner, and it self-checks the binner and both traversals against
-each other.
+file. It ships one SIMD traversal plus a scalar reference path and one binner,
+and it self-checks the binner and both traversals against each other.
 
-Build (MSVC, from `cpp/`):
+The scorer uses [Google Highway](https://github.com/google/highway) for SIMD,
+exactly as `imfeat` does: static dispatch, with the target chosen by the compiler
+flags, so one source runs SSE4/AVX2/AVX-512 on x86 and NEON/SVE on Arm.
 
-```bat
-call "%VS%\VC\Auxiliary\Build\vcvars64.bat"
-cl /nologo /O2 /EHsc /std:c++17 /arch:AVX2 fastdet_score.cpp /Fe:fastdet_score.exe
+The traversal is built on the shape of the features. They form a pyramid, so most
+splits test a value that is constant over a block of cells: in a default-size
+model about 40% of the splits are constant on any 4×4 block of cells. Cells are
+therefore scored in 4×4 **tiles** (16 cells, one 128-bit vector of byte lanes,
+two tiles per AVX2 vector), and each tree's splits are divided in two:
+
+- splits on features of side ≤ 16 (and image-wide features) are constant on a
+  tile. They are evaluated once per tile, at 16×16 resolution, and only choose
+  *which group of leaves* the tile can reach;
+- the `v` splits on side-64 and side-32 features vary inside the tile and index
+  within that group. Leaves are permuted per tree at load time so these are the
+  low index bits. With `v ≤ 4` the group has at most 16 leaves, and the leaf
+  values are fetched by four byte shuffles (one per byte of the float32) instead
+  of a gather; `v = 5` uses two shuffles and a blend, `v = 0` a broadcast, and
+  only `v ≥ 6` falls back to a gather.
+
+The loop order is tree-outer: one tree runs over every pack of tiles with its
+dispatch on `v`, its split tables and its plane pointers hoisted, and the running
+sums live in a 16 KB buffer rather than in registers (11% faster than the
+reverse, and each tree streams its few planes sequentially). Every cell still
+adds its trees in order, so the result is bit-identical to the scalar reference.
+
+The binner bins only the features the model uses, each value once, straight into the two layouts the traversal reads (tile-major bytes for
+the varying features, one byte per tile for the rest), with the comparison loop
+unrolled over the feature's cut count. On a depth-7 × 2400 model fitted to
+synthetic text images this measured 2.6 ms per image (0.45 ms binning + 2.1 ms
+traversal; AVX2, one thread) against 5.4 ms (0.9 + 4.6) for the per-cell,
+gather-based traversal it replaced, and 21 M instead of 39 M instructions per
+traversal. The program prints how many trees fall in each `v` class; that
+distribution decides the speed, so check it on a real model. CMake fetches
+Highway 1.2.0 (the same pin as `imfeat`):
+
+```sh
+cmake -S cpp -B build && cmake --build build --config Release --target fastdet_score
 ```
+
+The default target is the build machine (`-march=native`; `/arch:AVX2` with
+MSVC). For a portable or cross build set `-DFASTDET_ARCH_FLAGS=...`. Note that
+GCC's `-march=haswell` does not enable AES, which Highway's AVX2 target requires,
+so it silently falls back to 16-byte vectors; use
+`"-march=haswell -maes -mpclmul"`. To build offline, point CMake at a local
+Highway checkout with `-DFETCHCONTENT_SOURCE_DIR_HIGHWAY=/path/to/highway`. The
+program prints the Highway target it was built for.
 
 Run:
 
 ```bat
-fastdet_score.exe model.fdt fixtures.f32 [expected.f32] [iters]
+fastdet_score model.fdt fixtures.f32 [expected.f32] [iters]
 ```
 
-`fixtures.f32` is `4 * 4096 * n_features` bytes of little-endian float32 holding
-the 64×64 cells of one image, row-major — exactly what
-`Detector.design_matrix(image)` returns. With `expected.f32` (4096 float32, e.g.
+`fixtures.f32` holds one image's kept features at their **native resolution** —
+exactly what `Detector.native_matrix(image)` returns. Each feature, in model
+order, contributes its level's `side × side` little-endian float32 values
+row-major, where `side = 64 >> (level_shift / 2)`: 64 for the finest level, 2 for
+the coarsest, and 1 for an image-wide global. No dense `4096 × n_features` table
+is built on the inference path: a level-8 feature is 64 values rather than 4096
+copies of them, and the binner bins each distinct value once. For the default
+front-end that is 3.7 MB instead of 19.3 MB per image, and binning is ~6× faster.
+(`Detector.design_matrix(image)` still returns the dense matrix; it feeds training
+and the Python reference runtime, and expanding every native value over its
+block reproduces it exactly.) With `expected.f32` (4096 float32, e.g.
 `Detector.predict_proba(image).reshape(-1)`), the program also reports the
 maximum absolute probability error and exits non-zero if any gate fails.
+
+**Optional early exit (experimental).** A fifth argument, `"trees:theta,..."`,
+adds stages to the same traversal: once `trees` trees have run, a pack of tiles
+in which every raw sum is below `theta` is dropped and its cells keep that
+partial sum. A pack that survives has run every tree in order, so
+its scores are bit-identical to the full evaluation; only confidently negative
+tiles are cut short. The program times it next to the full evaluation and prints
+how many cells stayed identical and the highest full probability among those
+that did not. On the synthetic model above, with thresholds taken from the
+training images (the lowest partial sum of any cell that ends at p ≥ 0.05,
+minus 2), traversal on the six validation images fell from 2.1 ms to 0.7–1.2 ms
+and no cell ending at p ≥ 0.05 was cut short. The thresholds are a property of
+the data: calibrate them on yours, and validate PR-AUC, before using this.
 
 ## Development
 
@@ -339,10 +417,14 @@ python -m mypy --strict .
 
 The default suite fits a tiny synthetic detector, exports it, reloads it, and
 asserts the reloaded model reproduces scores exactly. `tests/test_cpp_runtime.py`
-(marked `slow`) additionally compiles `cpp/fastdet_score.cpp`, feeds it the same
-artifact plus a fixture built by `Detector.design_matrix`, and fails if the C++
-scorer diverges from the Python one or if its internal binner/traversal gates
-fail. It skips when no compiler or no AVX2 host is available.
+(marked `slow`) additionally builds `cpp/` with CMake (set `FASTDET_HWY_DIR` to a
+local Highway checkout to build offline), feeds it the same
+artifact plus a fixture built by `Detector.native_matrix` for every image, and
+fails if the C++ scorer diverges from the Python one (which scores the dense
+matrix, so the two share no feature-layout code) or if its internal
+binner/traversal gates fail. A hand-built one-split model pins the image-wide
+(global) binning path deterministically. It skips when cmake is unavailable or
+the scorer cannot be built.
 
 ## Layout
 

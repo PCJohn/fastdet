@@ -59,9 +59,13 @@ def small_config() -> Config:
     """A cheap but structurally complete config for end-to-end tests."""
     return Config(
         model=ModelConfig(depth=3, n_trees=60, learning_rate=0.2, border_count=15),
+        # The default front-end's shape (HSV, one scale, six dyadic levels down to
+        # 2x2, so level shifts 8 and 10 reach the exporter and the C++ binner) at a
+        # quarter of its resolution: 256 px at stride 1 keeps 4 samples per cell.
         train=TrainConfig(
-            levels=(64, 32, 16, 8),
+            levels=(64, 32, 16, 8, 4, 2),
             thumb=256,
+            stride=1,
             top_k_features=0,
             val_frac=0.25,
             max_train_cells=20_000,

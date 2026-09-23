@@ -10,18 +10,20 @@ single row per cell from every level.
 Banks, in the order :meth:`FeatureExtractor.gather` emits them per level:
 
 ``raw``
-    imfeat's 3x38 raw block per cell (plus a 114-wide block per extra scale).
+    imfeat's per-channel raw block per cell, once per scale.
 ``global``
-    seven whole-image scalars, identical for every cell (broadcast).
-``bard``
-    multi-lag bar-detector stroke statistics (cover / spectrum / peak / balance).
+    imfeat's whole-image raw block plus the original frame's aspect ratio and
+    log area, identical for every cell (broadcast, carried at the finest level
+    only since it does not vary by level).
 ``context``
-    small-scale surround/ring/range of the pooled grey mean.
+    small-scale surround/ring/range of imfeat's per-cell luminance mean.
 ``ctx2``
     the large-scale companion of ``context`` (9x9 surround, 5x5 range).
 
-The numeric behaviour here is frozen: it reproduces the design matrices the
-shipped model was trained on bit-for-bit.
+fastdet computes no image features of its own: everything per-pixel comes from
+imfeat in a single pass, and the banks here are cheap reductions of its output.
+The bar detector ("bard") used to live in this module in numpy; it now arrives
+inside imfeat's raw block, seven columns per channel.
 """
 
 from __future__ import annotations
@@ -42,13 +44,11 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
 __all__ = [
-    "BARD_LAGS",
-    "BARD_TAU",
     "CONTEXT2_FEATURE_NAMES",
     "CONTEXT_FEATURE_NAMES",
     "FEATURE_CHANNELS",
-    "GLOBAL_STAT_NAMES",
     "GRID",
+    "IMAGE_STAT_NAMES",
     "RAW_FEATURE_NAMES",
     "SPACE_INFO",
     "STRIDE",
@@ -65,22 +65,17 @@ Image = NDArray[np.uint8]
 FloatArray = NDArray[np.float32]
 
 GRID = 64  # Finest/output grid resolution; fixed regardless of the feature levels.
-FEATURE_CHANNELS = 3 * 38  # 114: three channels x imfeat's 38-D raw block.
+RAW_CHANNELS = 3  # imfeat is always fed a 3-channel image.
 THUMB = 512  # Default square resize target for the feature pyramid.
 STRIDE = 2  # Default imfeat sampling stride at the primary scale.
-BARD_LAGS = (1, 2, 4)  # Default bar-detector neighbor distances in pixels.
-BARD_TAU = 8.0  # Default per-pixel contrast floor (grey levels).
 
 _EPS = 1e-9  # Guard for the pooled ratios below (never a real denominator).
 _SAMPLES_PER_CELL = 4  # imfeat samples four points per cell; see parse_extra_scales.
-_BAR_SPAN = 2  # A lag-d neighbor test reaches +/- d, i.e. spans 2*d.
 _CTX1_SIZE = 3  # Small-scale context kernel side.
 _CTX2_SIZE = 5  # Large-scale range kernel side.
 _CTX2_SURROUND = 9  # Large-scale surround kernel side.
 _CTX1_MIN_GRID = 3  # Below this the 3x3 context kernel is undefined.
 _CTX2_MIN_GRID = 5  # Below this the 5x5 range kernel is undefined.
-_COHERENCE_PERCENTILE = 75  # Percentile of the finest-level coherence used globally.
-_LEVEL_SHIFT = {64: 0, 32: 2, 16: 4, 8: 6}  # 2*log2(64/level) per level size.
 
 
 @dataclass(frozen=True)
@@ -93,7 +88,7 @@ class SpaceInfo:
     chr: int
 
 
-# Color spaces the front-end can feed imfeat.  The 38-D block layout is
+# Color spaces the front-end can feed imfeat.  The raw block layout is
 # channel-agnostic; the global scalars and the bar/context banks assume specific
 # channel roles, hence `lum` (luminance-like) and `chr` (chroma used by the
 # S_mean_global proxy).
@@ -105,59 +100,32 @@ SPACE_INFO: dict[str, SpaceInfo] = {
 }
 CHANNEL_LETTERS = ("H", "S", "V")
 
-# Per-channel 38-feature layout of a raw block, in exact imfeat order:
-# f[0..4] structure tensor, f[5..13] HOG, f[14..15] extrema, f[16..25] LBP,
-# f[26..33] derived nonlinear descriptors, f[34..37] moments.
-RAW_FEATURE_NAMES = (
-    "energy",
-    "coherence",
-    "anisotropy",
-    "shear",
-    "corner",
-    "hog0",
-    "hog1",
-    "hog2",
-    "hog3",
-    "hog4",
-    "hog5",
-    "hog6",
-    "hog7",
-    "hog8",
-    "vmax",
-    "vmin",
-    "lbp0",
-    "lbp1",
-    "lbp2",
-    "lbp3",
-    "lbp4",
-    "lbp5",
-    "lbp6",
-    "lbp7",
-    "lbp8",
-    "lbp9",
-    "std_skew",
-    "excess_kurt",
-    "edge_sharpness",
-    "detail",
-    "concentration",
-    "cardinality",
-    "grad_sparsity",
-    "rms_contrast",
-    "mean",
-    "var",
-    "m3",
-    "m4",
-)
+# One channel's slice of an imfeat raw block, taken from the library rather than
+# copied: imfeat's per-channel width is a compile-time property of its build (it
+# grew from 38 to 45 when the bar detector landed), and a stale copy here silently
+# mislabels every column.
+RAW_FEATURE_NAMES: tuple[str, ...] = tuple(imfeat.FEATURE_NAMES)
+RAW_PER_CHANNEL = len(RAW_FEATURE_NAMES)
+FEATURE_CHANNELS = RAW_CHANNELS * RAW_PER_CHANNEL  # one scale's raw block width
 
-GLOBAL_STAT_NAMES = (
-    "texture_level",
-    "S_mean_global",
-    "V_mean_global",
-    "V_var_global",
-    "coherence_p75",
-    "aspect_ratio",
-    "log_orig_area",
-)
+# Column offsets inside a channel's slice, looked up by name for the same reason.
+_MEAN_IDX = RAW_FEATURE_NAMES.index("mean")
+_VAR_IDX = RAW_FEATURE_NAMES.index("var")
+_COHERENCE_IDX = RAW_FEATURE_NAMES.index("coherence")
+
+# Whole-image scalars broadcast to every cell.  imfeat already computes a global
+# (1-cell) level of the full raw block in the same pass, so the bank is that block
+# plus the two things imfeat cannot know: the ORIGINAL frame's shape.
+IMAGE_STAT_NAMES = ("aspect_ratio", "log_orig_area")
+
+
+def global_stat_names(space: SpaceInfo) -> tuple[str, ...]:
+    """Column names of the broadcast global bank for ``space``."""
+    return (
+        tuple(f"{letter}_{feature}" for letter in space.letters for feature in RAW_FEATURE_NAMES)
+        + IMAGE_STAT_NAMES
+    )
+
 
 CONTEXT_FEATURE_NAMES = ("ctx_x", "ctx_y", "ctx_surr3", "ctx_ring35", "ctx_range3")
 CONTEXT2_FEATURE_NAMES = ("ctx_surr9", "ctx_range5")
@@ -177,6 +145,28 @@ class ExtraScale:
     thumb: int
     stride: int
     label: str
+
+
+# One pyramid level: imfeat's raw map per scale, as imfeat returns it, then one
+# array per context bank.  Laid end to end these are the level's canonical columns.
+LevelBanks = tuple["FloatArray", ...]
+
+
+@dataclass(frozen=True)
+class _Copy:
+    """One contiguous run of output columns, copied from one bank of one level.
+
+    ``bank`` indexes the level's :data:`LevelBanks` (ignored for broadcast runs);
+    ``src`` indexes that bank's last axis (a slice when the kept columns are
+    contiguous, which makes the source a view); the run lands in ``[dst0, dst1)``.
+    """
+
+    size: int
+    broadcast: bool
+    bank: int
+    src: slice | NDArray[np.intp]
+    dst0: int
+    dst1: int
 
 
 def exponent_for_size(size: int) -> int:
@@ -229,147 +219,8 @@ def parse_extra_scales(spec: str) -> list[ExtraScale]:
     return out
 
 
-def bank_channel(thumb_bgr: Image, bank_gray: str) -> Image:
-    """The single grey channel driving the bar-detector and context banks.
-
-    ``v`` is framegate's saturation-blind choice; ``y`` (BT.601 luma) and
-    ``lstar`` (Lab L*) are alternatives derived from the same resized thumb.
-    """
-    if bank_gray == "v":
-        return np.asarray(cv2.cvtColor(thumb_bgr, cv2.COLOR_BGR2HSV)[:, :, 2], dtype=np.uint8)
-    if bank_gray == "y":
-        return np.asarray(cv2.cvtColor(thumb_bgr, cv2.COLOR_BGR2GRAY), dtype=np.uint8)
-    return np.asarray(cv2.cvtColor(thumb_bgr, cv2.COLOR_BGR2LAB)[:, :, 0], dtype=np.uint8)
-
-
-def resolve_bard_channels(space_name: str, spec: str) -> list[tuple[str, int]]:
-    """Resolve a bard-channel spec against the active space.
-
-    Tokens: ``lum`` (luminance channel), ``chr1``/``chr2`` (the two chroma
-    channels), a literal space letter, or ``all``.
-    """
-    space = SPACE_INFO[space_name]
-    letters = space.letters
-    role = {"lum": space.lum, "chr1": space.chr}
-    role["chr2"] = next(i for i in range(len(letters)) if i not in (space.lum, space.chr))
-
-    order: list[int] = []
-    seen: set[int] = set()
-
-    def add(index: int) -> None:
-        if index not in seen:
-            seen.add(index)
-            order.append(index)
-
-    for raw_token in (spec or "lum").replace(" ", "").split(","):
-        part = raw_token.strip().lower()
-        if part == "all":
-            add(role["lum"])
-            add(role["chr1"])
-            add(role["chr2"])
-        elif part in role:
-            add(role[part])
-        elif len(part) == 1 and part.upper() in letters:
-            add(letters.index(part.upper()))
-    return [(letters[i], i) for i in order]
-
-
-def _bar_detector_maps(gray: Image, lags: tuple[int, ...] = BARD_LAGS) -> FloatArray:
-    """``(H, W)`` grey -> ``(2, L, H, W)`` response maps (dark, light) per lag.
-
-    A pixel responds at lag ``d`` when it is darker (resp. lighter) than both
-    neighbors at distance ``d`` in x and y; a straight stroke of width ``w``
-    therefore fires only once ``d > w/2``, which makes the per-lag spectrum a
-    width cue.  Pixels within ``d`` of an edge get zero.
-    """
-    grey: NDArray[np.int16] = gray.astype(np.int16)
-    h, w = grey.shape
-    lag_list = tuple(int(d) for d in lags)
-    dark = np.zeros((len(lag_list), h, w), np.uint8)
-    light = np.zeros((len(lag_list), h, w), np.uint8)
-    for j, d in enumerate(lag_list):
-        if _BAR_SPAN * d >= min(h, w):
-            continue
-        centre = grey[:, d : w - d]
-        left = grey[:, : w - _BAR_SPAN * d]
-        right = grey[:, _BAR_SPAN * d :]
-        dark_h = np.minimum(np.maximum(left - centre, 0), np.maximum(right - centre, 0))
-        light_h = np.minimum(np.maximum(centre - left, 0), np.maximum(centre - right, 0))
-        dark[j][:, d : w - d] = np.maximum(dark[j][:, d : w - d], dark_h).astype(np.uint8)
-        light[j][:, d : w - d] = np.maximum(light[j][:, d : w - d], light_h).astype(np.uint8)
-
-        centre = grey[d : h - d, :]
-        up = grey[: h - _BAR_SPAN * d, :]
-        down = grey[_BAR_SPAN * d :, :]
-        dark_v = np.minimum(np.maximum(up - centre, 0), np.maximum(down - centre, 0))
-        light_v = np.minimum(np.maximum(centre - up, 0), np.maximum(centre - down, 0))
-        dark[j][d : h - d, :] = np.maximum(dark[j][d : h - d, :], dark_v).astype(np.uint8)
-        light[j][d : h - d, :] = np.maximum(light[j][d : h - d, :], light_v).astype(np.uint8)
-    return np.stack([dark, light], axis=0).astype(np.float32)
-
-
-def pool_bard_block(
-    response_maps: FloatArray, grid_size: int, stride: int = 4, tau: float = BARD_TAU
-) -> FloatArray:
-    """``(2, L, H, W)`` responses -> ``(grid, grid, 8)`` per-cell stat block.
-
-    Every aggregation pools only the pixels a stride-``stride`` imfeat mesh
-    samples (``R[..., ::s, ::s]``) and only pixels whose peak response over all
-    lags/polarities clears ``tau``.  Output columns: ``cover``, one ``spec`` per
-    lag, ``peak`` (mass-weighted mean lag), ``peaked`` (spectrum dispersion) and
-    ``bal`` (signed light-vs-dark balance in [-1, 1]).
-    """
-    dark_maps = response_maps[0].astype(np.float32)
-    light_maps = response_maps[1].astype(np.float32)
-    n_lags = dark_maps.shape[0]
-    step = max(1, int(stride))
-
-    def sampled_block_mean(source: FloatArray) -> FloatArray:
-        sampled = source[::step, ::step]
-        return np.asarray(
-            cv2.resize(sampled, (grid_size, grid_size), interpolation=cv2.INTER_AREA),
-            dtype=np.float32,
-        )
-
-    response = np.maximum(dark_maps, light_maps)
-    mask = (response.max(axis=0) >= tau).astype(np.float32)
-    cover = sampled_block_mean(mask)
-
-    totals = np.stack([sampled_block_mean(response[j] * mask) for j in range(n_lags)], axis=-1)
-    all_totals = totals.sum(axis=-1)
-    spectrum = np.where(
-        all_totals[..., None] > _EPS,
-        totals / np.maximum(all_totals[..., None], _EPS),
-        0.0,
-    )
-    weights = np.arange(1, n_lags + 1, dtype=np.float32)
-    peak = np.where(
-        all_totals > _EPS,
-        (totals * weights).sum(axis=-1) / np.maximum(all_totals, _EPS),
-        0.0,
-    )
-    mean_response = all_totals / n_lags
-    variance = np.mean((totals - mean_response[..., None]) ** 2, axis=-1)
-    std_response = np.sqrt(np.maximum(variance, 0.0))
-    peaked = np.where(
-        mean_response > _EPS,
-        std_response / np.maximum(mean_response, _EPS),
-        0.0,
-    )
-    dark_totals = sampled_block_mean(dark_maps.max(axis=0) * mask)
-    light_totals = sampled_block_mean(light_maps.max(axis=0) * mask)
-    balance = np.where(
-        dark_totals + light_totals > _EPS,
-        (light_totals - dark_totals) / np.maximum(dark_totals + light_totals, _EPS),
-        0.0,
-    )
-    return np.stack(
-        [cover] + [spectrum[..., j] for j in range(n_lags)] + [peak, peaked, balance], axis=-1
-    ).astype(np.float32)
-
-
-def compute_context_values(v_gray: Image, grid_size: int) -> FloatArray:
-    """Pooled grey channel -> ``(grid, grid, 5)`` small-scale context.
+def compute_context_values(pooled: FloatArray, grid_size: int) -> FloatArray:
+    """Small-scale context from imfeat's per-cell luminance mean: ``(grid, grid, 5)``.
 
     ``ctx_x``/``ctx_y`` are normalized cell coordinates in [-0.5, 0.5];
     ``ctx_surr3`` is a Laplacian (cell minus 3x3 mean), ``ctx_ring35`` the
@@ -379,10 +230,6 @@ def compute_context_values(v_gray: Image, grid_size: int) -> FloatArray:
     channels = len(CONTEXT_FEATURE_NAMES)
     if grid_size < _CTX1_MIN_GRID:
         return np.zeros((grid_size, grid_size, channels), dtype=np.float32)
-    pooled = np.asarray(
-        cv2.resize(v_gray.astype(np.float32), (grid_size, grid_size), interpolation=cv2.INTER_AREA),
-        dtype=np.float32,
-    )
     blur3 = np.asarray(
         cv2.boxFilter(
             pooled, -1, (_CTX1_SIZE, _CTX1_SIZE), normalize=True, borderType=cv2.BORDER_REFLECT
@@ -407,8 +254,8 @@ def compute_context_values(v_gray: Image, grid_size: int) -> FloatArray:
     )
 
 
-def compute_context2_values(v_gray: Image, grid_size: int) -> FloatArray:
-    """Pooled grey channel -> ``(grid, grid, 2)`` large-scale context.
+def compute_context2_values(pooled: FloatArray, grid_size: int) -> FloatArray:
+    """Large-scale context from imfeat's per-cell luminance mean: ``(grid, grid, 2)``.
 
     ``ctx_surr9`` is the cell mean minus the 9x9 mean, ``ctx_range5`` the 5x5
     max-minus-min; together they cover wider surroundings than ``context``.
@@ -416,10 +263,6 @@ def compute_context2_values(v_gray: Image, grid_size: int) -> FloatArray:
     channels = len(CONTEXT2_FEATURE_NAMES)
     if grid_size < _CTX2_MIN_GRID:
         return np.zeros((grid_size, grid_size, channels), dtype=np.float32)
-    pooled = np.asarray(
-        cv2.resize(v_gray.astype(np.float32), (grid_size, grid_size), interpolation=cv2.INTER_AREA),
-        dtype=np.float32,
-    )
     blur9 = np.asarray(
         cv2.boxFilter(
             pooled,
@@ -436,27 +279,12 @@ def compute_context2_values(v_gray: Image, grid_size: int) -> FloatArray:
     return np.stack([pooled - blur9, dilate5 - erode5], axis=-1).astype(np.float32)
 
 
-def compute_global_stats(
-    finest_raw: FloatArray, grid_size: int, orig_h: int, orig_w: int, space: SpaceInfo
-) -> FloatArray:
-    """Seven whole-image scalars from the finest raw block and original size."""
-    full = finest_raw[:, :, :FEATURE_CHANNELS].reshape(grid_size, grid_size, 3, 38)
-    lum_var = full[:, :, space.lum, 35]
-    lum_mean = full[:, :, space.lum, 34]
-    chr_mean = full[:, :, space.chr, 34]
-    coherence = full[:, :, space.lum, 1]
-
-    texture_level = float(np.sqrt(np.maximum(lum_var, 0.0)).mean())
-    values = [
-        texture_level,
-        float(chr_mean.mean()),
-        float(lum_mean.mean()),
-        float(lum_var.mean()),
-        float(np.percentile(coherence, _COHERENCE_PERCENTILE)),
-        float(orig_w / max(orig_h, 1)),
-        float(np.log1p(orig_h * orig_w)),
-    ]
-    return np.asarray(values, dtype=np.float32)
+def compute_global_stats(global_raw: FloatArray, orig_h: int, orig_w: int) -> FloatArray:
+    """Whole-image block from imfeat, plus the original frame's shape."""
+    shape_stats = (float(orig_w / max(orig_h, 1)), float(np.log1p(orig_h * orig_w)))
+    return np.concatenate(
+        [np.nan_to_num(global_raw, nan=0.0, posinf=0.0, neginf=0.0), np.asarray(shape_stats)]
+    ).astype(np.float32)
 
 
 def make_feature_computer(
@@ -488,30 +316,22 @@ class FeatureExtractor:
         self.extra_labels: tuple[str, ...] = tuple(scale.label for scale in self.extra_scales)
         self.raw_width = FEATURE_CHANNELS * (1 + len(self.extra_scales))
 
+        self.space = SPACE_INFO[cfg.imfeat_space]
+
         tags = iter_feature_mode_tags(cfg.feature_mode)
         self.compute_global_values = "global" in tags
-        self.compute_bard_values = "bard" in tags
         self.compute_context_values = "context" in tags
         self.compute_ctx2_values = "ctx2" in tags
 
-        self.bard_channels = resolve_bard_channels(cfg.imfeat_space, "lum")
-        self.bard_lags = tuple(cfg.bard_lags)
-
-        self.global_names = list(GLOBAL_STAT_NAMES) if self.compute_global_values else []
-        self.bard_names: list[str] = []
-        if self.compute_bard_values:
-            suffixes = (
-                ["cover"]
-                + [f"spec{j + 1}" for j in range(len(self.bard_lags))]
-                + ["peak", "peaked", "bal"]
-            )
-            for letter, _ in self.bard_channels:
-                self.bard_names += [f"bard{letter}_{name}" for name in suffixes]
+        self.global_names = (
+            list(global_stat_names(self.space)) if self.compute_global_values else []
+        )
         self.context_names = list(CONTEXT_FEATURE_NAMES) if self.compute_context_values else []
         self.ctx2_names = list(CONTEXT2_FEATURE_NAMES) if self.compute_ctx2_values else []
-        self.has_bard = bool(self.bard_names)
 
         self.block_ranges, self.broadcast_ranges = self._compute_block_ranges()
+        self._plans: dict[bytes, tuple[int, list[_Copy]]] = {}
+        self._all_cells = np.arange(GRID * GRID)
 
         self.fc, self.n_levels = make_feature_computer(self.levels, cfg.thumb, cfg.stride)
         self.extra_computers: list[tuple[Any, int, str]] = []
@@ -531,7 +351,6 @@ class FeatureExtractor:
             ranges["raw"] = (offset, offset + self.raw_width)
             offset += self.raw_width
             for tag, names in (
-                ("bard", self.bard_names),
                 ("context", self.context_names),
                 ("ctx2", self.ctx2_names),
             ):
@@ -539,14 +358,10 @@ class FeatureExtractor:
                 offset += len(names)
             ranges_by_size[size] = ranges
 
-            broadcast_offset = 0
-            broadcast_ranges: dict[str, Range] = {}
-            broadcast_ranges["global"] = (
-                broadcast_offset,
-                broadcast_offset + len(self.global_names),
-            )
-            broadcast_offset += len(self.global_names)
-            broadcast_by_size[size] = broadcast_ranges
+            # The global bank is identical at every level, so carry it once, at the
+            # finest one, instead of repeating it len(levels) times in every row.
+            width = len(self.global_names) if size == self.levels[0] else 0
+            broadcast_by_size[size] = {"global": (0, width)}
         return ranges_by_size, broadcast_by_size
 
     def _build_names(self) -> list[str]:
@@ -554,11 +369,7 @@ class FeatureExtractor:
         letters = SPACE_INFO[self.cfg.imfeat_space].letters
         scale_tags: list[str | None] = [None, *list(self.extra_labels)]
         names: list[str] = []
-        banks = {
-            "bard": self.bard_names,
-            "context": self.context_names,
-            "ctx2": self.ctx2_names,
-        }
+        banks = {"context": self.context_names, "ctx2": self.ctx2_names}
         for size in self.levels:
             for tag in iter_feature_mode_tags(self.cfg.feature_mode):
                 if tag == "raw":
@@ -570,7 +381,8 @@ class FeatureExtractor:
                             for feature in RAW_FEATURE_NAMES
                         )
                 elif tag == "global":
-                    names.extend(f"{size}/global/{name}" for name in GLOBAL_STAT_NAMES)
+                    low, high = self.broadcast_ranges[size]["global"]
+                    names.extend(f"{size}/global/{name}" for name in self.global_names[low:high])
                 else:
                     names.extend(f"{size}/{tag}/{name}" for name in banks[tag])
         return names
@@ -599,30 +411,6 @@ class FeatureExtractor:
         converted = cv2.cvtColor(thumb_bgr, space.convert)
         return np.asarray(converted, dtype=np.uint8)
 
-    def _bank_image(self, thumb_bgr: Image, feature_img: Image) -> Image:
-        if self.cfg.bank_gray == "v" and self.cfg.imfeat_space == "hsv":
-            return np.asarray(feature_img[:, :, 2], dtype=np.uint8)
-        return bank_channel(thumb_bgr, self.cfg.bank_gray)
-
-    def _bard_scale_entries(
-        self, thumb_bgr: Image, feature_img: Image, space: SpaceInfo
-    ) -> list[tuple[int, list[tuple[str, FloatArray]]]]:
-        scale_feature_imgs: dict[int, Image] = {self.cfg.thumb: feature_img}
-        for _computer, extra_thumb, _label in self.extra_computers:
-            extra_bgr = self._resize_bgr(thumb_bgr, extra_thumb)
-            scale_feature_imgs.setdefault(extra_thumb, self._convert(extra_bgr, space))
-        primary = scale_feature_imgs[self.cfg.thumb]
-        entries = [
-            (
-                letter,
-                _bar_detector_maps(
-                    np.asarray(primary[:, :, channel], dtype=np.uint8), self.bard_lags
-                ),
-            )
-            for letter, channel in self.bard_channels
-        ]
-        return [(self.cfg.stride, entries)]
-
     def _load_level_maps(self, result: Any, source: str) -> list[FloatArray]:
         # imfeat's result.maps appends a trailing whole-image "global" entry
         # beyond the requested levels, hence the slice to n_levels.
@@ -640,59 +428,43 @@ class FeatureExtractor:
             extra_maps.append(self._load_level_maps(result, "extra scale"))
         return extra_maps
 
+    def _lum_cell_mean(self, primary_raw: FloatArray, size: int) -> FloatArray:
+        """Per-cell mean of the luminance channel at level ``size``, from imfeat."""
+        full = primary_raw.reshape(size, size, RAW_CHANNELS, RAW_PER_CHANNEL)
+        return np.ascontiguousarray(full[:, :, self.space.lum, _MEAN_IDX], dtype=np.float32)
+
     def _compose_level(
-        self,
-        size: int,
-        raw_arrays: list[FloatArray],
-        bank: Image,
-        bard_entries: list[tuple[int, list[tuple[str, FloatArray]]]],
-        global_vec: FloatArray,
-    ) -> tuple[FloatArray, FloatArray]:
+        self, size: int, raw_arrays: list[FloatArray], global_vec: FloatArray
+    ) -> tuple[LevelBanks, FloatArray]:
+        """One level's banks and broadcast vector.
+
+        imfeat's maps are used as they come -- no copy into a wider array, and no
+        sanitising: they are always finite (every ratio is guarded; the tests pin
+        it on degenerate frames).  They are views of imfeat's pooled block, which
+        is released when the caller drops them; :class:`FeatureCache` copies.
+        """
         expected = (size, size, FEATURE_CHANNELS)
-        if raw_arrays[0].shape != expected:
-            msg = f"unexpected map shape for level {size}: {raw_arrays[0].shape}"
-            raise RuntimeError(msg)
-        raw_clean = np.nan_to_num(raw_arrays[0], nan=0.0, posinf=0.0, neginf=0.0)
-        for extra_arr in raw_arrays[1:]:
-            if extra_arr.shape != expected:
-                msg = f"unexpected extra-scale map shape for level {size}"
+        for arr in raw_arrays:
+            if arr.shape != expected:
+                msg = f"unexpected map shape for level {size}: {arr.shape}"
                 raise RuntimeError(msg)
-            clean_extra = np.nan_to_num(extra_arr, nan=0.0, posinf=0.0, neginf=0.0)
-            raw_clean = np.concatenate([raw_clean, clean_extra], axis=-1)
-
+        banks: list[FloatArray] = list(raw_arrays)
+        pooled = self._lum_cell_mean(raw_arrays[0], size)
         ranges = self.block_ranges[size]
-        total_width = max((high for (_, high) in ranges.values()), default=raw_clean.shape[-1])
-        out = np.empty((size, size, total_width), dtype=np.float32)
-
-        low, high = ranges["raw"]
-        out[:, :, low:high] = raw_clean
-
-        low, high = ranges.get("bard", (0, 0))
-        if high > low:
-            parts = [
-                pool_bard_block(entry_maps, size, stride=entry_stride, tau=self.cfg.bard_tau)
-                for entry_stride, entries in bard_entries
-                for _letter, entry_maps in entries
-            ]
-            out[:, :, low:high] = np.concatenate(parts, axis=-1)
-
-        low, high = ranges.get("context", (0, 0))
-        if high > low:
-            out[:, :, low:high] = compute_context_values(bank, size)
-
-        low, high = ranges.get("ctx2", (0, 0))
-        if high > low:
-            out[:, :, low:high] = compute_context2_values(bank, size)
+        if ranges.get("context", (0, 0))[1] > ranges.get("context", (0, 0))[0]:
+            banks.append(compute_context_values(pooled, size))
+        if ranges.get("ctx2", (0, 0))[1] > ranges.get("ctx2", (0, 0))[0]:
+            banks.append(compute_context2_values(pooled, size))
 
         broadcast_ranges = self.broadcast_ranges[size]
         broadcast_total = max((high for (_, high) in broadcast_ranges.values()), default=0)
         bvec = np.zeros(broadcast_total, dtype=np.float32)
         low, high = broadcast_ranges.get("global", (0, 0))
         if high > low:
-            bvec[low:high] = global_vec
-        return out, bvec
+            bvec[low:high] = global_vec[low:high]
+        return tuple(banks), bvec
 
-    def extract(self, img_bgr: Image) -> tuple[dict[int, FloatArray], dict[int, FloatArray]]:
+    def extract(self, img_bgr: Image) -> tuple[dict[int, LevelBanks], dict[int, FloatArray]]:
         """Image -> ``(level_maps, broadcast_vecs)`` (see module docstring)."""
         cfg = self.cfg
         interpolation = cv2.INTER_AREA if cfg.resize_interp == "area" else cv2.INTER_NEAREST
@@ -701,66 +473,151 @@ class FeatureExtractor:
         feature_img = self._convert(thumb_bgr, space)
         result = self.fc.features(feature_img)
 
-        bank = self._bank_image(thumb_bgr, feature_img)
-        bard_entries = (
-            self._bard_scale_entries(thumb_bgr, feature_img, space) if self.has_bard else []
-        )
         maps = self._load_level_maps(result, "imfeat")
         extra_maps = self._extra_level_maps(thumb_bgr, space)
 
         orig_h, orig_w = img_bgr.shape[:2]
-        finest_raw = np.nan_to_num(maps[0], nan=0.0, posinf=0.0, neginf=0.0)
-        global_vec = compute_global_stats(finest_raw, self.levels[0], orig_h, orig_w, space)
+        # result.maps[-1] is imfeat's whole-image level: the same raw block, one cell.
+        global_vec = compute_global_stats(
+            np.asarray(result.maps[-1], dtype=np.float32).ravel(), orig_h, orig_w
+        )
 
-        level_maps: dict[int, FloatArray] = {}
+        level_maps: dict[int, LevelBanks] = {}
         broadcast_vecs: dict[int, FloatArray] = {}
         for i, size in enumerate(self.levels):
             raw_arrays = [maps[i], *(scale_maps[i] for scale_maps in extra_maps)]
-            out, bvec = self._compose_level(size, raw_arrays, bank, bard_entries, global_vec)
+            out, bvec = self._compose_level(size, raw_arrays, global_vec)
             level_maps[size] = out
             broadcast_vecs[size] = bvec
         return level_maps, broadcast_vecs
 
     def gather(
         self,
-        level_maps: dict[int, FloatArray],
+        level_maps: dict[int, LevelBanks],
         broadcast_vecs: dict[int, FloatArray],
         flat_indices: NDArray[np.integer],
         col_keep: NDArray[np.integer] | None = None,
     ) -> FloatArray:
         """``(n_cells, width)`` design matrix for flat 64x64 cell indices.
 
-        ``col_keep`` selects a fixed subset of the canonical columns (e.g. the
-        pruned set); kept columns stay in canonical order so every row lines up.
+        ``col_keep`` selects a strictly ascending subset of the canonical columns
+        (e.g. the pruned set), so kept columns stay in canonical order.
+
+        Each output column is a coarse level value repeated over that level's
+        block, so the matrix is written in one pass straight from the level maps:
+        no per-level temporaries, no concatenation, no column re-selection.  For the
+        whole 64x64 grid the repetition is a broadcast into a ``(L, f, L, f, k)``
+        view of the output; for sampled cells it is an index by parent cell.
         """
-        tags = iter_feature_mode_tags(self.cfg.feature_mode)
-        rows, cols = np.unravel_index(flat_indices, (GRID, GRID))
-        n_rows = len(flat_indices)
-        blocks: list[FloatArray] = []
+        width, copies = self._gather_plan(col_keep)
+        flat = np.asarray(flat_indices)
+        out = np.empty((len(flat), width), dtype=np.float32)
+        whole_grid = len(flat) == GRID * GRID and np.array_equal(flat, self._all_cells)
+        rows, cols = (None, None) if whole_grid else np.divmod(flat, GRID)
+        for copy in copies:
+            if copy.broadcast:
+                out[:, copy.dst0 : copy.dst1] = broadcast_vecs[copy.size][copy.src]
+                continue
+            bank = level_maps[copy.size][copy.bank][..., copy.src]
+            factor = GRID // copy.size
+            if rows is None or cols is None:
+                blocks = out.reshape(copy.size, factor, copy.size, factor, width)
+                blocks[..., copy.dst0 : copy.dst1] = bank[:, None, :, None, :]
+            else:
+                out[:, copy.dst0 : copy.dst1] = bank[rows // factor, cols // factor]
+        return out
+
+    def native(
+        self,
+        level_maps: dict[int, LevelBanks],
+        broadcast_vecs: dict[int, FloatArray],
+        col_keep: NDArray[np.integer] | None = None,
+    ) -> FloatArray:
+        """Kept columns at native resolution, flat: the scorer's input, no dense table.
+
+        Column ``j`` contributes its ``side x side`` values row-major, in column
+        order, where ``side`` is the column's level (1 for globals); this is
+        :meth:`gather` over the full grid with the repetition left out.
+        """
+        _width, copies = self._gather_plan(col_keep)
+        sides = [1 if copy.broadcast else copy.size for copy in copies]
+        out = np.empty(
+            sum((c.dst1 - c.dst0) * side * side for c, side in zip(copies, sides, strict=True)),
+            dtype=np.float32,
+        )
+        pos = 0
+        for copy, side in zip(copies, sides, strict=True):
+            n_cols = copy.dst1 - copy.dst0
+            run = out[pos : pos + n_cols * side * side]
+            if copy.broadcast:
+                run[:] = broadcast_vecs[copy.size][copy.src]
+            else:
+                bank = level_maps[copy.size][copy.bank][..., copy.src]  # (side, side, n)
+                run.reshape(n_cols, side, side)[...] = bank.transpose(2, 0, 1)
+            pos += run.size
+        return out
+
+    def _segments(self) -> list[tuple[int, bool, int, int, int]]:
+        """Canonical column layout: ``(size, broadcast, bank, base, width)`` runs.
+
+        Laid end to end these are the columns of :meth:`gather`, in the order
+        :attr:`base_names` is built in.  ``bank`` indexes the level's
+        :data:`LevelBanks` and ``base`` is the first column inside it (broadcast
+        runs read the level's broadcast vector instead).
+        """
+        segments: list[tuple[int, bool, int, int, int]] = []
         for size in self.levels:
-            arr = level_maps[size]
-            factor = GRID // size
-            coarse_rows = rows // factor
-            coarse_cols = cols // factor
-            for tag in tags:
+            bank = 0
+            for tag in iter_feature_mode_tags(self.cfg.feature_mode):
                 if tag in BROADCAST_TAGS:
                     low, high = self.broadcast_ranges[size].get(tag, (0, 0))
-                    if high <= low:
-                        continue
-                    blocks.append(
-                        np.broadcast_to(broadcast_vecs[size][low:high], (n_rows, high - low))
-                    )
+                    if high > low:
+                        segments.append((size, True, -1, low, high - low))
                     continue
                 low, high = self.block_ranges[size].get(tag, (0, 0))
                 if high <= low:
                     continue
-                blocks.append(arr[coarse_rows, coarse_cols, low:high])
-        if not blocks:
-            return np.zeros((n_rows, 0), dtype=np.float32)
-        design: FloatArray = np.concatenate(blocks, axis=1).astype(np.float32)
-        if col_keep is not None:
-            design = design[:, col_keep]
-        return design
+                # The raw block holds one imfeat map per scale, each its own bank.
+                widths = (
+                    [FEATURE_CHANNELS] * ((high - low) // FEATURE_CHANNELS)
+                    if tag == "raw"
+                    else [high - low]
+                )
+                for width in widths:
+                    segments.append((size, False, bank, 0, width))
+                    bank += 1
+        return segments
+
+    def _gather_plan(self, col_keep: NDArray[np.integer] | None) -> tuple[int, list[_Copy]]:
+        """Output width and the column runs :meth:`gather` copies, cached per ``col_keep``."""
+        keep = None if col_keep is None else np.asarray(col_keep, dtype=np.intp)
+        key = b"" if keep is None else keep.tobytes()
+        if key in self._plans:
+            return self._plans[key]
+        total = self.total_width()
+        if keep is not None and (
+            np.any(np.diff(keep) <= 0) or (keep.size and (keep[0] < 0 or keep[-1] >= total))
+        ):
+            msg = "col_keep must be strictly ascending canonical column indices"
+            raise ValueError(msg)
+        mask = np.ones(total, dtype=bool) if keep is None else np.isin(np.arange(total), keep)
+        copies: list[_Copy] = []
+        column = dst = 0
+        for size, broadcast, bank, base, width in self._segments():
+            local = np.flatnonzero(mask[column : column + width])
+            column += width
+            if not local.size:
+                continue
+            contiguous = local[-1] - local[0] + 1 == local.size
+            src: slice | NDArray[np.intp] = (
+                slice(base + int(local[0]), base + int(local[-1]) + 1)
+                if contiguous
+                else (local + base).astype(np.intp)
+            )
+            copies.append(_Copy(size, broadcast, bank, src, dst, dst + local.size))
+            dst += local.size
+        self._plans[key] = (dst, copies)
+        return dst, copies
 
 
 class FeatureCache:
@@ -781,7 +638,7 @@ class FeatureCache:
         self.base_names = self.extractor.base_names
         self.levels = self.extractor.levels
 
-        self.level_maps_list: list[dict[int, FloatArray]] = []
+        self.level_maps_list: list[dict[int, LevelBanks]] = []
         self.broadcast_list: list[dict[int, FloatArray]] = []
         self.gt_coverage_list: list[FloatArray] = []
         self.img_paths: list[str] = []
@@ -795,7 +652,11 @@ class FeatureCache:
                 skipped += 1
                 continue
             level_maps, broadcast_vecs = self.extractor.extract(img)
-            self.level_maps_list.append(level_maps)
+            # Copy: imfeat's maps are views of a per-frame pooled block, and holding
+            # them for the whole split would keep every frame's block alive.
+            self.level_maps_list.append(
+                {size: tuple(bank.copy() for bank in banks) for size, banks in level_maps.items()}
+            )
             self.broadcast_list.append(broadcast_vecs)
             self.gt_coverage_list.append(
                 mask_to_grid_coverage(mask, GRID).ravel().astype(np.float32)
@@ -829,7 +690,15 @@ class FeatureCache:
 
 
 def feature_level_bits(name: str) -> tuple[int, int]:
-    """``'8/a/hog0'`` -> ``(level, coarse_shift)`` where shift is ``2*log2(64/level)``."""
-    prefix = name.split("/", 1)[0]
-    size = int(prefix.split("@", 1)[0])
-    return size, _LEVEL_SHIFT[size]
+    """``'8/a/hog0'`` -> ``(level, coarse_shift)`` where shift is ``2*log2(64/level)``.
+
+    A level-``L`` column is constant on ``L x L`` blocks of the output grid, and the
+    C++ binner bins one value per block.  Global columns are constant over the
+    whole image, so they are a 1x1 level (shift 12): binned once, not 4096 times.
+    """
+    prefix, tag = name.split("/", 2)[:2]
+    size = 1 if tag in BROADCAST_TAGS else int(prefix.split("@", 1)[0])
+    if size < 1 or GRID % size or size & (size - 1):
+        msg = f"{name!r}: level {size} does not tile the {GRID}x{GRID} grid dyadically"
+        raise ValueError(msg)
+    return size, 2 * ((GRID // size).bit_length() - 1)

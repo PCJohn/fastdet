@@ -13,7 +13,7 @@ import json
 import os
 import tempfile
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 from numpy.typing import NDArray
@@ -213,21 +213,34 @@ class Detector:
     def design_matrix(self, image: str | Path | UInt8Array) -> NDArray[np.floating[Any]]:
         """Kept-column features for every cell: a ``(GRID * GRID, n_features)`` matrix.
 
-        This is exactly the matrix :meth:`predict_proba` scores, in the row-major
-        layout both runtimes expect, so it is also how fixtures for the C++
-        runtime are produced.
+        This is exactly the matrix :meth:`predict_proba` scores (the Python
+        runtime is the reference, so it keeps the dense per-cell layout).
         """
+        level_maps, broadcast_vecs = self.extractor.extract(self._decode(image))
+        return self.extractor.gather(
+            level_maps, broadcast_vecs, np.arange(GRID * GRID), col_keep=self.col_keep
+        )
+
+    def native_matrix(self, image: str | Path | UInt8Array) -> NDArray[np.floating[Any]]:
+        """Kept-column features at native resolution: the C++ runtime's input.
+
+        Each column contributes its level's ``side x side`` values, not one per
+        cell, so no dense table is built; expanding every value over its block
+        reproduces :meth:`design_matrix` exactly.
+        """
+        level_maps, broadcast_vecs = self.extractor.extract(self._decode(image))
+        return self.extractor.native(level_maps, broadcast_vecs, col_keep=self.col_keep)
+
+    @staticmethod
+    def _decode(image: str | Path | UInt8Array) -> UInt8Array:
+        """A path (read as BGR) or an already-decoded ``uint8`` array."""
         if isinstance(image, (str, os.PathLike)):
             decoded = read_image(str(image))
             if decoded is None:
                 msg = f"could not read image {image!r}"
                 raise ValueError(msg)
-        else:
-            decoded = np.asarray(image)
-        level_maps, broadcast_vecs = self.extractor.extract(decoded)
-        return self.extractor.gather(
-            level_maps, broadcast_vecs, np.arange(GRID * GRID), col_keep=self.col_keep
-        )
+            return decoded
+        return cast("UInt8Array", np.asarray(image))  # no dtype coercion, as before
 
     def predict_proba(self, image: str | Path | UInt8Array) -> NDArray[np.floating[Any]]:
         """Per-cell positive probability for one image as a ``GRID x GRID`` map.

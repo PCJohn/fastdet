@@ -10,13 +10,14 @@ import numpy as np
 from catboost import CatBoostClassifier
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Mapping, Sequence
 
     from numpy.typing import NDArray
 
     from .config import ModelConfig
 
 __all__ = [
+    "build_ranking",
     "default_feature_ranks_path",
     "fit_booster",
     "load_ranking",
@@ -84,3 +85,23 @@ def fit_booster(
     )
     booster.fit(features, labels)
     return booster
+
+
+def build_ranking(booster: CatBoostClassifier, feature_names: Sequence[str]) -> dict[str, Any]:
+    """Gain-importance ranking of a full-width fit, names in descending order.
+
+    ``feature_names`` are the columns the booster was fitted on, in fitting order
+    (CatBoost reports importances by position).  Fit with ``top_k_features=0`` so
+    the ranking covers every front-end column; that is what :func:`select_columns`
+    later indexes into.
+    """
+    gains = np.asarray(booster.get_feature_importance(type="FeatureImportance"), dtype=float)
+    if len(gains) != len(feature_names):
+        msg = f"{len(gains)} importances for {len(feature_names)} feature names"
+        raise ValueError(msg)
+    order = np.argsort(-gains, kind="stable")
+    return {
+        "names": [feature_names[int(i)] for i in order],
+        "gains": [float(gains[int(i)]) for i in order],
+        "width": len(feature_names),
+    }

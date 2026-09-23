@@ -41,6 +41,42 @@ class _EncodedTrees:
     max_referenced_bin: int
 
 
+def _pad_trees(trees: list[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+    """Bring every oblivious tree to the deepest tree's depth, exactly.
+
+    CatBoost stops a symmetric tree early when no split improves the loss, so a
+    model can mix depths; the blob stores one depth for all trees.  A depth-``d``
+    tree becomes depth ``D`` by appending ``D - d`` placeholder splits and
+    repeating its leaves so the new (high) index bits are ignored:
+    ``leaves'[i] = leaves[i & (2**d - 1)]``, since the root split is bit 0.
+    The placeholder split's outcome never matters; it just has to be encodable.
+    """
+    depth = max(len(tree["splits"]) for tree in trees)
+    if all(len(tree["splits"]) == depth for tree in trees):
+        return trees
+    filler = next((tree["splits"][0] for tree in trees if tree["splits"]), None)
+    if filler is None:
+        msg = "every tree is a constant: nothing to encode"
+        raise ValueError(msg)
+    padded: list[Mapping[str, Any]] = []
+    for tree in trees:
+        if len(tree["splits"]) == depth:
+            padded.append(tree)
+            continue
+        splits = list(tree["splits"])
+        leaves = list(tree["leaf_values"])
+        mask = (1 << len(splits)) - 1
+        pad = splits[0] if splits else filler
+        padded.append(
+            {
+                **tree,
+                "splits": splits + [pad] * (depth - len(splits)),
+                "leaf_values": [leaves[i & mask] for i in range(1 << depth)],
+            }
+        )
+    return padded
+
+
 def _validate_trees(trees: list[Mapping[str, Any]]) -> tuple[int, int]:
     """Return ``(n_trees, depth)`` and reject ragged trees."""
     depth = len(trees[0]["splits"])
@@ -150,7 +186,7 @@ def build_blob(
     :func:`fastdet.features.feature_level_bits`).  With ``shuffle_tables`` the
     blob is version 3 and every referenced bin index must be <= 15.
     """
-    trees = model_json["oblivious_trees"]
+    trees = _pad_trees(model_json["oblivious_trees"])
     n_trees, depth = _validate_trees(trees)
     borders = _feature_borders(model_json)
     n_features = len(borders)

@@ -14,7 +14,7 @@ Blob layout (little-endian), magic ``IMSY``::
           float32  leaf_values[n_leafs_total]
           uint32   n_borders[n_features]
           float32  borders[sum(n_borders)]
-          uint8    level_shift[n_features]      2*log2(64/level) for coarse-cell constancy
+          uint8    level_shift[n_features]      2*log2(64/level); 12 = one value per image
     v3:   uint8    shuffle_tables[n_trees * depth * 16]   T[v] = (v > bin) ? (1<<d) : 0
 
 A split at level ``d`` (0 = root) sets leaf bit ``d`` when the byte-space bin of
