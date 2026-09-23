@@ -196,6 +196,32 @@ No early stopping is used; the validation plateau was reached by tuning tree
 count and learning rate explicitly. See the
 [training parameters reference](https://catboost.ai/docs/en/references/training-parameters/).
 
+### Leaf quantisation
+
+`ModelConfig.leaf_bits` puts the leaf values on a low-bit grid at export: one offset
+per tree and one step per `leaf_chunk` (16) trees, because leaf magnitudes shrink as
+boosting proceeds and a single global step would quantise the later trees into noise.
+The values are still stored as float32, so the blob format and both runtimes are
+unchanged; what changes is that a chunk holds at most `2**leaf_bits` distinct values,
+which is what a low-bit scorer would read.
+
+```python
+det = Detector(leaf_bits=8).fit(images_dir, masks_dir)          # after training
+det = Detector(leaf_bits=4, quantisation_aware=True).fit(...)   # during training
+```
+
+With `quantisation_aware`, training fits in chunks of `leaf_chunk` trees and passes
+the **quantised** running score to the next chunk as CatBoost `baseline`, so later
+trees correct the rounding of earlier ones. Training and export call the same
+`quantise_leaves`, so the exported model holds exactly the values it was fitted
+against. Measured on the real validation set: 8-bit costs nothing
+(ΔPR-AUC −0.0003, CI95 [−0.0007, +0.0002]) and needs no retraining, while 4-bit
+applied after training costs −0.012 to −0.019 — that is the case quantisation-aware
+training exists for, and it has yet to be measured on the real data.
+
+When `leaf_bits` is set, `fit()` reports validation PR-AUC from the exported runtime
+rather than the booster, since the two no longer agree.
+
 ### Pruning
 
 One full-width training run produces a split-gain ranking; the bundled JSON

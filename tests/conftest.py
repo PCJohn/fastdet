@@ -13,7 +13,7 @@ import cv2
 import numpy as np
 import pytest
 
-from fastdet import Config, ModelConfig, TrainConfig
+from fastdet import Config, Detector, ModelConfig, TrainConfig
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray
@@ -111,3 +111,17 @@ def _build_scorer(build_dir: Path) -> Path:
 def scorer(tmp_path_factory: pytest.TempPathFactory) -> Path:
     """The C++ scorer binary, built once per test session."""
     return _build_scorer(tmp_path_factory.mktemp("cpp_build"))
+
+
+@pytest.fixture
+def fitted(
+    tmp_path: Path,
+    tiny_dataset: tuple[Path, Path],
+    small_config: Config,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[Detector, Path]:
+    """A detector fitted once on the tiny dataset, in an isolated cwd."""
+    monkeypatch.chdir(tmp_path)
+    images_dir, masks_dir = tiny_dataset
+    det = Detector(small_config).fit(images_dir, masks_dir)
+    return det, images_dir

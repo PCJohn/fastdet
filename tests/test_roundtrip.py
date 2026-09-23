@@ -17,20 +17,6 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 
-@pytest.fixture
-def fitted(
-    tmp_path: Path,
-    tiny_dataset: tuple[Path, Path],
-    small_config: Config,
-    monkeypatch: pytest.MonkeyPatch,
-) -> tuple[Detector, Path]:
-    """A detector fitted once on the tiny dataset, in an isolated cwd."""
-    monkeypatch.chdir(tmp_path)
-    images_dir, masks_dir = tiny_dataset
-    det = Detector(small_config).fit(images_dir, masks_dir)
-    return det, images_dir
-
-
 def test_export_load_roundtrip_is_bit_exact(fitted: tuple[Detector, Path], tmp_path: Path) -> None:
     """Reloading the exported single file reproduces scores exactly."""
     det, images_dir = fitted

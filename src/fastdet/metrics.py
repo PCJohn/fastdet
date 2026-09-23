@@ -11,6 +11,8 @@ from numpy.typing import NDArray
 from .features import GRID, FeatureCache
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from catboost import CatBoostClassifier
 
 __all__ = ["paired_image_bootstrap", "pooled_pr_auc", "score_validation_per_image"]
@@ -68,19 +70,23 @@ def paired_image_bootstrap(
     return float(deltas.mean()), float(lo), float(hi), float(delta_observed), n
 
 
-def score_validation_per_image(
+def score_validation_per_image(  # noqa: PLR0913 -- one optional override on a settled signature
     model: CatBoostClassifier,
     cache: FeatureCache,
     col_keep: NDArray[np.integer[Any]] | None = None,
     desc: str = "val",
     *,
     keep_grids: bool = False,
+    scorer: Callable[[NDArray[np.floating[Any]]], Float64Array] | None = None,
 ) -> tuple[list[Float64Array], list[BoolArray], dict[int, Float64Array]]:
     """Score every image separately (the granularity the image bootstrap needs).
 
     Returns ``(scores_per_image, labels_per_image, grids)``, each per-image
-    array holding ``GRID*GRID`` cells.
+    array holding ``GRID*GRID`` cells.  ``scorer`` overrides the booster, e.g. with
+    the exported runtime's ``predict_proba`` when the shipped model differs from the
+    fitted one (quantised leaves).
     """
+    predict = scorer if scorer is not None else (lambda d: model.predict_proba(d)[:, 1])
     full = np.arange(GRID * GRID)
     scores_per_image: list[Float64Array] = []
     labels_per_image: list[BoolArray] = []
@@ -89,7 +95,7 @@ def score_validation_per_image(
     start = time.time()
     for i in range(cache.n):
         design = cache.gather(i, full, col_keep=col_keep)
-        scores: Float64Array = np.asarray(model.predict_proba(design)[:, 1], dtype=np.float64)
+        scores: Float64Array = np.asarray(predict(design), dtype=np.float64)
         labels_per_image.append(cache.gt_coverage_list[i] >= cache.cfg.gt_cell_thresh)
         scores_per_image.append(scores)
         if keep_grids:

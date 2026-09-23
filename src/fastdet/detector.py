@@ -170,12 +170,15 @@ class Detector:
         design = gather_training_matrix(train_cache, img_ids, local_ids, self.col_keep)
         print(f"[fastdet] X={design.shape} positives={int(labels.sum()):,}")
         self.booster = fit_booster(design, labels, cfg.model)
-        self._refresh_runtime()
+        runtime = self._refresh_runtime()
 
         if evaluate:
             val_cache = FeatureCache(val_pairs, cfg.train, "val")
+            # With quantised leaves the booster is no longer what ships, so score
+            # the exported runtime instead: the reported PR-AUC is the model's.
+            shipped = runtime.predict_proba if cfg.model.leaf_bits is not None else None
             scores, targets, _grids = score_validation_per_image(
-                self.booster, val_cache, col_keep=self.col_keep
+                self.booster, val_cache, col_keep=self.col_keep, scorer=shipped
             )
             pr_auc = pooled_pr_auc(np.concatenate(scores), np.concatenate(targets).astype(bool))
             self.metrics["pr_auc"] = pr_auc
@@ -183,13 +186,15 @@ class Detector:
             print(f"[fastdet] validation pooled PR-AUC = {pr_auc:.4f}")
         return self
 
-    def _refresh_runtime(self) -> None:
-        """(Re)parse the in-memory export of the fitted booster."""
+    def _refresh_runtime(self) -> ImysModel:
+        """(Re)parse the in-memory export of the fitted booster and return it."""
         blob, info = self._build_blob()
-        self.runtime = parse_blob(blob)
+        runtime = parse_blob(blob)
+        self.runtime = runtime
         self.metrics.update(info)
         if self.col_keep is not None and self.base_names is not None:
             self.feature_names = [self.base_names[int(i)] for i in self.col_keep]
+        return runtime
 
     def _build_blob(self) -> tuple[bytes, dict[str, Any]]:
         if self.booster is None or self.col_keep is None or self.base_names is None:
@@ -207,7 +212,13 @@ class Detector:
             self.booster.save_model(str(json_path), format="json")
             with json_path.open(encoding="utf-8") as fh:
                 model_json = json.load(fh)
-        return build_blob(model_json, level_shift, shuffle_tables=self.config.export.shuffle_tables)
+        return build_blob(
+            model_json,
+            level_shift,
+            shuffle_tables=self.config.export.shuffle_tables,
+            leaf_bits=self.config.model.leaf_bits,
+            leaf_chunk=self.config.model.leaf_chunk,
+        )
 
     # -- inference ----------------------------------------------------------
     def design_matrix(self, image: str | Path | UInt8Array) -> NDArray[np.floating[Any]]:

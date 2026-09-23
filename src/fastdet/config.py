@@ -21,6 +21,8 @@ __all__ = ["Config", "ExportConfig", "ModelConfig", "TrainConfig"]
 
 # Largest bin count the 4-bit (`vpshufb`) traversal can encode.
 MAX_BORDER_COUNT = 15
+# Leaf grids the exporter can write.
+LEAF_BITS_CHOICES = (4, 6, 8, 16)
 
 
 @dataclass
@@ -32,6 +34,14 @@ class ModelConfig:
     learning_rate: float = 0.1  # CatBoost learning_rate / shrinkage per tree.
     border_count: int = 15  # Per-feature split candidates; <= 15 for the 4-bit blob.
     random_seed: int = 42  # Seed for the booster; independent of the data split.
+    # Leaf values are stored on a low-bit grid when set (4, 6, 8 or 16 bits), which
+    # is what a low-bit scorer would read; None keeps full float32 leaves.
+    leaf_bits: int | None = None
+    leaf_chunk: int = 16  # Trees sharing one quantisation step (leaf ranges shrink with depth).
+    # Quantisation-aware training: fit in chunks of leaf_chunk trees and quantise
+    # each chunk's leaves before fitting the next, so later trees correct the
+    # rounding of earlier ones.  Needs leaf_bits; only worth it at 4 bits.
+    quantisation_aware: bool = False
     loss_function: str = "Logloss"  # CatBoost objective; only Logloss is supported.
     grow_policy: str = "SymmetricTree"  # Must stay symmetric for the blob format.
 
@@ -50,6 +60,15 @@ class ModelConfig:
             raise ValueError(msg)
         if self.n_trees < 1:
             msg = "n_trees must be >= 1"
+            raise ValueError(msg)
+        if self.leaf_bits is not None and self.leaf_bits not in LEAF_BITS_CHOICES:
+            msg = f"leaf_bits must be one of {sorted(LEAF_BITS_CHOICES)} or None"
+            raise ValueError(msg)
+        if self.leaf_chunk < 1:
+            msg = "leaf_chunk must be >= 1"
+            raise ValueError(msg)
+        if self.quantisation_aware and self.leaf_bits is None:
+            msg = "quantisation_aware needs leaf_bits"
             raise ValueError(msg)
         if not 1 <= self.border_count <= MAX_BORDER_COUNT:
             msg = f"border_count must be in [1, {MAX_BORDER_COUNT}] for the 4-bit blob"

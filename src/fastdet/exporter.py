@@ -177,16 +177,44 @@ def _shuffle_table_bytes(
     return bytes(table)
 
 
+def _quantise_tree_leaves(
+    trees: list[Mapping[str, Any]], leaf_bits: int, leaf_chunk: int
+) -> list[Mapping[str, Any]]:
+    """Trees with their leaves moved onto the low-bit grid, splits untouched."""
+    from .training import quantise_leaves  # noqa: PLC0415 -- avoids a circular import
+
+    table = quantise_leaves(
+        np.asarray([tree["leaf_values"] for tree in trees], dtype=np.float64),
+        leaf_bits,
+        leaf_chunk,
+    )
+    return [{**tree, "leaf_values": row.tolist()} for tree, row in zip(trees, table, strict=True)]
+
+
 def build_blob(
-    model_json: Mapping[str, Any], level_shift: list[int], *, shuffle_tables: bool = True
+    model_json: Mapping[str, Any],
+    level_shift: list[int],
+    *,
+    shuffle_tables: bool = True,
+    leaf_bits: int | None = None,
+    leaf_chunk: int = 16,
 ) -> tuple[bytes, BlobInfo]:
     """Serialize a CatBoost symmetric model to ``IMSY`` bytes.
 
     ``level_shift`` gives one coarse-cell shift per kept feature (see
     :func:`fastdet.features.feature_level_bits`).  With ``shuffle_tables`` the
     blob is version 3 and every referenced bin index must be <= 15.
+
+    ``leaf_bits`` puts the leaf values on a low-bit grid before packing (see
+    :func:`fastdet.training.quantise_leaves`); they are still stored as float32, so
+    the blob format and both runtimes are unchanged, but the model then holds only
+    ``2**leaf_bits`` distinct values per chunk of ``leaf_chunk`` trees.  A
+    quantisation-aware fit uses the same grid, so exporting reproduces the scores it
+    was fitted against.
     """
     trees = _pad_trees(model_json["oblivious_trees"])
+    if leaf_bits is not None:
+        trees = _quantise_tree_leaves(trees, leaf_bits, leaf_chunk)
     n_trees, depth = _validate_trees(trees)
     borders = _feature_borders(model_json)
     n_features = len(borders)
