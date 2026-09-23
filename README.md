@@ -456,7 +456,9 @@ them with their current defaults). The ones worth sweeping:
 | `--feature-mode`, `--imfeat-space` | raw_plus_global_context_ext, hsv | feature banks and colour space |
 | `--gt-cell-thresh` | 0.10 | mask coverage at which a cell is a positive |
 | `--val-frac`, `--split-seed` | 0.15, 42 | held-out share of near-duplicate groups and the split seed |
-| `--neg-pos-ratio`, `--max-train-cells` | none | training-cell sampling |
+| `--neg-pos-ratio` | none (keep all) | negatives kept per positive in the training sample (`none,3,5`); rebalances the classes by discarding negatives, which shifts the probability scale (use `thr*`) |
+| `--scale-pos-weight` | none (1) | CatBoost class weight on positives; the usual alternative to subsampling for boosting, keeps every negative |
+| `--max-train-cells` | none | cap on sampled training cells |
 
 Reading the report: PR-AUC is the number to rank by (the positive rate is a few
 percent, so ROC-AUC flatters everything); `thr*` is the probability threshold with the

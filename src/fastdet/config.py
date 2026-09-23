@@ -36,6 +36,9 @@ class ModelConfig:
     learning_rate: float = 0.1  # CatBoost learning_rate / shrinkage per tree.
     border_count: int = 15  # Per-feature split candidates; <= 15 for the 4-bit blob.
     random_seed: int = 42  # Seed for the booster; independent of the data split.
+    # Class weighting instead of (or on top of) negative subsampling: CatBoost's
+    # scale_pos_weight multiplies every positive's gradient; None = 1.
+    scale_pos_weight: float | None = None
     # Leaf values live on a low-bit grid (4, 6, 8 or 16 bits); None keeps float32
     # leaves.  8-bit costs no measurable accuracy and is the format a low-bit
     # scorer reads, so models are trained for it by default.
@@ -102,6 +105,9 @@ class ModelConfig:
             raise ValueError(msg)
         if self.exit_margin < 0.0:
             msg = "exit_margin must be >= 0"
+            raise ValueError(msg)
+        if self.scale_pos_weight is not None and self.scale_pos_weight <= 0.0:
+            msg = "scale_pos_weight must be > 0"
             raise ValueError(msg)
         self.exit_stage_fractions = tuple(float(f) for f in self.exit_stage_fractions)
         if any(not 0.0 <= f < 1.0 for f in self.exit_stage_fractions):

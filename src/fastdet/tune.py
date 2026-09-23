@@ -192,23 +192,25 @@ def _knob_fields() -> dict[str, tuple[str, dataclasses.Field[Any]]]:
     return knobs
 
 
-def _parse_value(text: str, default: Any) -> Any:
-    """One knob value from its CLI text, typed like the default."""
-    if isinstance(default, bool):
-        return text.strip().lower() in {"1", "true", "yes", "on"}
-    if isinstance(default, int):
-        return int(text)
-    if isinstance(default, float):
-        return float(text)
-    if isinstance(default, tuple):
-        return tuple(float(v) if "." in v else int(v) for v in text.split("/") if v)
-    if default is None:
-        return (
-            None
-            if text.strip().lower() in {"none", ""}
-            else (int(text) if text.strip().lstrip("-").isdigit() else text)
-        )
-    return text
+def _parse_value(text: str, annotation: str, default: Any) -> Any:
+    """One knob value from its CLI text, typed by the field's annotation.
+
+    ``none`` (any case) gives ``None`` for optional knobs; tuples are ``/``-separated.
+    """
+    kind = annotation.replace(" ", "")
+    if text.strip().lower() in {"none", ""} and "None" in kind:
+        return None
+    parsers: dict[str, Any] = {
+        "bool": lambda v: v.strip().lower() in {"1", "true", "yes", "on"},
+        "int": int,
+        "float": float,
+        "tuple": lambda v: tuple(float(x) if "." in x else int(x) for x in v.split("/") if x),
+        "str": str,
+    }
+    for prefix, parse in parsers.items():
+        if kind.startswith(prefix):
+            return parse(text)
+    return text if default is None else type(default)(text)
 
 
 def _run_key(overrides: dict[str, Any]) -> str:
@@ -563,7 +565,7 @@ def sweep_from_args(args: argparse.Namespace) -> dict[str, list[Any]]:
         if text is None:
             continue
         default = f.default if f.default is not dataclasses.MISSING else None
-        values = [_parse_value(v, default) for v in text.split(",")]
+        values = [_parse_value(v, str(f.type), default) for v in text.split(",")]
         sweep[name] = list(dict.fromkeys(values))  # de-duplicate, keep order
     return sweep
 

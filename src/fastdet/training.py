@@ -272,6 +272,11 @@ def fit_booster(
         "grow_policy": model_cfg.grow_policy,
         "random_seed": model_cfg.random_seed,
         "border_count": model_cfg.border_count,
+        **(
+            {"scale_pos_weight": model_cfg.scale_pos_weight}
+            if model_cfg.scale_pos_weight is not None
+            else {}
+        ),
         "verbose": False,
         "allow_writing_files": False,
         "thread_count": -1,

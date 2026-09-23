@@ -61,6 +61,25 @@ def test_cli_sweep_parsing() -> None:
     )
     sweep = sweep_from_args(args)
     assert sweep == {"n_trees": [8, 16], "leaf_bits": [4], "levels": [(64, 32)]}
+    args = build_parser().parse_args(
+        [
+            "--images",
+            "a",
+            "--masks",
+            "b",
+            "--neg-pos-ratio",
+            "none,3,2.5",
+            "--scale-pos-weight",
+            "None,4",
+            "--use-exit",
+            "false",
+        ]
+    )
+    assert sweep_from_args(args) == {
+        "neg_pos_ratio": [None, 3.0, 2.5],
+        "scale_pos_weight": [None, 4.0],
+        "use_exit": [False],
+    }
 
 
 def test_sweep_writes_report_and_charts(tiny_dataset: tuple[Path, Path], tmp_path: Path) -> None:
