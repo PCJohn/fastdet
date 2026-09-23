@@ -38,7 +38,7 @@ def _write_f32(path: Path, values: NDArray[np.floating]) -> None:
 @pytest.mark.slow
 def test_cpp_matches_python_runtime(
     scorer: Path,
-    tmp_path: Path,
+    scratch: Path,
     tiny_dataset: tuple[Path, Path],
     small_config: Config,
     monkeypatch: pytest.MonkeyPatch,
@@ -50,16 +50,16 @@ def test_cpp_matches_python_runtime(
     whether or not its plane is filled), so one image is not enough coverage.
     """
     binary = scorer
-    monkeypatch.chdir(tmp_path)
+    monkeypatch.chdir(scratch)
     images_dir, masks_dir = tiny_dataset
     det = Detector(small_config).fit(images_dir, masks_dir, evaluate=False)
-    model_path = det.export(tmp_path / "model.fdt")
+    model_path = det.export(scratch / "model.fdt")
 
     for sample in sorted(images_dir.glob("*.png")):
         # The C++ reads the native fixture; the expectation comes from the dense
         # Python reference runtime, so the two paths share no feature layout code.
-        fixture_path = tmp_path / "fixture.f32"
-        expected_path = tmp_path / "expected.f32"
+        fixture_path = scratch / "fixture.f32"
+        expected_path = scratch / "expected.f32"
         _write_f32(fixture_path, det.native_matrix(sample))
         _write_f32(expected_path, det.predict_proba(sample).reshape(-1))
 
@@ -81,7 +81,7 @@ def test_cpp_matches_python_runtime(
 @pytest.mark.parametrize(("theta", "all_finish"), [("-1e30", True), ("1e30", False)])
 def test_cpp_early_exit_keeps_or_drops_every_pack(  # noqa: PLR0913, PLR0917 -- fixtures
     scorer: Path,
-    tmp_path: Path,
+    scratch: Path,
     tiny_dataset: tuple[Path, Path],
     small_config: Config,
     monkeypatch: pytest.MonkeyPatch,
@@ -94,13 +94,13 @@ def test_cpp_early_exit_keeps_or_drops_every_pack(  # noqa: PLR0913, PLR0917 -- 
     A threshold nothing can miss changes no score; one nothing can reach stops every
     pack at that stage.
     """
-    monkeypatch.chdir(tmp_path)
+    monkeypatch.chdir(scratch)
     images_dir, masks_dir = tiny_dataset
     det = Detector(small_config).fit(images_dir, masks_dir, evaluate=False)
-    model_path = det.export(tmp_path / "model.fdt")
+    model_path = det.export(scratch / "model.fdt")
     sample = min(images_dir.glob("*.png"))
-    _write_f32(tmp_path / "fixture.f32", det.native_matrix(sample))
-    _write_f32(tmp_path / "expected.f32", det.predict_proba(sample).reshape(-1))
+    _write_f32(scratch / "fixture.f32", det.native_matrix(sample))
+    _write_f32(scratch / "expected.f32", det.predict_proba(sample).reshape(-1))
     run = subprocess.run(  # noqa: S603 -- argv is the binary this test just built
         [str(scorer), str(model_path), "fixture.f32", "expected.f32", "2", f"16:{theta}"],
         capture_output=True,
@@ -127,9 +127,7 @@ def test_fixture_layout_is_row_major() -> None:
 
 @pytest.mark.slow
 @pytest.mark.parametrize("value", [0.0, 1.0])
-def test_cpp_image_wide_feature_fills_every_cell(
-    scorer: Path, tmp_path: Path, value: float
-) -> None:
+def test_cpp_image_wide_feature_fills_every_cell(scorer: Path, scratch: Path, value: float) -> None:
     """An image-wide (level_shift 12) feature must bin the same in all 4096 cells.
 
     A hand-built one-split model makes this deterministic: with the value above
@@ -145,10 +143,10 @@ def test_cpp_image_wide_feature_fills_every_cell(
         ],
     }
     blob, _info = build_blob(model_json, level_shift=[12])
-    model_path = tmp_path / "model.imsy"
+    model_path = scratch / "model.imsy"
     model_path.write_bytes(blob)
-    fixture_path = tmp_path / "fixture.f32"
-    expected_path = tmp_path / "expected.f32"
+    fixture_path = scratch / "fixture.f32"
+    expected_path = scratch / "expected.f32"
     _write_f32(fixture_path, np.full(1, value, dtype=np.float32))  # one native value
     leaf = 2.0 if value > 0.5 else -1.0
     _write_f32(expected_path, np.full(GRID_CELLS, 1.0 / (1.0 + np.exp(-leaf)), dtype=np.float32))

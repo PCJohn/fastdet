@@ -16,6 +16,7 @@ import numpy as np
 import pytest
 
 from fastdet import Config, Detector
+from fastdet.features import feature_level_bits
 from fastdet.runtime import parse_blob
 from fastdet.training import quantise_leaves
 
@@ -104,3 +105,34 @@ def test_quantisation_aware_fit_matches_its_export(
     reloaded = Detector.load(detector.export(tmp_path / "qat.fdt"))
     sample = images_dir / "img_00.png"
     np.testing.assert_array_equal(reloaded.predict_proba(sample), detector.predict_proba(sample))
+
+
+def test_tiered_fit_keeps_the_coarse_stage_coarse(
+    tiny_dataset: tuple[Path, Path], small_config: Config, tmp_path: Path
+) -> None:
+    """Resolution tiering: the first trees split only on tile-constant features."""
+    images_dir, masks_dir = tiny_dataset
+    small_config.model.n_trees = 16
+    small_config.model.coarse_trees = 6
+    small_config.model.coarse_max_side = 16  # constant inside a 4x4 cell tile
+
+    detector = Detector(small_config).fit(images_dir, masks_dir, evaluate=False)
+    assert detector.booster is not None
+    assert detector.booster.tree_count_ == 16
+    assert detector.feature_names is not None
+
+    json_path = tmp_path / "booster.json"
+    detector.booster.save_model(str(json_path), format="json")
+    trees = json.loads(json_path.read_text(encoding="utf-8"))["oblivious_trees"]
+    sides = [feature_level_bits(name)[0] for name in detector.feature_names]
+
+    def tree_sides(tree: dict[str, object]) -> set[int]:
+        splits = tree["splits"]
+        assert isinstance(splits, list)
+        return {sides[int(split["float_feature_index"])] for split in splits}
+
+    coarse = set().union(*(tree_sides(tree) for tree in trees[:6]))
+    assert coarse, "coarse stage grew no splits"
+    assert max(coarse) <= 16, f"coarse stage used sides {sorted(coarse)}"
+    fine = set().union(*(tree_sides(tree) for tree in trees[6:]))
+    assert max(fine) > 16, "fine stage never used a tile-varying feature"

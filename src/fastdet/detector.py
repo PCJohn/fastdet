@@ -169,7 +169,9 @@ class Detector:
         )
         design = gather_training_matrix(train_cache, img_ids, local_ids, self.col_keep)
         print(f"[fastdet] X={design.shape} positives={int(labels.sum()):,}")
-        self.booster = fit_booster(design, labels, cfg.model)
+        kept = self.col_keep if self.col_keep is not None else np.arange(len(self.base_names))
+        sides = [feature_level_bits(self.base_names[int(i)])[0] for i in kept]
+        self.booster = fit_booster(design, labels, cfg.model, feature_sides=sides)
         runtime = self._refresh_runtime()
 
         if evaluate:

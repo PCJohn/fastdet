@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -16,6 +17,8 @@ import pytest
 from fastdet import Config, Detector, ModelConfig, TrainConfig
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     from numpy.typing import NDArray
 
 IMAGE_SIZE = 160
@@ -107,10 +110,27 @@ def _build_scorer(build_dir: Path) -> Path:
     return found[0]
 
 
+@pytest.fixture
+def scratch(tmp_path: Path) -> Iterator[Path]:
+    """A working directory whose contents are removed when the test ends.
+
+    The C++ gates write a model and a feature fixture per image (several MB each),
+    and pytest keeps the last three runs' temp trees; these do not need keeping.
+    """
+    with tempfile.TemporaryDirectory(dir=tmp_path) as work:
+        yield Path(work)
+
+
 @pytest.fixture(scope="session")
-def scorer(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    """The C++ scorer binary, built once per test session."""
-    return _build_scorer(tmp_path_factory.mktemp("cpp_build"))
+def scorer() -> Path:
+    """The C++ scorer binary, built once per session and reused across runs.
+
+    The build lives in the repo's gitignored ``build/`` rather than a pytest temp
+    directory: it holds the fetched Highway checkout (~26 MB), and pytest keeps the
+    last three runs, so a temp build would re-fetch and rebuild Highway every
+    session and keep three copies of it.
+    """
+    return _build_scorer(CPP_DIR.parent / "build" / "pytest-cpp")
 
 
 @pytest.fixture

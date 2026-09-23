@@ -109,49 +109,61 @@ def _leaf_table(booster: CatBoostClassifier, n_trees: int) -> NDArray[np.float64
     return table
 
 
-def _fit_quantisation_aware(
+def _fit_stage(  # noqa: PLR0913 -- a private helper with one call site per stage
     features: NDArray[np.floating],
     labels: NDArray[np.bool_] | NDArray[np.integer[Any]],
-    model_cfg: ModelConfig,
     params: Mapping[str, Any],
-) -> CatBoostClassifier:
-    """Fit in chunks, quantising each chunk's leaves before the next one starts.
+    *,
+    n_trees: int,
+    chunk: int,
+    bits: int | None,
+    running: NDArray[np.float64],
+    ignored: list[int] | None,
+) -> tuple[list[CatBoostClassifier], NDArray[np.float64]]:
+    """Fit ``n_trees`` on top of ``running``; return the models and the new score.
 
-    Each chunk is fitted on the running quantised score as CatBoost ``baseline``, so
-    a chunk sees -- and corrects -- the rounding error of every chunk before it.  The
-    chunks are summed into one model whose (unquantised) leaves the exporter
-    quantises with the same grid, reproducing the scores fitted here.
+    With ``bits`` the stage is fitted in chunks of ``chunk`` trees and each chunk's
+    leaves are quantised before the next chunk starts, so later trees see -- and
+    correct -- the rounding of earlier ones.  Without it the stage is one fit.
+    ``ignored`` hides feature columns from this stage (resolution tiering).
     """
-    from catboost import Pool, sum_models  # noqa: PLC0415 -- optional heavy import
+    from catboost import Pool  # noqa: PLC0415 -- optional heavy import
 
-    bits = model_cfg.leaf_bits
-    if bits is None:  # guarded by ModelConfig, restated for the type checker
-        msg = "quantisation-aware fitting needs leaf_bits"
-        raise ValueError(msg)
-    chunk = model_cfg.leaf_chunk
-    running = np.zeros(len(labels), dtype=np.float64)
+    stage = dict(params)
+    if ignored:
+        stage["ignored_features"] = list(ignored)
+    step = chunk if bits is not None else n_trees
     models: list[CatBoostClassifier] = []
-    for start in range(0, model_cfg.n_trees, chunk):
-        size = min(chunk, model_cfg.n_trees - start)
-        fitted = CatBoostClassifier(iterations=size, boost_from_average=False, **params)
-        fitted.fit(Pool(features, labels, baseline=running))
-        table = quantise_leaves(_leaf_table(fitted, size), bits, chunk)
+    score = running
+    for start in range(0, n_trees, step):
+        size = min(step, n_trees - start)
+        fitted = CatBoostClassifier(iterations=size, boost_from_average=False, **stage)
+        fitted.fit(Pool(features, labels, baseline=score))
+        table = _leaf_table(fitted, size)
+        if bits is not None:
+            table = quantise_leaves(table, bits, chunk)
         indexes = fitted.calc_leaf_indexes(Pool(features))
         scale, bias = fitted.get_scale_and_bias()
-        running += scale * table[np.arange(size)[None, :], indexes].sum(axis=1) + bias
+        score = score + scale * table[np.arange(size)[None, :], indexes].sum(axis=1) + bias
         models.append(fitted)
-    return sum_models(models)
+    return models, score
 
 
 def fit_booster(
     features: NDArray[np.floating],
     labels: NDArray[np.bool_] | NDArray[np.integer[Any]],
     model_cfg: ModelConfig,
+    feature_sides: list[int] | None = None,
 ) -> CatBoostClassifier:
     """Fit the frozen symmetric CatBoost booster and return it.
 
-    With ``quantisation_aware`` the trees are fitted in chunks against the quantised
-    running score (see :func:`_fit_quantisation_aware`); otherwise one plain fit.
+    Three knobs change how the trees are grown, and they compose:
+
+    * ``quantisation_aware`` fits in chunks against the quantised running score,
+      so the model is trained for the leaf grid the exporter writes;
+    * ``coarse_trees`` grows the first trees on tile-constant features only
+      (``feature_sides`` says which), leaving the rest to the fine stage;
+    * neither set, a single ordinary fit -- unchanged from before.
     """
     params: dict[str, Any] = {
         "loss_function": model_cfg.loss_function,
@@ -164,11 +176,47 @@ def fit_booster(
         "allow_writing_files": False,
         "thread_count": -1,
     }
-    if model_cfg.quantisation_aware:
-        return _fit_quantisation_aware(features, labels, model_cfg, params)
-    booster = CatBoostClassifier(iterations=model_cfg.n_trees, **params)
-    booster.fit(features, labels)
-    return booster
+    bits = model_cfg.leaf_bits if model_cfg.quantisation_aware else None
+    if bits is None and not model_cfg.coarse_trees:
+        booster = CatBoostClassifier(iterations=model_cfg.n_trees, **params)
+        booster.fit(features, labels)
+        return booster
+
+    from catboost import sum_models  # noqa: PLC0415 -- optional heavy import
+
+    models: list[CatBoostClassifier] = []
+    score = np.zeros(len(labels), dtype=np.float64)
+    if model_cfg.coarse_trees:
+        if feature_sides is None:
+            msg = "coarse_trees needs feature_sides (the pyramid side of each column)"
+            raise ValueError(msg)
+        ignored = [i for i, side in enumerate(feature_sides) if side > model_cfg.coarse_max_side]
+        if len(ignored) == len(feature_sides):
+            msg = f"no column has side <= coarse_max_side={model_cfg.coarse_max_side}"
+            raise ValueError(msg)
+        coarse, score = _fit_stage(
+            features,
+            labels,
+            params,
+            n_trees=model_cfg.coarse_trees,
+            chunk=model_cfg.leaf_chunk,
+            bits=bits,
+            running=score,
+            ignored=ignored,
+        )
+        models += coarse
+    fine, _score = _fit_stage(
+        features,
+        labels,
+        params,
+        n_trees=model_cfg.n_trees - model_cfg.coarse_trees,
+        chunk=model_cfg.leaf_chunk,
+        bits=bits,
+        running=score,
+        ignored=None,
+    )
+    models += fine
+    return models[0] if len(models) == 1 else sum_models(models)
 
 
 def build_ranking(booster: CatBoostClassifier, feature_names: Sequence[str]) -> dict[str, Any]:

@@ -205,9 +205,39 @@ The values are still stored as float32, so the blob format and both runtimes are
 unchanged; what changes is that a chunk holds at most `2**leaf_bits` distinct values,
 which is what a low-bit scorer would read.
 
+Both are on by default (`leaf_bits=8`, `quantisation_aware=True`), so models are
+trained for the grid they ship on:
+
 ```python
-det = Detector(leaf_bits=8).fit(images_dir, masks_dir)          # after training
-det = Detector(leaf_bits=4, quantisation_aware=True).fit(...)   # during training
+det = Detector().fit(images_dir, masks_dir)                      # 8-bit, QAT
+det = Detector(leaf_bits=4).fit(images_dir, masks_dir)           # 4-bit, QAT
+det = Detector(leaf_bits=None, quantisation_aware=False).fit(…)  # plain float32
+```
+
+Quantisation-aware fitting costs training time, because each chunk is its own
+CatBoost fit: measured on a 200-tree synthetic fit, 3.2 s plain, 7.8 s at the
+default `leaf_chunk=16`, 4.5 s at `leaf_chunk=50`. Raise `leaf_chunk` to trade
+some of the correction for wall time.
+
+**It does not make inference faster yet.** The blob stores leaves as float32 and
+the scorer reads float32, so quantising restricts which values occur, not the work
+done. The gain arrives with a scorer that reads packed low-bit leaves (measured in
+the experiments: 2.0 ms → 1.43 ms at 8-bit, → 1.12 ms at 4-bit on AVX2); that
+kernel is not written.
+
+### Resolution-tiered boosting
+
+`ModelConfig.coarse_trees` grows the first N trees on features that are constant
+inside a 4x4 cell tile (pyramid side <= `coarse_max_side`, 16 by default), then the
+rest on everything, fitted on the coarse stage's score as `baseline`. A scorer could
+evaluate those first trees once per tile instead of once per cell, which is about a
+tenth of the cost of a fine tree. On synthetic data this held PR-AUC at ~40% of the
+traversal cost. Off by default (`coarse_trees=0`): the tile-resolution path does not
+exist in the scorer yet, so today it changes what is trained, not what inference
+costs, and it needs validating on the real dataset first.
+
+```python
+det = Detector(coarse_trees=1600, n_trees=2400).fit(images_dir, masks_dir)
 ```
 
 With `quantisation_aware`, training fits in chunks of `leaf_chunk` trees and passes
