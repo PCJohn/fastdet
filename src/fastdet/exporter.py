@@ -1,8 +1,9 @@
 """Build the self-contained ``IMSY`` tree blob from a fitted CatBoost model.
 
 The JSON written by ``CatBoostClassifier.save_model(format="json")`` is the only
-model input; borders, split bins and leaf values are copied verbatim, so the
-blob is a faithful, compact re-encoding rather than an approximation.
+model input; borders and split bins are copied verbatim and the leaves are put on
+the low-bit grid the model was fitted for (see :mod:`fastdet.runtime` for the
+layout).
 """
 
 from __future__ import annotations
@@ -15,15 +16,14 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 
 from .config import MAX_BORDER_COUNT
-from .runtime import IMSY_MAGIC
+from .runtime import BLOB_VERSION, IMSY_MAGIC
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Mapping, Sequence
 
 __all__ = ["BlobInfo", "build_blob", "catboost_json_to_blob"]
 
 _SPLIT_STRUCT = struct.Struct("<HBB")  # u16 feature, u8 bin, u8 pad
-_TABLE_COLUMNS = MAX_BORDER_COUNT + 1  # one shuffle entry per possible 4-bit bin
 
 
 class BlobInfo(dict[str, Any]):
@@ -142,11 +142,9 @@ def _encode_trees(
     tree_offsets = [0]
     tree_base = [0]
     split_bytes = bytearray()
-    leaf_bytes = bytearray()
+    leaf_bytes = bytearray()  # unused since v4: leaves travel as codes
     max_referenced_bin = 0
     for tree in trees:
-        for value in tree["leaf_values"]:
-            leaf_bytes += struct.pack("<f", float(value))
         tree_offsets.append(tree_offsets[-1] + (1 << depth))
         for fid, border in _tree_splits(tree):
             bin_index = _bin_index(borders, border_map, fid, border)
@@ -162,60 +160,39 @@ def _encode_trees(
     )
 
 
-def _shuffle_table_bytes(
-    trees: list[Mapping[str, Any]], border_map: list[dict[float, int]]
-) -> bytes:
-    """One 16-byte ``vpshufb`` table per split: ``T[v] = (v > bin) << d``."""
-    table = bytearray()
-    for tree in trees:
-        for d, (fid, border) in enumerate(_tree_splits(tree)):
-            bin_index = border_map[fid][border]
-            if bin_index > MAX_BORDER_COUNT:
-                msg = f"4-bit unsafe: feature {fid} referenced bin {bin_index}"
-                raise ValueError(msg)
-            table += bytes(((1 << d) if v > bin_index else 0) for v in range(_TABLE_COLUMNS))
-    return bytes(table)
-
-
-def _quantise_tree_leaves(
-    trees: list[Mapping[str, Any]], leaf_bits: int, leaf_chunk: int
-) -> list[Mapping[str, Any]]:
-    """Trees with their leaves moved onto the low-bit grid, splits untouched."""
-    from .training import quantise_leaves  # noqa: PLC0415 -- avoids a circular import
-
-    table = quantise_leaves(
-        np.asarray([tree["leaf_values"] for tree in trees], dtype=np.float64),
-        leaf_bits,
-        leaf_chunk,
-    )
-    return [{**tree, "leaf_values": row.tolist()} for tree, row in zip(trees, table, strict=True)]
-
-
-def build_blob(
+def build_blob(  # noqa: PLR0913 -- the model's few knobs, all explicit
     model_json: Mapping[str, Any],
     level_shift: list[int],
     *,
-    shuffle_tables: bool = True,
-    leaf_bits: int | None = None,
+    leaf_bits: int = 8,
     leaf_chunk: int = 16,
+    coarse_trees: int = 0,
+    exit_stages: Sequence[tuple[int, float]] = (),
 ) -> tuple[bytes, BlobInfo]:
-    """Serialize a CatBoost symmetric model to ``IMSY`` bytes.
+    """Serialize a CatBoost symmetric model to ``IMSY`` version 4 bytes.
 
-    ``level_shift`` gives one coarse-cell shift per kept feature (see
-    :func:`fastdet.features.feature_level_bits`).  With ``shuffle_tables`` the
-    blob is version 3 and every referenced bin index must be <= 15.
-
-    ``leaf_bits`` puts the leaf values on a low-bit grid before packing (see
-    :func:`fastdet.training.quantise_leaves`); they are still stored as float32, so
-    the blob format and both runtimes are unchanged, but the model then holds only
-    ``2**leaf_bits`` distinct values per chunk of ``leaf_chunk`` trees.  A
-    quantisation-aware fit uses the same grid, so exporting reproduces the scores it
-    was fitted against.
+    Leaves are stored as the low-bit grid of :func:`fastdet.training.leaf_grid`:
+    a ``leaf_bits`` code per leaf, a float32 offset per tree and a power-of-two
+    step per chunk of ``leaf_chunk`` trees (chunks restart at ``coarse_trees``, the
+    stage boundary, exactly as a quantisation-aware fit counts them).  Both
+    runtimes sum the codes as integers, so they agree to the bit.  ``exit_stages``
+    are ``(trees, threshold)`` pairs the scorer may apply (see the runtime).
+    ``level_shift`` gives one coarse-cell shift per kept feature.
     """
+    from .training import leaf_grid  # noqa: PLC0415 -- avoids a circular import
+
     trees = _pad_trees(model_json["oblivious_trees"])
-    if leaf_bits is not None:
-        trees = _quantise_tree_leaves(trees, leaf_bits, leaf_chunk)
     n_trees, depth = _validate_trees(trees)
+    if not 0 <= coarse_trees <= n_trees:
+        msg = f"coarse_trees={coarse_trees} outside [0, {n_trees}]"
+        raise ValueError(msg)
+    stage_starts = (0, coarse_trees) if 0 < coarse_trees < n_trees else (0,)
+    grid = leaf_grid(
+        np.asarray([tree["leaf_values"] for tree in trees], dtype=np.float64),
+        leaf_bits,
+        leaf_chunk,
+        stage_starts,
+    )
     borders = _feature_borders(model_json)
     n_features = len(borders)
     if len(level_shift) != n_features:
@@ -224,49 +201,61 @@ def build_blob(
     border_map = [{b: i for i, b in enumerate(feature_borders)} for feature_borders in borders]
     _check_scale_and_bias(model_json)
     encoded = _encode_trees(trees, depth, borders, border_map)
+    if encoded.max_referenced_bin > MAX_BORDER_COUNT:
+        msg = f"a split references bin {encoded.max_referenced_bin} > {MAX_BORDER_COUNT}"
+        raise ValueError(msg)
 
     border_blob = struct.pack(f"<{n_features}I", *[len(b) for b in borders])
     for feature_borders in borders:
         if feature_borders:
             border_blob += np.asarray(feature_borders, dtype=np.float32).tobytes()
     level_blob = struct.pack(f"<{n_features}B", *level_shift)
+    stage_blob = b"".join(struct.pack("<If", int(t), float(theta)) for t, theta in exit_stages)
 
-    table_blob = b""
-    if shuffle_tables:
-        table_blob = _shuffle_table_bytes(trees, border_map)
-        expected_tables = n_trees * depth * _TABLE_COLUMNS
-        if len(table_blob) != expected_tables:
-            msg = "shuffle-table size mismatch"
-            raise ValueError(msg)
-
-    version = 3 if shuffle_tables else 2
     header = IMSY_MAGIC + struct.pack(
-        "<IIIII", version, n_trees, n_features, n_trees * (1 << depth), depth
+        "<IIIIIIIIiII",
+        BLOB_VERSION,
+        n_trees,
+        n_features,
+        n_trees * (1 << depth),
+        depth,
+        leaf_bits,
+        leaf_chunk,
+        coarse_trees,
+        grid.e_min,
+        grid.n_chunks,
+        len(exit_stages),
     )
     blob = (
         header
         + struct.pack(f"<{n_trees + 1}I", *encoded.tree_offsets)
         + struct.pack(f"<{n_trees + 1}I", *encoded.tree_base)
         + bytes(encoded.split_bytes)
-        + bytes(encoded.leaf_bytes)
+        + grid.codes.reshape(-1).astype(np.uint8).tobytes()
+        + grid.offsets.astype("<f4").tobytes()
+        + grid.shifts.astype(np.uint8).tobytes()
+        + stage_blob
         + border_blob
         + level_blob
-        + table_blob
     )
     info = BlobInfo(
-        version=version,
+        version=BLOB_VERSION,
         n_trees=n_trees,
         n_features=n_features,
         depth=depth,
+        leaf_bits=leaf_bits,
+        leaf_chunk=leaf_chunk,
+        coarse_trees=coarse_trees,
         n_borders=sum(len(b) for b in borders),
         max_referenced_bin=encoded.max_referenced_bin,
+        exit_stages=[[int(t), float(theta)] for t, theta in exit_stages],
         blob_bytes=len(blob),
     )
     return blob, info
 
 
 def catboost_json_to_blob(
-    model_json: Mapping[str, Any], level_shift: list[int], *, shuffle_tables: bool = True
+    model_json: Mapping[str, Any], level_shift: list[int], **kwargs: Any
 ) -> tuple[bytes, BlobInfo]:
     """Alias of :func:`build_blob` (explicit about the input being CatBoost JSON)."""
-    return build_blob(model_json, level_shift, shuffle_tables=shuffle_tables)
+    return build_blob(model_json, level_shift, **kwargs)

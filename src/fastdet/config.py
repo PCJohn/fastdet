@@ -21,8 +21,10 @@ __all__ = ["Config", "ExportConfig", "ModelConfig", "TrainConfig"]
 
 # Largest bin count the 4-bit (`vpshufb`) traversal can encode.
 MAX_BORDER_COUNT = 15
-# Leaf grids the exporter can write.
-LEAF_BITS_CHOICES = (4, 6, 8, 16)
+# Leaf code widths the scorer reads: one or two nibble planes per leaf.
+LEAF_BITS_CHOICES = (4, 8)
+# A chunk's codes are summed in byte lanes before widening, so chunk * (2**4 - 1) must fit a byte.
+MAX_LEAF_CHUNK = 17
 
 
 @dataclass
@@ -37,20 +39,31 @@ class ModelConfig:
     # Leaf values live on a low-bit grid (4, 6, 8 or 16 bits); None keeps float32
     # leaves.  8-bit costs no measurable accuracy and is the format a low-bit
     # scorer reads, so models are trained for it by default.
-    leaf_bits: int | None = 8
-    leaf_chunk: int = 16  # Trees sharing one quantisation step (leaf ranges shrink with depth).
+    # Leaf values live on a low-bit grid the scorer reads directly: per tree an
+    # offset, per chunk of leaf_chunk trees a power-of-two step, per leaf a
+    # leaf_bits code.  8-bit costs nothing measurable; 4-bit halves the fine-tree
+    # work again and needs the quantisation-aware fit below.
+    leaf_bits: int = 8
+    leaf_chunk: int = 16  # Trees sharing one step; also the scorer's pass length (<= 17).
     # Quantisation-aware training: fit in chunks of leaf_chunk trees and quantise
     # each chunk's leaves before fitting the next, so later trees correct the
-    # rounding of earlier ones.  On by default; raise leaf_chunk to trade a little
-    # of that correction for training time (one CatBoost fit per chunk).
+    # rounding of earlier ones and the fitted model IS the shipped model.
     quantisation_aware: bool = True
     # Resolution-tiered boosting: the first coarse_trees trees may only split on
-    # features that are constant inside a 4x4 cell tile (side <= coarse_max_side),
-    # so the scorer could evaluate them once per tile instead of once per cell.
-    # 0 disables it.  The scorer has no tile-resolution path yet, so this changes
-    # what is trained, not yet what inference costs.
-    coarse_trees: int = 0
+    # features that are constant inside a 4x4 cell tile (side <= coarse_max_side);
+    # the scorer evaluates them once per tile (a fifth of a fine tree, or less),
+    # and their tile-level score gates the fine trees (early exit below).
+    coarse_fraction: float = 2.0 / 3.0  # Share of n_trees in the coarse tier (0 disables tiering).
     coarse_max_side: int = 16
+    # Early exit: after each stage a tile whose cells all score below the stage's
+    # threshold keeps its partial score.  Thresholds are calibrated at fit time on
+    # the training images: the lowest partial score of any cell that ends above
+    # exit_keep_prob, minus exit_margin.  exit_stage_fractions place the stages
+    # inside the fine tier (0 = right after the coarse tier).
+    use_exit: bool = True
+    exit_keep_prob: float = 0.05
+    exit_margin: float = 2.0
+    exit_stage_fractions: tuple[float, ...] = (0.0, 0.125, 0.25, 0.5, 0.75)
     loss_function: str = "Logloss"  # CatBoost objective; only Logloss is supported.
     grow_policy: str = "SymmetricTree"  # Must stay symmetric for the blob format.
 
@@ -78,20 +91,32 @@ class ModelConfig:
 
     def _validate_leaf_grid(self) -> None:
         """Check the leaf quantisation settings."""
-        if self.leaf_bits is not None and self.leaf_bits not in LEAF_BITS_CHOICES:
-            msg = f"leaf_bits must be one of {sorted(LEAF_BITS_CHOICES)} or None"
+        if self.leaf_bits not in LEAF_BITS_CHOICES:
+            msg = f"leaf_bits must be one of {sorted(LEAF_BITS_CHOICES)}"
             raise ValueError(msg)
-        if self.leaf_chunk < 1:
-            msg = "leaf_chunk must be >= 1"
+        if not 1 <= self.leaf_chunk <= MAX_LEAF_CHUNK:
+            msg = f"leaf_chunk must be in [1, {MAX_LEAF_CHUNK}]"
             raise ValueError(msg)
-        if self.quantisation_aware and self.leaf_bits is None:
-            msg = "quantisation_aware needs leaf_bits"
+        if not 0.0 < self.exit_keep_prob < 1.0:
+            msg = "exit_keep_prob must be in (0, 1)"
             raise ValueError(msg)
+        if self.exit_margin < 0.0:
+            msg = "exit_margin must be >= 0"
+            raise ValueError(msg)
+        self.exit_stage_fractions = tuple(float(f) for f in self.exit_stage_fractions)
+        if any(not 0.0 <= f < 1.0 for f in self.exit_stage_fractions):
+            msg = "exit_stage_fractions must be in [0, 1)"
+            raise ValueError(msg)
+
+    @property
+    def coarse_trees(self) -> int:
+        """Trees in the coarse tier: ``coarse_fraction`` of ``n_trees``, at least one fine tree left."""
+        return min(round(self.n_trees * self.coarse_fraction), self.n_trees - 1)
 
     def _validate_tiers(self) -> None:
         """Check the resolution-tiering settings."""
-        if not 0 <= self.coarse_trees < self.n_trees:
-            msg = "coarse_trees must be in [0, n_trees)"
+        if not 0.0 <= self.coarse_fraction < 1.0:
+            msg = "coarse_fraction must be in [0, 1)"
             raise ValueError(msg)
         if self.coarse_max_side < 1:
             msg = "coarse_max_side must be >= 1"
@@ -176,6 +201,7 @@ class Config:
         """Return the fully resolved config as plain JSON-compatible data."""
         d = dataclasses.asdict(self)
         d["train"]["levels"] = list(self.train.levels)
+        d["model"]["exit_stage_fractions"] = list(self.model.exit_stage_fractions)
         return d
 
     @classmethod

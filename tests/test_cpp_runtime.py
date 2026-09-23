@@ -61,7 +61,10 @@ def test_cpp_matches_python_runtime(
         fixture_path = scratch / "fixture.f32"
         expected_path = scratch / "expected.f32"
         _write_f32(fixture_path, det.native_matrix(sample))
-        _write_f32(expected_path, det.predict_proba(sample).reshape(-1))
+        assert det.runtime is not None
+        # the C++ gate compares every tree on every cell; early exit is checked separately
+        full = det.runtime.predict_grid(det.design_matrix(sample), use_exit=False)
+        _write_f32(expected_path, full.reshape(-1))
 
         run = subprocess.run(  # noqa: S603 -- argv is the binary this test just built
             [str(binary), str(model_path), str(fixture_path), str(expected_path), "2"],
@@ -100,7 +103,11 @@ def test_cpp_early_exit_keeps_or_drops_every_pack(  # noqa: PLR0913, PLR0917 -- 
     model_path = det.export(scratch / "model.fdt")
     sample = min(images_dir.glob("*.png"))
     _write_f32(scratch / "fixture.f32", det.native_matrix(sample))
-    _write_f32(scratch / "expected.f32", det.predict_proba(sample).reshape(-1))
+    assert det.runtime is not None
+    _write_f32(
+        scratch / "expected.f32",
+        det.runtime.predict_grid(det.design_matrix(sample), use_exit=False).reshape(-1),
+    )
     run = subprocess.run(  # noqa: S603 -- argv is the binary this test just built
         [str(scorer), str(model_path), "fixture.f32", "expected.f32", "2", f"16:{theta}"],
         capture_output=True,

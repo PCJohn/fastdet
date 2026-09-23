@@ -93,7 +93,7 @@ def _p50_min(fn: Any, reps: int = _REPS) -> tuple[float, float]:
 
 
 def _random_model(
-    n_features: int, seed: int = 0, leaf_bits: int | None = None
+    n_features: int, seed: int = 0, leaf_bits: int = 8
 ) -> tuple[bytes, NDArray[np.float32], NDArray[np.float32]]:
     """A random model of the shipped shape: ``(blob, native fixture, dense fixture)``."""
     rng = np.random.default_rng(seed)
@@ -180,9 +180,9 @@ def test_model_inference_latency(scorer: Path, scratch: Path) -> None:
     """Binning + tree traversal for the whole 64x64 grid, one thread."""
     print(
         f"\n[fastdet-lat] MODEL INFERENCE -- {N_TREES} trees x depth {DEPTH}, "
-        f"{GRID * GRID} cells, float32 leaves, one thread."
+        f"{GRID * GRID} cells, low-bit leaf codes, one thread."
     )
-    print("              'bin features' = float features -> 4-bit codes, once per")
+    print("              'bin features' = float features -> 4-bit bins, once per")
     print("              distinct value; 'walk trees' = every tree on every cell.")
     print("              Independent of the input image size (fixed output grid).")
 
@@ -194,7 +194,7 @@ def test_model_inference_latency(scorer: Path, scratch: Path) -> None:
         _report_model("real model", _run_scorer(scorer, Path(model_path), Path(fixture), None))
         return
 
-    for n_features, bits in [(n, None) for n in KEPT_COLUMNS] + [(KEPT_COLUMNS[-1], 8)]:
+    for n_features, bits in [(n, 8) for n in KEPT_COLUMNS] + [(KEPT_COLUMNS[-1], 4)]:
         blob, native, dense = _random_model(n_features, leaf_bits=bits)
         expected = parse_blob(blob).predict_grid(dense).reshape(-1).astype(np.float32)
         paths = [scratch / name for name in ("m.imsy", "f.f32", "e.f32")]
@@ -203,11 +203,11 @@ def test_model_inference_latency(scorer: Path, scratch: Path) -> None:
         out = _run_scorer(scorer, *paths)
         assert "0 mismatches PASS" in out  # binner agrees with the reference binner
         assert "BIT-IDENTICAL" in out  # SIMD traversal agrees with the scalar one
-        label = f"random, {n_features} columns" + (f", {bits}-bit leaves" if bits else "")
+        label = f"random, {n_features} columns, {bits}-bit leaves"
         _report_model(label, out)
-    print("   8-bit leaves take the same time: the blob stores every leaf as float32 and")
-    print("   the scorer reads float32, so quantising restricts the values, not the work.")
-    print("   Packed low-bit leaves need a scorer that reads them; that is not built yet.")
+    print("   A random model has no tile-constant tier and no exit stages, so this is the")
+    print("   full traversal; a fitted model runs its coarse tier once per tile and exits")
+    print("   early (see 'model, as shipped' in the scorer's output on a real model).")
 
 
 def _strides_for(size: int) -> tuple[int, ...]:

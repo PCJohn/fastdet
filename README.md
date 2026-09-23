@@ -198,59 +198,55 @@ count and learning rate explicitly. See the
 
 ### Leaf quantisation
 
-`ModelConfig.leaf_bits` puts the leaf values on a low-bit grid at export: one offset
-per tree and one step per `leaf_chunk` (16) trees, because leaf magnitudes shrink as
-boosting proceeds and a single global step would quantise the later trees into noise.
-The values are still stored as float32, so the blob format and both runtimes are
-unchanged; what changes is that a chunk holds at most `2**leaf_bits` distinct values,
-which is what a low-bit scorer would read.
+Every model ships with its leaves on a low-bit grid, and is *trained for* that grid:
 
-Both are on by default (`leaf_bits=8`, `quantisation_aware=True`), so models are
-trained for the grid they ship on:
+* per tree an `offset` (its smallest leaf), per chunk of `leaf_chunk` trees a
+  power-of-two `step`, per leaf a `leaf_bits` code (8 by default, 4 optional):
+  `leaf = offset + code * step`. One step per chunk because leaf magnitudes shrink
+  as boosting proceeds; a single global step would quantise the later trees into
+  noise. Chunks restart at the coarse/fine boundary (below).
+* the fit is quantisation-aware: each chunk is fitted on top of the **quantised**
+  running score of the previous ones (CatBoost `baseline`), so later trees correct
+  the rounding of earlier ones, and the export reproduces exactly the grid the fit
+  was steered to (same chunking, same power-of-two steps).
+* both runtimes sum the codes as integers (`total += code << shift[chunk]`) and
+  turn the integer into a score once, `sum(offsets) + total * 2**e_min`, so the
+  Python reference and the C++ scorer agree to the bit, and the scorer's fine-tree
+  work is one byte shuffle per nibble plane of codes instead of four per float leaf.
 
 ```python
-det = Detector().fit(images_dir, masks_dir)                      # 8-bit, QAT
-det = Detector(leaf_bits=4).fit(images_dir, masks_dir)           # 4-bit, QAT
-det = Detector(leaf_bits=None, quantisation_aware=False).fit(…)  # plain float32
+det = Detector(Config()).fit(images_dir, masks_dir)                 # 8-bit, QAT, tiered, exit
+det = Detector(Config(model=ModelConfig(leaf_bits=4))).fit(...)     # 4-bit
 ```
 
-Quantisation-aware fitting costs training time, because each chunk is its own
-CatBoost fit: measured on a 200-tree synthetic fit, 3.2 s plain, 7.8 s at the
-default `leaf_chunk=16`, 4.5 s at `leaf_chunk=50`. Raise `leaf_chunk` to trade
-some of the correction for wall time.
-
-**It does not make inference faster yet.** The blob stores leaves as float32 and
-the scorer reads float32, so quantising restricts which values occur, not the work
-done. The gain arrives with a scorer that reads packed low-bit leaves (measured in
-the experiments: 2.0 ms → 1.43 ms at 8-bit, → 1.12 ms at 4-bit on AVX2); that
-kernel is not written.
+`fit()` reports validation PR-AUC from the exported runtime with early exit on:
+the number is the shipped model's, not the float booster's.
 
 ### Resolution-tiered boosting
 
-`ModelConfig.coarse_trees` grows the first N trees on features that are constant
-inside a 4x4 cell tile (pyramid side <= `coarse_max_side`, 16 by default), then the
-rest on everything, fitted on the coarse stage's score as `baseline`. A scorer could
-evaluate those first trees once per tile instead of once per cell, which is about a
-tenth of the cost of a fine tree. On synthetic data this held PR-AUC at ~40% of the
-traversal cost. Off by default (`coarse_trees=0`): the tile-resolution path does not
-exist in the scorer yet, so today it changes what is trained, not what inference
-costs, and it needs validating on the real dataset first.
+The first `coarse_fraction` of the trees (two thirds by default) may only split on
+features that are constant inside a 4×4 cell tile (`coarse_max_side`, 16); the rest
+see every feature. A tile-constant tree is evaluated **once per tile** by the scorer
+(a fifth of a fine tree, or less), and its tile-level score is what the early exit
+gates on. On the synthetic validation set the tiered model scores 0.9012 against
+0.9014 for an untiered one.
 
-```python
-det = Detector(coarse_trees=1600, n_trees=2400).fit(images_dir, masks_dir)
-```
+### Early exit
 
-With `quantisation_aware`, training fits in chunks of `leaf_chunk` trees and passes
-the **quantised** running score to the next chunk as CatBoost `baseline`, so later
-trees correct the rounding of earlier ones. Training and export call the same
-`quantise_leaves`, so the exported model holds exactly the values it was fitted
-against. Measured on the real validation set: 8-bit costs nothing
-(ΔPR-AUC −0.0003, CI95 [−0.0007, +0.0002]) and needs no retraining, while 4-bit
-applied after training costs −0.012 to −0.019 — that is the case quantisation-aware
-training exists for, and it has yet to be measured on the real data.
+After the coarse tier, and at `exit_stage_fractions` of the fine tier, a tile whose
+cells all score below the stage's threshold stops accumulating and keeps its partial
+score. The thresholds are calibrated at fit time on the training images: the lowest
+partial score of any cell that ends at or above `exit_keep_prob` (0.05), minus
+`exit_margin` (2.0 in raw-score units). They travel in the blob, both runtimes apply
+them (`use_exit`), and the C++ scorer additionally bins the side-64 features only
+for the tiles still alive after the coarse tier (lazy binning).
 
-When `leaf_bits` is set, `fit()` reports validation PR-AUC from the exported runtime
-rather than the booster, since the two no longer agree.
+The exit is a contract about cells that end above `exit_keep_prob`: on the
+calibration images none of them can be stopped, and the margin covers what unseen
+images move. Cells that are stopped keep a score below the threshold, so anything a
+consumer thresholds at or above `exit_keep_prob` is unaffected; a consumer that
+needs exact scores for every cell sets `use_exit=False` (the C++ scorer: no stage
+argument, or an empty one).
 
 ### Pruning
 
@@ -346,120 +342,70 @@ Little-endian:
 
 The header holds `config`, `feature_names`, `metadata`, and `blob_bytes`.
 
-### `IMSY` blob (version 3)
+### `IMSY` blob (version 4)
 
-Little-endian. A bare blob (no `FDT1` wrapper) is also accepted by both runtimes.
+```
++0    "IMSY"                      +24   u32 leaf_bits (4|8)     +40  u32 n_chunks
++4    u32 version = 4             +28   u32 leaf_chunk          +44  u32 n_stages
++8    u32 n_trees                 +32   u32 coarse_trees
++12   u32 n_features              +36   i32 e_min
++16   u32 n_leafs_total
++20   u32 depth
++48   u32 tree_offsets[n_trees+1]   leaf-code start per tree
+      u32 tree_base[n_trees+1]      split-byte offset per tree
+      split[n_trees*depth]          u16 feature, u8 bin, u8 pad   (root split = index bit 0)
+      u8  codes[n_leafs_total]      leaf codes
+      f32 offsets[n_trees]
+      u8  shifts[n_chunks]          chunk step = 2**(e_min + shift)
+      stage[n_stages]               u32 trees, f32 threshold (raw score)
+      u32 n_borders[n_features], f32 borders[...], u8 level_shift[n_features]
+```
 
-| Offset | Type | Field |
-| --- | --- | --- |
-| +0 | 4 bytes | magic `IMSY` |
-| +4 | uint32 | version (2 or 3) |
-| +8 | uint32 | `n_trees` |
-| +12 | uint32 | `n_features` |
-| +16 | uint32 | `n_leafs_total` |
-| +20 | uint32 | `depth` |
-| +24 | uint32[] | `tree_offsets[n_trees + 1]` — leaf-value start per tree |
-| | uint32[] | `tree_base[n_trees + 1]` — split-byte offset per tree |
-| | (u16,u8,u8)[] | `split[n_trees * depth]` — feature, bin, pad |
-| | float32[] | `leaf_values[n_leafs_total]` |
-| | uint32[] | `n_borders[n_features]` |
-| | float32[] | `borders[sum(n_borders)]` |
-| | uint8[] | `level_shift[n_features]` |
-| v3 | uint8[] | `shuffle_tables[n_trees * depth * 16]`, `T[v] = (v > bin) ? (1 << d) : 0` |
-
-A split at level `d` (0 = root) sets leaf bit `d` when the feature's byte-space
-bin is **strictly greater** than the split bin; the leaf index is the sum of
-those bits, so the root split is the lowest bit. Binning is
-`searchsorted-left(borders[f], x)`. Version 3 adds 4-bit `vpshufb` tables, so the
-C++ path never compares — it ORs a table lookup per split. `border_count` is
-capped at `MAX_BORDER_COUNT = 15` because a bin must fit a nibble.
+Chunks are `leaf_chunk` consecutive trees, restarting at `coarse_trees`. A cell's
+raw score is `sum(offsets) + total * 2**e_min` with `total` the integer sum of
+`code << shift`. See `fastdet.runtime` for the reference reader.
 
 ## C++ runtime
 
-`cpp/fastdet_score.cpp` is a dependency-free reader and scorer for the same
-file. It ships one SIMD traversal plus a scalar reference path and one binner,
-and it self-checks the binner and both traversals against each other.
+`cpp/fastdet_score.cpp` is a single-file Highway program that reads the exported
+model, bins the native-resolution features, walks the trees and reports timings.
+Build it with CMake (Highway is fetched automatically) and run:
 
-The scorer uses [Google Highway](https://github.com/google/highway) for SIMD,
-exactly as `imfeat` does: static dispatch, with the target chosen by the compiler
-flags, so one source runs SSE4/AVX2/AVX-512 on x86 and NEON/SVE on Arm.
-
-The traversal is built on the shape of the features. They form a pyramid, so most
-splits test a value that is constant over a block of cells: in a default-size
-model about 40% of the splits are constant on any 4×4 block of cells. Cells are
-therefore scored in 4×4 **tiles** (16 cells, one 128-bit vector of byte lanes,
-two tiles per AVX2 vector), and each tree's splits are divided in two:
-
-- splits on features of side ≤ 16 (and image-wide features) are constant on a
-  tile. They are evaluated once per tile, at 16×16 resolution, and only choose
-  *which group of leaves* the tile can reach;
-- the `v` splits on side-64 and side-32 features vary inside the tile and index
-  within that group. Leaves are permuted per tree at load time so these are the
-  low index bits. With `v ≤ 4` the group has at most 16 leaves, and the leaf
-  values are fetched by four byte shuffles (one per byte of the float32) instead
-  of a gather; `v = 5` uses two shuffles and a blend, `v = 0` a broadcast, and
-  only `v ≥ 6` falls back to a gather.
-
-The loop order is tree-outer: one tree runs over every pack of tiles with its
-dispatch on `v`, its split tables and its plane pointers hoisted, and the running
-sums live in a 16 KB buffer rather than in registers (11% faster than the
-reverse, and each tree streams its few planes sequentially). Every cell still
-adds its trees in order, so the result is bit-identical to the scalar reference.
-
-The binner bins only the features the model uses, each value once, straight into the two layouts the traversal reads (tile-major bytes for
-the varying features, one byte per tile for the rest), with the comparison loop
-unrolled over the feature's cut count. On a depth-7 × 2400 model fitted to
-synthetic text images this measured 2.6 ms per image (0.45 ms binning + 2.1 ms
-traversal; AVX2, one thread) against 5.4 ms (0.9 + 4.6) for the per-cell,
-gather-based traversal it replaced, and 21 M instead of 39 M instructions per
-traversal. The program prints how many trees fall in each `v` class; that
-distribution decides the speed, so check it on a real model. CMake fetches
-Highway 1.2.0 (the same pin as `imfeat`):
-
-```sh
-cmake -S cpp -B build && cmake --build build --config Release --target fastdet_score
+```
+fastdet_score model.fdt fixture.f32 [expected.f32] [iters] [stages]
 ```
 
-The default target is the build machine (`-march=native`; `/arch:AVX2` with
-MSVC). For a portable or cross build set `-DFASTDET_ARCH_FLAGS=...`. Note that
-GCC's `-march=haswell` does not enable AES, which Highway's AVX2 target requires,
-so it silently falls back to 16-byte vectors; use
-`"-march=haswell -maes -mpclmul"`. To build offline, point CMake at a local
-Highway checkout with `-DFETCHCONTENT_SOURCE_DIR_HIGHWAY=/path/to/highway`. The
-program prints the Highway target it was built for.
+`fixture.f32` is `Detector.native_matrix(image)` as little-endian float32,
+`expected.f32` the Python runtime's full probabilities (`predict_grid(...,
+use_exit=False)`). The program gates itself: the tile binner must reproduce the
+reference bins exactly and the SIMD traversal must reproduce the scalar integer
+reference to the bit, and it exits non-zero otherwise. `stages` overrides the blob's
+calibrated exit stages (`trees:theta,...`, applied at chunk ends; an empty string
+disables the exit).
 
-Run:
+What it does, in order:
 
-```bat
-fastdet_score model.fdt fixtures.f32 [expected.f32] [iters]
-```
+1. **Binning.** Each feature is binned once per distinct value (a level-L feature
+   has L×L values), by comparing against its cut list in SIMD and counting; the
+   bins are written as one byte plane per feature in **tile-major** order (a 4×4
+   tile is 16 consecutive bytes), coarse features as one byte per tile.
+2. **Coarse tier.** Trees that split only on tile-constant features are evaluated
+   once per tile: their leaf index is built with byte shuffles over the coarse
+   planes and the leaf code gathered per tile.
+3. **Early exit and lazy binning.** After the coarse tier's stage, only the packs
+   of tiles still alive get their side-64 features binned, and only they are
+   scored by the fine trees.
+4. **Fine trees.** Splits that vary inside a tile take the low bits of the leaf
+   index and are looked up with one byte shuffle each over 32 cells; the
+   tile-constant splits select the leaf group per tile. Each nibble plane of the
+   group's codes is fetched with one byte shuffle and added into byte-lane sums,
+   which are widened once per chunk of trees with the chunk's shift into the
+   integer totals. No float arithmetic until the final score.
+5. **Score.** `sigmoid(sum(offsets) + total * 2**e_min)` per cell, in row-major order.
 
-`fixtures.f32` holds one image's kept features at their **native resolution** —
-exactly what `Detector.native_matrix(image)` returns. Each feature, in model
-order, contributes its level's `side × side` little-endian float32 values
-row-major, where `side = 64 >> (level_shift / 2)`: 64 for the finest level, 2 for
-the coarsest, and 1 for an image-wide global. No dense `4096 × n_features` table
-is built on the inference path: a level-8 feature is 64 values rather than 4096
-copies of them, and the binner bins each distinct value once. For the default
-front-end that is 3.7 MB instead of 19.3 MB per image, and binning is ~6× faster.
-(`Detector.design_matrix(image)` still returns the dense matrix; it feeds training
-and the Python reference runtime, and expanding every native value over its
-block reproduces it exactly.) With `expected.f32` (4096 float32, e.g.
-`Detector.predict_proba(image).reshape(-1)`), the program also reports the
-maximum absolute probability error and exits non-zero if any gate fails.
-
-**Optional early exit (experimental).** A fifth argument, `"trees:theta,..."`,
-adds stages to the same traversal: once `trees` trees have run, a pack of tiles
-in which every raw sum is below `theta` is dropped and its cells keep that
-partial sum. A pack that survives has run every tree in order, so
-its scores are bit-identical to the full evaluation; only confidently negative
-tiles are cut short. The program times it next to the full evaluation and prints
-how many cells stayed identical and the highest full probability among those
-that did not. On the synthetic model above, with thresholds taken from the
-training images (the lowest partial sum of any cell that ends at p ≥ 0.05,
-minus 2), traversal on the six validation images fell from 2.1 ms to 0.7–1.2 ms
-and no cell ending at p ≥ 0.05 was cut short. The thresholds are a property of
-the data: calibrate them on yours, and validate PR-AUC, before using this.
+Timings printed: `tile binner`, `simd traversal` (every tree on every cell),
+`model total` (binning + full traversal) and `model, as shipped` (lazy binning,
+coarse tier per tile, early exit) -- the last one is the production number.
 
 ## Development
 

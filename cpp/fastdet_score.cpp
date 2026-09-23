@@ -37,6 +37,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <climits>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -93,28 +94,13 @@ inline uint32_t rd_u32(const uint8_t* p) {
   return v;
 }
 
-struct ImysModel {
-  uint32_t n_trees = 0;
-  uint32_t n_features = 0;
-  uint32_t n_leafs_total = 0;
-  uint32_t depth = 0;
-  std::vector<uint32_t> tree_offsets;     // n_trees + 1 leaf-value starts
-  std::vector<uint32_t> tree_base;        // n_trees + 1 split-record byte offsets
-  std::vector<uint8_t> splits;            // n_trees * depth packed records
-  std::vector<float> leaf_values;         // n_leafs_total
-  std::vector<uint32_t> n_borders;        // per feature
-  std::vector<uint32_t> border_offset;    // n_features + 1
-  std::vector<float> borders;             // concatenated per-feature borders
-  std::vector<uint8_t> level_shift;       // per feature (2 * log2(64 / level))
-  std::vector<uint8_t> shuffle_tables;    // n_trees * depth * 16
-};
-
 // Extract the IMSY blob from either an FDT1 container or a bare IMSY blob.
-bool locate_blob(const std::string& raw, const uint8_t** blob, size_t* blob_size) {
+bool find_blob(const std::string& raw, const uint8_t** blob, size_t* blob_size) {
   if (raw.size() < 12) return false;
   const uint8_t* p = reinterpret_cast<const uint8_t*>(raw.data());
   if (std::memcmp(p, "FDT1", 4) == 0) {
-    const uint32_t header_len = rd_u32(p + 8);
+    uint32_t header_len;
+    std::memcpy(&header_len, p + 8, 4);
     if (raw.size() < 12 + header_len) return false;
     *blob = p + 12 + header_len;
     *blob_size = raw.size() - 12 - header_len;
@@ -128,70 +114,79 @@ bool locate_blob(const std::string& raw, const uint8_t** blob, size_t* blob_size
   return false;
 }
 
-bool load_imys(const uint8_t* p, size_t size, ImysModel* model) {
+struct Stage {
+  uint32_t trees;
+  float theta;
+};
+
+struct ImysModel {
+  uint32_t version = 0, n_trees = 0, n_features = 0, n_leafs_total = 0, depth = 0;
+  uint32_t leaf_bits = 8, leaf_chunk = 16, coarse_trees = 0, n_chunks = 0;
+  int32_t e_min = 0;
+  std::vector<uint32_t> tree_offsets, tree_base;
+  std::vector<uint16_t> split_feat;
+  std::vector<uint8_t> split_bin;
+  std::vector<uint8_t> codes;      // leaf codes, < 2**leaf_bits
+  std::vector<float> offsets;      // per tree
+  std::vector<uint8_t> shifts;     // per chunk: step = 2**(e_min + shift)
+  std::vector<Stage> stages;       // early-exit stages calibrated at fit time
+  std::vector<uint32_t> n_borders, border_offset;
+  std::vector<float> borders;
+  std::vector<uint8_t> level_shift;
+  std::vector<uint32_t> chunk_of;  // per tree
+  double offset_sum = 0.0;
+
+  uint32_t chunk_start(uint32_t c) const { return chunk_starts[c]; }
+  uint32_t chunk_end(uint32_t c) const { return c + 1 < n_chunks ? chunk_starts[c + 1] : n_trees; }
+  std::vector<uint32_t> chunk_starts;
+};
+
+bool load_imys(const uint8_t* p, size_t size, ImysModel* m) {
+  auto rd32 = [&](size_t off) { uint32_t v; std::memcpy(&v, p + off, 4); return v; };
   if (size < 48 || std::memcmp(p, "IMSY", 4) != 0) return false;
-  const uint32_t version = rd_u32(p + 4);
-  if (version != 2 && version != 3) return false;
-  model->n_trees = rd_u32(p + 8);
-  model->n_features = rd_u32(p + 12);
-  model->n_leafs_total = rd_u32(p + 16);
-  model->depth = rd_u32(p + 20);
-
-  const size_t n1 = 4 * (size_t)(model->n_trees + 1);
-  size_t off = 24;
-  if (size < off + 2 * n1) return false;
-  model->tree_offsets.assign((const uint32_t*)(p + off), (const uint32_t*)(p + off) + model->n_trees + 1);
-  off += n1;
-  model->tree_base.assign((const uint32_t*)(p + off), (const uint32_t*)(p + off) + model->n_trees + 1);
-  off += n1;
-  if (model->tree_offsets[0] != 0 || model->tree_offsets[model->n_trees] != model->n_leafs_total) return false;
-  if (model->tree_base[model->n_trees] != (size_t)model->n_trees * model->depth * 4) return false;
-
-  const size_t split_bytes = (size_t)model->n_trees * model->depth * 4;
-  if (size < off + split_bytes) return false;
-  model->splits.assign(p + off, p + off + split_bytes);
-  off += split_bytes;
-
-  const size_t leaf_bytes = 4 * (size_t)model->n_leafs_total;
-  if (size < off + leaf_bytes) return false;
-  model->leaf_values.assign((const float*)(p + off), (const float*)(p + off) + model->n_leafs_total);
-  off += leaf_bytes;
-
-  const size_t nb_bytes = 4 * (size_t)model->n_features;
-  if (size < off + nb_bytes) return false;
-  model->n_borders.assign((const uint32_t*)(p + off), (const uint32_t*)(p + off) + model->n_features);
-  off += nb_bytes;
-  // A bin indexes a 16-entry table, so a feature has at most kMaxBin cuts (the exporter
-  // enforces the same bound).
-  const auto binnable = [](uint32_t cuts) { return cuts <= kMaxBin; };
-  if (!std::all_of(model->n_borders.begin(), model->n_borders.end(), binnable)) return false;
-
-  model->border_offset.assign(model->n_features + 1, 0);
-  for (uint32_t f = 0; f < model->n_features; ++f)
-    model->border_offset[f + 1] = model->border_offset[f] + model->n_borders[f];
-  const size_t border_bytes = 4 * (size_t)model->border_offset[model->n_features];
-  if (size < off + border_bytes) return false;
-  model->borders.assign((const float*)(p + off),
-                        (const float*)(p + off) + model->border_offset[model->n_features]);
-  off += border_bytes;
-
-  if (version == 2 || version == 3) {
-    if (size < off + model->n_features) return false;
-    model->level_shift.assign(p + off, p + off + model->n_features);
-    const auto tileable = [](uint8_t shift) { return shift <= kMaxShift && !(shift & 1u); };
-    if (!std::all_of(model->level_shift.begin(), model->level_shift.end(), tileable)) return false;
-    off += model->n_features;
+  m->version = rd32(4);
+  if (m->version != 4) { std::fprintf(stderr, "IMSY version %u; this scorer reads version 4\n", m->version); return false; }
+  m->n_trees = rd32(8); m->n_features = rd32(12); m->n_leafs_total = rd32(16); m->depth = rd32(20);
+  m->leaf_bits = rd32(24); m->leaf_chunk = rd32(28); m->coarse_trees = rd32(32);
+  std::memcpy(&m->e_min, p + 36, 4);
+  m->n_chunks = rd32(40);
+  const uint32_t n_stages = rd32(44);
+  size_t off = 48;
+  auto take = [&](size_t bytes) { const uint8_t* q = p + off; off += bytes; return q; };
+  if (m->depth == 0 || m->depth > 8 || (m->leaf_bits != 4 && m->leaf_bits != 8) || m->leaf_chunk == 0 || m->leaf_chunk > 17) return false;
+  m->tree_offsets.resize(m->n_trees + 1); std::memcpy(m->tree_offsets.data(), take(4 * (m->n_trees + 1)), 4 * (m->n_trees + 1));
+  m->tree_base.resize(m->n_trees + 1); std::memcpy(m->tree_base.data(), take(4 * (m->n_trees + 1)), 4 * (m->n_trees + 1));
+  const size_t n_splits = static_cast<size_t>(m->n_trees) * m->depth;
+  m->split_feat.resize(n_splits); m->split_bin.resize(n_splits);
+  for (size_t i = 0; i < n_splits; ++i) { const uint8_t* q = take(4); std::memcpy(&m->split_feat[i], q, 2); m->split_bin[i] = q[2]; }
+  m->codes.resize(m->n_leafs_total); std::memcpy(m->codes.data(), take(m->n_leafs_total), m->n_leafs_total);
+  m->offsets.resize(m->n_trees); std::memcpy(m->offsets.data(), take(4 * m->n_trees), 4 * m->n_trees);
+  m->shifts.resize(m->n_chunks); std::memcpy(m->shifts.data(), take(m->n_chunks), m->n_chunks);
+  for (uint32_t i = 0; i < n_stages; ++i) { const uint8_t* q = take(8); Stage s; std::memcpy(&s.trees, q, 4); std::memcpy(&s.theta, q + 4, 4); m->stages.push_back(s); }
+  m->n_borders.resize(m->n_features); std::memcpy(m->n_borders.data(), take(4 * m->n_features), 4 * m->n_features);
+  m->border_offset.resize(m->n_features + 1);
+  size_t total = 0;
+  for (uint32_t f = 0; f < m->n_features; ++f) { m->border_offset[f] = static_cast<uint32_t>(total); total += m->n_borders[f]; if (m->n_borders[f] > kMaxBin) return false; }
+  m->border_offset[m->n_features] = static_cast<uint32_t>(total);
+  m->borders.resize(total); std::memcpy(m->borders.data(), take(4 * total), 4 * total);
+  m->level_shift.resize(m->n_features); std::memcpy(m->level_shift.data(), take(m->n_features), m->n_features);
+  if (off != size) { std::fprintf(stderr, "IMSY blob: %zu trailing bytes\n", size - off); return false; }
+  // chunks: leaf_chunk trees each, restarting at coarse_trees
+  m->chunk_of.resize(m->n_trees);
+  m->chunk_starts.clear();
+  const uint32_t starts[3] = {0, m->coarse_trees, m->n_trees};
+  for (int s = 0; s < 2; ++s) {
+    const uint32_t lo = starts[s], hi = starts[s + 1];
+    for (uint32_t t = lo; t < hi; t += m->leaf_chunk) {
+      for (uint32_t u = t; u < std::min(t + m->leaf_chunk, hi); ++u) m->chunk_of[u] = static_cast<uint32_t>(m->chunk_starts.size());
+      m->chunk_starts.push_back(t);
+    }
   }
-  if (version == 3) {
-    const size_t table_bytes = (size_t)model->n_trees * model->depth * 16;
-    if (size < off + table_bytes) return false;
-    model->shuffle_tables.assign(p + off, p + off + table_bytes);
-    off += table_bytes;
-  }
+  if (m->chunk_starts.size() != m->n_chunks) { std::fprintf(stderr, "IMSY blob: %zu chunks, header says %u\n", m->chunk_starts.size(), m->n_chunks); return false; }
+  for (uint32_t t = 0; t < m->n_trees; ++t) m->offset_sum += m->offsets[t];
   return true;
 }
 
-// searchsorted-left: bin(x) = number of borders strictly below x.
 inline uint8_t bin_one(const ImysModel& m, uint32_t f, float x) {
   const float* a = m.borders.data() + m.border_offset[f];
   const uint32_t n = m.n_borders[f];
@@ -203,7 +198,6 @@ inline uint8_t bin_one(const ImysModel& m, uint32_t f, float x) {
   return (uint8_t)lo;
 }
 
-// Reference binner: full column-major byte matrix. X is row-major (cell-major).
 void bin_full(const ImysModel& m, const float* X, size_t n_cells, uint8_t* B) {
   for (size_t c = 0; c < n_cells; ++c) {
     const float* row = X + c * m.n_features;
@@ -310,42 +304,33 @@ std::vector<float> expand_native(const ImysModel& m, const float* xn,
 }
 
 void sigmoid(const std::vector<float>& raw, float* out, size_t n) {
-  for (size_t i = 0; i < n; ++i) out[i] = 1.0f / (1.0f + std::exp((double)-raw[i]));
+  for (size_t i = 0; i < n; ++i) out[i] = 1.0f / (1.0f + std::exp(-raw[i]));
 }
 
-// Reference scorer: one cell at a time, root split in the lowest leaf bit.
+// Raw score of a cell from its integer total: the runtimes agree to the bit because the total
+// is an integer and this is the one float expression that turns it into a score.
+inline float raw_of(const ImysModel& m, int64_t total) {
+  return static_cast<float>(m.offset_sum + std::ldexp(static_cast<double>(total), m.e_min));
+}
+
+// Reference: every tree on every cell in order, integer codes, no SIMD.
 void score_cells_scalar(const ImysModel& m, const uint8_t* B, size_t n_cells, float* out) {
-  std::vector<float> raw(n_cells, 0.0f);
-  for (size_t c = 0; c < n_cells; ++c) {
-    float acc = 0.0f;
-    for (uint32_t t = 0; t < m.n_trees; ++t) {
-      const uint8_t* sp = m.splits.data() + m.tree_base[t];
-      const float* lf = m.leaf_values.data() + m.tree_offsets[t];
+  std::vector<int64_t> total(n_cells, 0);
+  for (uint32_t t = 0; t < m.n_trees; ++t) {
+    const size_t s0 = static_cast<size_t>(t) * m.depth;
+    const uint8_t* code = m.codes.data() + m.tree_offsets[t];
+    const int shift = m.shifts[m.chunk_of[t]];
+    for (size_t c = 0; c < n_cells; ++c) {
       uint32_t idx = 0;
-      for (uint32_t d = 0; d < m.depth; ++d) {
-        const uint16_t feat = *(const uint16_t*)(sp + d * 4);
-        const uint8_t bin = sp[d * 4 + 2];
-        idx |= (uint32_t)(B[(size_t)feat * n_cells + c] > bin) << d;
-      }
-      acc += lf[idx];
+      for (uint32_t d = 0; d < m.depth; ++d) idx |= static_cast<uint32_t>(B[static_cast<size_t>(m.split_feat[s0 + d]) * n_cells + c] > m.split_bin[s0 + d]) << d;
+      total[c] += static_cast<int64_t>(code[idx]) << shift;
     }
-    raw[c] = acc;
   }
+  std::vector<float> raw(n_cells);
+  for (size_t c = 0; c < n_cells; ++c) raw[c] = raw_of(m, total[c]);
   sigmoid(raw, out, n_cells);
 }
 
-// ---- Tiled scorer --------------------------------------------------------------------------
-// The feature pyramid makes most splits coarse: a feature of side s is constant on blocks of
-// (64 / s)^2 cells.  Cells are therefore scored in 4 x 4 tiles (one 16-lane byte vector), and a
-// tree's splits are divided into those that vary inside a tile (side 64 or 32) and those that
-// are constant on it (side <= 16, and image-wide features):
-//   * the constant splits are evaluated once per tile, at 16 x 16 resolution, and only select
-//     WHICH group of leaves the tile can reach;
-//   * the v varying splits index inside that group.  With v <= 4 the group has at most 16
-//     leaves, so the leaf value is fetched with four byte shuffles (one per byte of the
-//     float) instead of a gather; v == 0 is a broadcast; v > 4 falls back to a gather.
-// Leaves are permuted per tree so that the varying splits are the low index bits.  Every cell
-// still adds its trees in order, so the result is bit-identical to score_cells_scalar.
 constexpr size_t kTile = 4;                       // tile side, in cells
 constexpr size_t kTileCells = kTile * kTile;      // 16 cells: one 128-bit vector of byte lanes
 constexpr size_t kTileGrid = kGrid / kTile;       // 16 x 16 tiles
@@ -357,79 +342,78 @@ constexpr uint32_t kBlendBits = 5;                // ... and with two shuffles a
 struct TiledModel {
   std::vector<int32_t> fine_slot, coarse_slot;  // per feature: its plane, or -1 if unused
   uint32_t n_fine = 0, n_coarse = 0;
-  std::vector<uint8_t> nvary;                       // per tree: v
+  std::vector<uint8_t> nvary;                       // per tree: v (varying splits inside a tile)
   std::vector<uint32_t> plane;                      // per split, varying first: its plane slot
   hwy::AlignedFreeUniquePtr<uint8_t[]> table;       // per split: 16 bytes, bin -> its index bit
-  hwy::AlignedFreeUniquePtr<uint8_t[]> leaf_bytes;  // 1 <= v <= 4: per group, 4 byte planes
-  std::vector<float> leaf_f32;                      // leaves in permuted order (v == 0, v > 4)
+  std::vector<uint8_t> code;                        // leaf codes in permuted order
+  std::vector<int32_t> code32;                      // the same, widened, for per-tile gathers
+  hwy::AlignedFreeUniquePtr<uint8_t[]> nib;         // per leaf group: NP nibble planes of the codes
 };
 
 bool varies_in_tile(const ImysModel& m, uint32_t f) {
   return m.level_shift.empty() || m.level_shift[f] <= kVaryShift;
 }
 
+// Reorders every tree's splits so the ones that vary inside a tile take the low index bits,
+// permutes its leaf codes to match, and lays the codes of each leaf group out as nibble
+// planes: plane k of group g holds ((code >> 4k) & 15) for the group's 2^v leaves, so a byte
+// shuffle fetches a 4-bit slice of 16 (or 32) leaf codes at once.
 TiledModel build_tiled(const ImysModel& m) {
   TiledModel tm;
-  const uint32_t depth = m.depth, leaves = 1u << depth;
+  const uint32_t depth = m.depth, np = m.leaf_bits / 4;
   tm.fine_slot.assign(m.n_features, -1);
   tm.coarse_slot.assign(m.n_features, -1);
   tm.nvary.resize(m.n_trees);
   tm.plane.resize(static_cast<size_t>(m.n_trees) * depth);
   tm.table = hwy::AllocateAligned<uint8_t>(static_cast<size_t>(m.n_trees) * depth * 16);
-  tm.leaf_bytes = hwy::AllocateAligned<uint8_t>(static_cast<size_t>(m.n_leafs_total) * 4 + 16);
-  tm.leaf_f32.resize(m.n_leafs_total);
-  std::memset(tm.leaf_bytes.get(), 0, static_cast<size_t>(m.n_leafs_total) * 4 + 16);
+  tm.code.resize(m.n_leafs_total);
+  tm.code32.resize(m.n_leafs_total);
+  tm.nib = hwy::AllocateAligned<uint8_t>(static_cast<size_t>(m.n_leafs_total) * np + 64);
   std::vector<uint32_t> order(depth);
   for (uint32_t t = 0; t < m.n_trees; ++t) {
-    const uint8_t* sp = m.splits.data() + m.tree_base[t];
+    const size_t s0 = static_cast<size_t>(t) * depth;
     uint32_t v = 0, n = 0;  // varying splits take the low index bits, in their original order
     for (uint32_t d = 0; d < depth; ++d)
-      if (varies_in_tile(m, rd_u16(sp + d * 4))) order[n++] = d;
-    v = n;
+      if (varies_in_tile(m, m.split_feat[s0 + d])) order[n++] = d, ++v;
     for (uint32_t d = 0; d < depth; ++d)
-      if (!varies_in_tile(m, rd_u16(sp + d * 4))) order[n++] = d;
+      if (!varies_in_tile(m, m.split_feat[s0 + d])) order[n++] = d;
     tm.nvary[t] = static_cast<uint8_t>(v);
     for (uint32_t j = 0; j < depth; ++j) {
-      const uint32_t f = rd_u16(sp + order[j] * 4);
-      const uint8_t bin = sp[order[j] * 4 + 2];
-      const bool varying = j < v;
-      std::vector<int32_t>& slot = varying ? tm.fine_slot : tm.coarse_slot;
-      if (slot[f] < 0) slot[f] = static_cast<int32_t>((varying ? tm.n_fine : tm.n_coarse)++);
-      tm.plane[static_cast<size_t>(t) * depth + j] = static_cast<uint32_t>(slot[f]);
-      const uint32_t bit = j < v ? j : j - v;  // within the low (varying) or high (constant) part
-      uint8_t* tab = tm.table.get() + (static_cast<size_t>(t) * depth + j) * 16;
-      for (uint32_t b = 0; b < 16; ++b) tab[b] = b > bin ? static_cast<uint8_t>(1u << bit) : 0;
+      const uint32_t f = m.split_feat[s0 + order[j]];
+      const uint8_t bin = m.split_bin[s0 + order[j]];
+      int32_t& slot = j < v ? tm.fine_slot[f] : tm.coarse_slot[f];
+      if (slot < 0) slot = static_cast<int32_t>(j < v ? tm.n_fine++ : tm.n_coarse++);
+      tm.plane[s0 + j] = static_cast<uint32_t>(slot);
+      // varying splits set index bits 0..v-1; tile-constant ones set the group's bits 0..depth-v-1
+      uint8_t* table = tm.table.get() + (s0 + j) * 16;
+      const uint32_t bit = j < v ? j : j - v;
+      for (uint32_t b = 0; b < 16; ++b) table[b] = b > bin ? static_cast<uint8_t>(1u << bit) : 0;
     }
-    const float* old_leaf = m.leaf_values.data() + m.tree_offsets[t];
-    float* leaf = tm.leaf_f32.data() + m.tree_offsets[t];
-    for (uint32_t idx = 0; idx < leaves; ++idx) {
+    const uint32_t n_leaves = 1u << depth;
+    const uint8_t* src = m.codes.data() + m.tree_offsets[t];
+    uint8_t* dst = tm.code.data() + m.tree_offsets[t];
+    for (uint32_t idx = 0; idx < n_leaves; ++idx) {  // new index -> old index
       uint32_t old_idx = 0;
       for (uint32_t j = 0; j < depth; ++j) old_idx |= ((idx >> j) & 1u) << order[j];
-      leaf[idx] = old_leaf[old_idx];
+      dst[idx] = src[old_idx];
+      tm.code32[m.tree_offsets[t] + idx] = src[old_idx];
     }
-    if (v >= 1 && v <= kBlendBits) {  // byte planes: group g holds leaves [g << v, (g + 1) << v)
-      const uint32_t group = 1u << v;
-      uint8_t* out = tm.leaf_bytes.get() + static_cast<size_t>(m.tree_offsets[t]) * 4;
-      for (uint32_t g = 0; g < leaves / group; ++g)
-        for (uint32_t k = 0; k < 4; ++k)
-          for (uint32_t i = 0; i < group; ++i) {
-            uint8_t bytes[4];
-            std::memcpy(bytes, &leaf[g * group + i], 4);
-            out[(static_cast<size_t>(g) * 4 + k) * group + i] = bytes[k];
-          }
-    }
+    uint8_t* planes = tm.nib.get() + static_cast<size_t>(m.tree_offsets[t]) * np;
+    const uint32_t width = 1u << v, groups = n_leaves / width;
+    for (uint32_t g = 0; g < groups; ++g)
+      for (uint32_t k = 0; k < np; ++k)
+        for (uint32_t i = 0; i < width; ++i) planes[(g * np + k) * width + i] = static_cast<uint8_t>((dst[g * width + i] >> (4 * k)) & 15);
   }
   return tm;
 }
 
-// Bins of the used features: fine planes (4096 bytes, tile-major: tile T = (r/4)*16 + c/4 at
-// T*16 + (r%4)*4 + c%4) and tile-constant planes (256 bytes, one per tile).
 void bin_tiles(const ImysModel& m, const TiledModel& tm, const float* xn,
-               const std::vector<size_t>& offset, uint8_t* fine, uint8_t* coarse) {
+               const std::vector<size_t>& offset, uint8_t* fine, uint8_t* coarse, bool skip_side64 = false) {
   uint8_t rows[kTile][kGrid];
   uint8_t small[kTileGrid * kTileGrid];
   for (uint32_t f = 0; f < m.n_features; ++f) {
     if (tm.fine_slot[f] < 0 && tm.coarse_slot[f] < 0) continue;
+    if (skip_side64 && tm.fine_slot[f] >= 0 && tm.coarse_slot[f] < 0 && native_side(m, f) == kGrid) continue;
     const uint32_t k = m.n_borders[f];
     const float* cuts = m.borders.data() + m.border_offset[f];
     const float* xf = xn + offset[f];
@@ -498,424 +482,360 @@ void bin_tiles(const ImysModel& m, const TiledModel& tm, const float* xn,
 
 // One tree's view of a tile pass: everything the inner loop touches, resolved to pointers.
 struct TiledTree {
-  uint32_t v;                 // splits that vary inside a tile
-  const uint8_t* table;       // v 16-byte tables, bin -> index bit
-  const uint8_t* fine[8];     // the v fine planes those splits read
-  const uint8_t* group;       // per tile: which leaf group it reaches (kTiles bytes)
-  const uint8_t* leaf_bytes;  // 1 <= v <= 4: byte planes of the permuted leaves
-  const float* leaf;          // permuted leaves
+  uint32_t v = 0;
+  const uint8_t* table = nullptr;   // 16 bytes per split, varying first
+  const uint8_t* fine[8] = {};      // plane of each varying split (4096 bytes, tile-major)
+  const uint8_t* nib = nullptr;     // this tree's nibble planes
+  const uint8_t* group = nullptr;   // leaf group per tile
 };
 
-// Tiles are scored kPack at a time, one per 128-bit block of a vector: byte shuffles and
-// interleaves work per block, so each tile uses its own leaf tables.  The running sums of a
-// pack are kept as four float vectors; vector k holds cells 4k..4k+3 of every tile in it.
 #if HWY_MAX_BYTES >= 32 && !HWY_HAVE_SCALABLE
-constexpr size_t kPack = 2;
+constexpr size_t kPack = 2;  // tiles per index vector (32 byte lanes)
 #else
 constexpr size_t kPack = 1;
 #endif
 using PackB = hn::FixedTag<uint8_t, 16 * kPack>;
 using PackW = hn::FixedTag<uint16_t, 8 * kPack>;
-using PackF = hn::FixedTag<float, 4 * kPack>;
 
-// One 16-byte table per tile of the pack, from the same offset of each tile's own base.
+// One 16-byte table per tile of the pack, side by side.
 HWY_INLINE hn::VFromD<PackB> pack_tables(const uint8_t* const* base, size_t offset) {
-  const hn::FixedTag<uint8_t, 16> db;
+  const hn::FixedTag<uint8_t, 16> dq;
 #if HWY_MAX_BYTES >= 32 && !HWY_HAVE_SCALABLE
-  return hn::Combine(PackB(), hn::LoadU(db, base[1] + offset), hn::LoadU(db, base[0] + offset));
+  return hn::Combine(PackB(), hn::LoadU(dq, base[1] + offset), hn::LoadU(dq, base[0] + offset));
 #else
-  return hn::LoadU(db, base[0] + offset);
+  return hn::LoadU(dq, base[0] + offset);
 #endif
 }
 
-// Five varying splits: the fifth index bit chooses between two 16-entry tables per byte plane.
-HWY_INLINE void pack_leaves5(const TiledTree& tr, size_t cell0, const uint8_t* g,
-                             hn::VFromD<PackF>* acc) {
+// One tree over the active packs: the index is built in byte lanes (one shuffle per varying
+// split), and each nibble plane of the leaf codes is fetched with one shuffle per plane and
+// added into byte-lane sums.  Trees of a chunk share the sums (at most 17 * 15 per lane), which
+// are widened once per chunk.  For v >= 5 the 32-entry (or wider) group is two or more
+// 16-entry sub-tables merged by a blend on the high index bits.
+template <uint32_t V, uint32_t NP>
+HWY_NOINLINE void tree_codes_over_packs(const TiledTree& tr, const uint16_t* active, size_t n_active, uint8_t* bsum) {
   const PackB db;
-  const PackW dw;
-  const PackF df;
-  auto idx = hn::TableLookupBytes(hn::LoadDup128(db, tr.table), hn::LoadU(db, tr.fine[0] + cell0));
-  for (uint32_t j = 1; j < kBlendBits; ++j)
-    idx = hn::Or(idx, hn::TableLookupBytes(hn::LoadDup128(db, tr.table + j * 16),
-                                           hn::LoadU(db, tr.fine[j] + cell0)));
-  constexpr size_t width = static_cast<size_t>(1) << kBlendBits;
-  const uint8_t* base[kPack];
-  for (size_t k = 0; k < kPack; ++k)
-    base[k] = tr.leaf_bytes + static_cast<size_t>(g[k]) * width * 4;
-  const auto upper = hn::TestBit(idx, hn::Set(db, 16));
-  const auto low = hn::And(idx, hn::Set(db, 15));
-  auto plane = [&](size_t k) {
-    return hn::IfThenElse(upper, hn::TableLookupBytes(pack_tables(base, k * width + 16), low),
-                          hn::TableLookupBytes(pack_tables(base, k * width), low));
-  };
-  const auto b0 = plane(0), b1 = plane(1), b2 = plane(2), b3 = plane(3);
-  const auto lo01 = hn::BitCast(dw, hn::InterleaveLower(db, b0, b1));
-  const auto hi01 = hn::BitCast(dw, hn::InterleaveUpper(db, b0, b1));
-  const auto lo23 = hn::BitCast(dw, hn::InterleaveLower(db, b2, b3));
-  const auto hi23 = hn::BitCast(dw, hn::InterleaveUpper(db, b2, b3));
-  acc[0] = hn::Add(acc[0], hn::BitCast(df, hn::InterleaveLower(dw, lo01, lo23)));
-  acc[1] = hn::Add(acc[1], hn::BitCast(df, hn::InterleaveUpper(dw, lo01, lo23)));
-  acc[2] = hn::Add(acc[2], hn::BitCast(df, hn::InterleaveLower(dw, hi01, hi23)));
-  acc[3] = hn::Add(acc[3], hn::BitCast(df, hn::InterleaveUpper(dw, hi01, hi23)));
-}
-
-// Where cell `p` (0..15) of tile `tile` lives in the pack-ordered running sums.
-inline size_t pack_slot(size_t tile, size_t p) {
-  const size_t lanes = 4 * kPack;
-  // kPack is 1 on 128-bit targets, where `tile % kPack` is a constant zero by design.
-  // cppcheck-suppress moduloofone
-  return (tile / kPack) * kTileCells * kPack + (p / 4) * lanes + (tile % kPack) * 4 + p % 4;
-}
-
-// Adds one tree with 1 <= V <= 4 varying splits to every pack still being scored.  The loop
-// order is tree-outer on purpose: the running sums live in memory (16 KB, in L1) rather than
-// in registers, but everything that depends only on the tree -- the dispatch on V, the split
-// tables, the plane pointers -- is hoisted out of the pack loop, and a tree streams its few
-// planes sequentially.  Measured 11% faster than holding the sums in registers across a group
-// of trees.
-template <uint32_t V>
-HWY_NOINLINE void tree_over_packs(const TiledTree& tr, const uint16_t* active, size_t n_active,
-                                  float* raw) {
-  const PackB db;
-  const PackW dw;
-  const PackF df;
-  const size_t lanes = hn::Lanes(df);
   hn::VFromD<PackB> table[V];
-  for (uint32_t j = 0; j < V; ++j) table[j] = hn::LoadDup128(db, tr.table + j * 16);
-  constexpr size_t width = static_cast<size_t>(1) << V;
+  const uint8_t* plane[V];
+  for (uint32_t j = 0; j < V; ++j) { table[j] = hn::LoadDup128(db, tr.table + j * 16); plane[j] = tr.fine[j]; }
+  constexpr size_t width = static_cast<size_t>(1) << V, subs = width > 16 ? width / 16 : 1;
+  const uint8_t* const nib = tr.nib;
+  const uint8_t* const group = tr.group;
+  const auto low = hn::Set(db, 15);
   for (size_t a = 0; a < n_active; ++a) {
     const size_t tile = active[a], cell0 = tile * kTileCells;
-    auto idx = hn::TableLookupBytes(table[0], hn::LoadU(db, tr.fine[0] + cell0));
-    for (uint32_t j = 1; j < V; ++j)
-      idx = hn::Or(idx, hn::TableLookupBytes(table[j], hn::LoadU(db, tr.fine[j] + cell0)));
+    auto idx = hn::TableLookupBytes(table[0], hn::LoadU(db, plane[0] + cell0));
+    for (uint32_t j = 1; j < V; ++j) idx = hn::Or(idx, hn::TableLookupBytes(table[j], hn::LoadU(db, plane[j] + cell0)));
     const uint8_t* base[kPack];
-    for (size_t k = 0; k < kPack; ++k)
-      base[k] = tr.leaf_bytes + static_cast<size_t>(tr.group[tile + k]) * width * 4;
-    // Four byte shuffles fetch the four bytes of each of the pack's leaf values ...
-    const auto b0 = hn::TableLookupBytes(pack_tables(base, 0), idx);
-    const auto b1 = hn::TableLookupBytes(pack_tables(base, width), idx);
-    const auto b2 = hn::TableLookupBytes(pack_tables(base, 2 * width), idx);
-    const auto b3 = hn::TableLookupBytes(pack_tables(base, 3 * width), idx);
-    // ... and two rounds of interleaves put them back together as floats.
-    const auto lo01 = hn::BitCast(dw, hn::InterleaveLower(db, b0, b1));
-    const auto hi01 = hn::BitCast(dw, hn::InterleaveUpper(db, b0, b1));
-    const auto lo23 = hn::BitCast(dw, hn::InterleaveLower(db, b2, b3));
-    const auto hi23 = hn::BitCast(dw, hn::InterleaveUpper(db, b2, b3));
-    float* sum = raw + cell0;
-    hn::Store(hn::Add(hn::Load(df, sum), hn::BitCast(df, hn::InterleaveLower(dw, lo01, lo23))), df,
-              sum);
-    hn::Store(
-        hn::Add(hn::Load(df, sum + lanes), hn::BitCast(df, hn::InterleaveUpper(dw, lo01, lo23))),
-        df, sum + lanes);
-    hn::Store(hn::Add(hn::Load(df, sum + 2 * lanes),
-                      hn::BitCast(df, hn::InterleaveLower(dw, hi01, hi23))),
-              df, sum + 2 * lanes);
-    hn::Store(hn::Add(hn::Load(df, sum + 3 * lanes),
-                      hn::BitCast(df, hn::InterleaveUpper(dw, hi01, hi23))),
-              df, sum + 3 * lanes);
+    for (size_t k = 0; k < kPack; ++k) base[k] = nib + static_cast<size_t>(group[tile + k]) * NP * width;
+    hn::VFromD<PackB> sel[3];
+    if constexpr (V > 4) {
+      for (uint32_t b = 4; b < V; ++b) sel[b - 4] = hn::VecFromMask(db, hn::TestBit(idx, hn::Set(db, static_cast<uint8_t>(1u << b))));
+      idx = hn::And(idx, low);
+    }
+    for (uint32_t k = 0; k < NP; ++k) {
+      hn::VFromD<PackB> t[subs];
+      for (size_t sub = 0; sub < subs; ++sub) t[sub] = hn::TableLookupBytes(pack_tables(base, k * width + sub * 16), idx);
+      if constexpr (V > 4)
+        for (uint32_t level = 0; level < V - 4; ++level)
+          for (size_t i = 0; i < (subs >> (level + 1)); ++i) t[i] = hn::IfThenElse(hn::MaskFromVec(sel[level]), t[2 * i + 1], t[2 * i]);
+      uint8_t* sum = bsum + k * kCells + cell0;
+      hn::StoreU(hn::Add(hn::LoadU(db, sum), t[0]), db, sum);
+    }
   }
 }
 
-// Early exit (optional): after `trees` trees, a pack of tiles whose every running sum is below
-// `theta` is dropped; its cells keep the partial sum.  A pack that survives to the end has run
-// every tree in order, so its scores are bit-identical to the full evaluation.
-struct Stage {
-  uint32_t trees;
-  float theta;  // on the raw (pre-sigmoid) sum
+template <uint32_t NP>
+void run_tree(const TiledTree& tr, const uint16_t* active, size_t n_active, uint8_t* bsum) {
+  switch (tr.v) {
+    case 1: tree_codes_over_packs<1, NP>(tr, active, n_active, bsum); break;
+    case 2: tree_codes_over_packs<2, NP>(tr, active, n_active, bsum); break;
+    case 3: tree_codes_over_packs<3, NP>(tr, active, n_active, bsum); break;
+    case 4: tree_codes_over_packs<4, NP>(tr, active, n_active, bsum); break;
+    case 5: tree_codes_over_packs<5, NP>(tr, active, n_active, bsum); break;
+    case 6: tree_codes_over_packs<6, NP>(tr, active, n_active, bsum); break;
+    default: tree_codes_over_packs<7, NP>(tr, active, n_active, bsum); break;
+  }
+}
+
+// Lazy binning: one side-64 feature for the packs still alive, straight from the native
+// fixture (4 rows x 4*kPack floats per pack), written in the pack's tile-major order.
+void bin_side64_packs(const float* xf, const float* cuts, uint32_t k, const uint16_t* active, size_t n_active, uint8_t* plane) {
+  const size_t cols = kTile * kPack;
+  alignas(64) float vals[kTile * kTile * kPack];
+  alignas(64) uint8_t bins[kTile * kTile * kPack];
+  for (size_t i = 0; i < n_active; ++i) {
+    const size_t tile = active[i], tr = tile / kTileGrid, tc = tile % kTileGrid;
+    for (size_t r = 0; r < kTile; ++r) std::memcpy(vals + cols * r, xf + (kTile * tr + r) * kGrid + kTile * tc, cols * sizeof(float));
+    bin_run(vals, static_cast<uint32_t>(kTile * cols), cuts, k, bins);
+    uint8_t* dst = plane + tile * kTileCells;
+    for (size_t p = 0; p < kPack; ++p)
+      for (size_t r = 0; r < kTile; ++r)
+        for (size_t c = 0; c < kTile; ++c) dst[p * kTileCells + r * kTile + c] = bins[cols * r + kTile * p + c];
+  }
+}
+
+void bin_side64_lazy(const ImysModel& m, const TiledModel& tm, const float* xn, const std::vector<size_t>& offset,
+                     const uint16_t* active, size_t n_active, uint8_t* fine) {
+  for (uint32_t f = 0; f < m.n_features; ++f) {
+    if (tm.fine_slot[f] < 0 || native_side(m, f) != kGrid) continue;
+    bin_side64_packs(xn + offset[f], m.borders.data() + m.border_offset[f], m.n_borders[f], active, n_active,
+                     fine + static_cast<size_t>(tm.fine_slot[f]) * kCells);
+  }
+}
+
+// Everything but the side-64 features (streaming): coarse planes, side-32 fine planes.
+void bin_except_side64(const ImysModel& m, const TiledModel& tm, const float* xn, const std::vector<size_t>& offset, uint8_t* fine, uint8_t* coarse) {
+  bin_tiles(m, tm, xn, offset, fine, coarse, /*skip_side64=*/true);
+}
+
+// The scorer: chunk by chunk (the quantisation chunks are the passes), coarse trees once per
+// tile, fine trees on the packs still alive, integer totals, early exit at the blob's stages.
+// With `lazy` the side-64 features are binned only for the packs alive after the coarse tier.
+struct ScoreOptions {
+  const std::vector<Stage>* stages = nullptr;  // nullptr: no early exit
+  bool lazy = false;                           // bin side-64 features after the coarse tier
+  size_t* packs_finished = nullptr;
 };
 
-void score_cells_simd(const ImysModel& m, const TiledModel& tm, const uint8_t* fine,
-                      const uint8_t* coarse, float* out, const std::vector<Stage>* stages = nullptr,
-                      size_t* packs_finished = nullptr) {
+template <uint32_t NP>
+void score_cells_simd(const ImysModel& m, const TiledModel& tm, const float* xn, const std::vector<size_t>& offset,
+                      uint8_t* fine, uint8_t* coarse, float* out, const ScoreOptions& opt) {
   const hn::ScalableTag<uint8_t> d8;
-  const PackB db;
-  const PackF df;
-  const hn::RebindToUnsigned<PackF> du;
-  const hn::RebindToSigned<PackF> di;
-  const hn::FixedTag<float, 4> d4;
-  const hn::FixedTag<uint32_t, 4> du4;
-  const hn::FixedTag<uint8_t, 16> d16;
-  const hn::FixedTag<uint8_t, 4> dq;
+  const hn::ScalableTag<int64_t> d64;
+  const hn::Rebind<int32_t, decltype(d64)> d32;
+  const hn::Rebind<uint8_t, decltype(d64)> dq;
+  const size_t l64 = hn::Lanes(d64);
   const uint32_t depth = m.depth;
-  const size_t lanes = hn::Lanes(df);
-  auto raw = hwy::AllocateAligned<float>(kCells);
-  auto group = hwy::AllocateAligned<uint8_t>(kTiles);
-  std::fill(raw.get(), raw.get() + kCells, 0.0f);
-  std::vector<uint16_t> active(kTiles / kPack);  // first tile of every pack still being scored
+  const bool lazy = opt.lazy && m.coarse_trees > 0;
+  if (lazy) bin_except_side64(m, tm, xn, offset, fine, coarse);
+  else bin_tiles(m, tm, xn, offset, fine, coarse);
+  auto total = hwy::AllocateAligned<int64_t>(kCells);  // tile-major: tile * 16 + cell
+  auto bsum = hwy::AllocateAligned<uint8_t>(NP * kCells);
+  auto group = hwy::AllocateAligned<uint8_t>(kTiles + 64);
+  std::vector<int32_t> flat(kTiles);
+  std::fill(total.get(), total.get() + kCells, int64_t{0});
+  std::vector<uint16_t> active(kTiles / kPack);
   for (size_t a = 0; a < active.size(); ++a) active[a] = static_cast<uint16_t>(a * kPack);
   size_t next_stage = 0;
-  for (uint32_t t = 0; t < m.n_trees; ++t) {
-    const size_t s0 = static_cast<size_t>(t) * depth;
-    TiledTree tr;
-    tr.v = tm.nvary[t];
-    tr.table = tm.table.get() + s0 * 16;
-    for (uint32_t j = 0; j < tr.v; ++j)
-      tr.fine[j] = fine + static_cast<size_t>(tm.plane[s0 + j]) * kCells;
-    tr.leaf = tm.leaf_f32.data() + m.tree_offsets[t];
-    tr.leaf_bytes = tm.leaf_bytes.get() + static_cast<size_t>(m.tree_offsets[t]) * 4;
-    // Which leaf group each tile reaches, from the tile-constant splits.
-    uint8_t* g = group.get();
-    tr.group = g;
-    std::memset(g, 0, kTiles);
-    for (uint32_t j = tr.v; j < depth; ++j) {
-      const auto table = hn::LoadDup128(d8, tm.table.get() + (s0 + j) * 16);
-      const uint8_t* bins = coarse + static_cast<size_t>(tm.plane[s0 + j]) * kTiles;
-      for (size_t c = 0; c < kTiles; c += hn::Lanes(d8))
-        hn::Store(hn::Or(hn::Load(d8, g + c), hn::TableLookupBytes(table, hn::LoadU(d8, bins + c))),
-                  d8, g + c);
+  double offsets_done = 0.0;
+  bool side64_binned = !lazy;
+  for (uint32_t c = 0; c < m.n_chunks; ++c) {
+    const uint32_t t0 = m.chunk_start(c), t1 = m.chunk_end(c);
+    if (!side64_binned && t0 >= m.coarse_trees) {  // the fine tier starts: bin what it needs where it runs
+      bin_side64_lazy(m, tm, xn, offset, active.data(), active.size(), fine);
+      side64_binned = true;
     }
-    switch (tr.v) {
-      case 1:
-        tree_over_packs<1>(tr, active.data(), active.size(), raw.get());
-        break;
-      case 2:
-        tree_over_packs<2>(tr, active.data(), active.size(), raw.get());
-        break;
-      case 3:
-        tree_over_packs<3>(tr, active.data(), active.size(), raw.get());
-        break;
-      case 4:
-        tree_over_packs<4>(tr, active.data(), active.size(), raw.get());
-        break;
-      default:  // the rarer shapes, a pack at a time
-        for (const size_t tile : active) {
-          const size_t cell0 = tile * kTileCells;
-          float* sum = raw.get() + cell0;
-          hn::VFromD<PackF> acc[4] = {hn::Load(df, sum), hn::Load(df, sum + lanes),
-                                      hn::Load(df, sum + 2 * lanes), hn::Load(df, sum + 3 * lanes)};
-          const uint8_t* gp = tr.group + tile;
-          if (tr.v == 0) {  // each tile lands in one leaf
-#if HWY_MAX_BYTES >= 32 && !HWY_HAVE_SCALABLE
-            const auto leaf =
-                hn::Combine(df, hn::Set(d4, tr.leaf[gp[1]]), hn::Set(d4, tr.leaf[gp[0]]));
-#else
-            const auto leaf = hn::Set(d4, tr.leaf[gp[0]]);
-#endif
-            for (auto& x : acc) x = hn::Add(x, leaf);
-          } else if (tr.v == kBlendBits) {
-            pack_leaves5(tr, cell0, gp, acc);
-          } else {  // too many varying splits for a byte shuffle: full index, then gather
-#if HWY_MAX_BYTES >= 32 && !HWY_HAVE_SCALABLE
-            auto idx = hn::Combine(db, hn::Set(d16, static_cast<uint8_t>(gp[1] << tr.v)),
-                                   hn::Set(d16, static_cast<uint8_t>(gp[0] << tr.v)));
-#else
-            auto idx = hn::Set(d16, static_cast<uint8_t>(gp[0] << tr.v));
-#endif
-            for (uint32_t j = 0; j < tr.v; ++j)
-              idx = hn::Or(idx, hn::TableLookupBytes(hn::LoadDup128(db, tr.table + j * 16),
-                                                     hn::LoadU(db, tr.fine[j] + cell0)));
-            uint8_t bytes[kTileCells * kPack];
-            hn::StoreU(idx, db, bytes);
-            for (size_t k = 0; k < 4;
-                 ++k) {  // cells 4k..4k+3 of each tile, as the sums are laid out
-#if HWY_MAX_BYTES >= 32 && !HWY_HAVE_SCALABLE
-              const auto at =
-                  hn::Combine(du, hn::PromoteTo(du4, hn::LoadU(dq, bytes + kTileCells + 4 * k)),
-                              hn::PromoteTo(du4, hn::LoadU(dq, bytes + 4 * k)));
-#else
-              const auto at = hn::PromoteTo(du4, hn::LoadU(dq, bytes + 4 * k));
-#endif
-              acc[k] = hn::Add(acc[k], hn::GatherIndex(df, tr.leaf, hn::BitCast(di, at)));
-            }
-          }
-          for (size_t k = 0; k < 4; ++k) hn::Store(acc[k], df, sum + k * lanes);
-        }
+    std::memset(bsum.get(), 0, NP * kCells);
+    std::fill(flat.begin(), flat.end(), 0);
+    for (uint32_t t = t0; t < t1; ++t) {
+      const size_t s0 = static_cast<size_t>(t) * depth;
+      TiledTree tr;
+      tr.v = tm.nvary[t];
+      tr.table = tm.table.get() + s0 * 16;
+      for (uint32_t j = 0; j < tr.v; ++j) tr.fine[j] = fine + static_cast<size_t>(tm.plane[s0 + j]) * kCells;
+      tr.nib = tm.nib.get() + static_cast<size_t>(m.tree_offsets[t]) * NP;
+      uint8_t* g = group.get();
+      tr.group = g;
+      if (tr.v == depth) for (size_t i = 0; i < kTiles; i += hn::Lanes(d8)) hn::Store(hn::Zero(d8), d8, g + i);
+      for (uint32_t j = tr.v; j < depth; ++j) {  // tile-constant splits: the leaf group per tile
+        const auto table = hn::LoadDup128(d8, tm.table.get() + (s0 + j) * 16);
+        const uint8_t* bins = coarse + static_cast<size_t>(tm.plane[s0 + j]) * kTiles;
+        if (j == tr.v) for (size_t i = 0; i < kTiles; i += hn::Lanes(d8)) hn::Store(hn::TableLookupBytes(table, hn::LoadU(d8, bins + i)), d8, g + i);
+        else for (size_t i = 0; i < kTiles; i += hn::Lanes(d8)) hn::Store(hn::Or(hn::Load(d8, g + i), hn::TableLookupBytes(table, hn::LoadU(d8, bins + i))), d8, g + i);
+      }
+      if (tr.v == 0) {  // tile-constant tree: one gathered code per tile
+        const int32_t* code = tm.code32.data() + m.tree_offsets[t];
+        for (size_t i = 0; i < kTiles; i += hn::Lanes(d32))
+          hn::StoreU(hn::Add(hn::LoadU(d32, flat.data() + i), hn::GatherIndex(d32, code, hn::PromoteTo(d32, hn::LoadU(dq, g + i)))), d32, flat.data() + i);
+      } else {
+        run_tree<NP>(tr, active.data(), active.size(), bsum.get());
+      }
+      offsets_done += m.offsets[t];
     }
-    if (stages && next_stage < stages->size() && (*stages)[next_stage].trees == t + 1) {
-      const auto theta = hn::Set(df, (*stages)[next_stage++].theta);
+    // widen this chunk's byte sums and tile totals into the running totals of the active packs
+    const int shift = m.shifts[c];
+    for (const uint16_t first : active) {
+      for (size_t i = 0; i < kPack * kTileCells; i += l64) {
+        const size_t cell = first * kTileCells + i;
+        auto v = hn::PromoteTo(d64, hn::PromoteTo(d32, hn::LoadU(dq, bsum.get() + cell)));
+        if constexpr (NP == 2) v = hn::Add(v, hn::ShiftLeft<4>(hn::PromoteTo(d64, hn::PromoteTo(d32, hn::LoadU(dq, bsum.get() + kCells + cell)))));
+        v = hn::Add(v, hn::Set(d64, static_cast<int64_t>(flat[cell / kTileCells])));
+        hn::StoreU(hn::Add(hn::LoadU(d64, total.get() + cell), hn::ShiftLeftSame(v, shift)), d64, total.get() + cell);
+      }
+    }
+    if (opt.stages && next_stage < opt.stages->size() && (*opt.stages)[next_stage].trees == t1) {
+      const double theta = (*opt.stages)[next_stage++].theta;
+      // integer threshold: total * 2^e_min + offsets_done >= theta  <=>  total >= ceil((theta - offsets_done) / 2^e_min)
+      const double lim = std::ceil(std::ldexp(theta - offsets_done, -m.e_min));
+      const int64_t theta_int = lim <= -9.0e18 ? INT64_MIN : lim >= 9.0e18 ? INT64_MAX : static_cast<int64_t>(lim);
+      const auto th = hn::Set(d64, theta_int);
       size_t kept = 0;
-      for (const uint16_t tile : active) {
-        const float* sum = raw.get() + static_cast<size_t>(tile) * kTileCells;
-        const auto top =
-            hn::Max(hn::Max(hn::Load(df, sum), hn::Load(df, sum + lanes)),
-                    hn::Max(hn::Load(df, sum + 2 * lanes), hn::Load(df, sum + 3 * lanes)));
-        if (!hn::AllTrue(df, hn::Lt(top, theta))) active[kept++] = tile;
+      for (const uint16_t first : active) {
+        auto top = hn::Set(d64, INT64_MIN);
+        for (size_t i = 0; i < kPack * kTileCells; i += l64) top = hn::Max(top, hn::LoadU(d64, total.get() + first * kTileCells + i));
+        if (!hn::AllTrue(d64, hn::Lt(top, th))) active[kept++] = first;
       }
       active.resize(kept);
     }
   }
-  if (packs_finished) *packs_finished = active.size();
-  std::vector<float> ordered(kCells);  // pack order back to row-major
+  if (opt.packs_finished) *opt.packs_finished = active.size();
+  std::vector<float> raw(kCells);
   for (size_t r = 0; r < kGrid; ++r)
     for (size_t c = 0; c < kGrid; ++c)
-      ordered[r * kGrid + c] =
-          raw[pack_slot((r / kTile) * kTileGrid + c / kTile, (r % kTile) * kTile + c % kTile)];
-  sigmoid(ordered, out, kCells);
+      raw[r * kGrid + c] = raw_of(m, total[((r / kTile) * kTileGrid + c / kTile) * kTileCells + (r % kTile) * kTile + c % kTile]);
+  sigmoid(raw, out, kCells);
 }
 
-float max_abs_diff(const std::vector<float>& a, const std::vector<float>& b) {
-  float d = 0.0f;
-  for (size_t i = 0; i < a.size(); ++i) d = std::max(d, std::fabs(a[i] - b[i]));
-  return d;
+void score_cells(const ImysModel& m, const TiledModel& tm, const float* xn, const std::vector<size_t>& offset,
+                 uint8_t* fine, uint8_t* coarse, float* out, const ScoreOptions& opt) {
+  if (m.leaf_bits == 4) score_cells_simd<1>(m, tm, xn, offset, fine, coarse, out, opt);
+  else score_cells_simd<2>(m, tm, xn, offset, fine, coarse, out, opt);
 }
 
-template <typename Fn>
+// ---------------------------------------------------------------------------------------------
+// Harness: gates against the scalar reference and the Python fixture, then timings.
+
+template <class Fn>
 double time_it(Fn fn, int iters) {
-  for (int r = 0; r < 5; ++r) fn();
-  std::vector<double> t;
-  t.reserve(iters);
-  for (int r = 0; r < iters; ++r) {
-    const Clock::time_point t0 = Clock::now();
+  std::vector<double> ms;
+  for (int i = 0; i < iters; ++i) {
+    const auto t0 = std::chrono::steady_clock::now();
     fn();
-    t.push_back(ms_since(t0));
+    ms.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
   }
-  return median(t);
+  std::sort(ms.begin(), ms.end());
+  return ms[ms.size() / 2];
+}
+
+std::vector<Stage> parse_stages(const char* text, bool* ok) {
+  std::vector<Stage> stages;
+  *ok = true;
+  for (const char* q = text; *q;) {
+    char* end = nullptr;
+    const uint32_t trees = static_cast<uint32_t>(std::strtoul(q, &end, 10));
+    if (*end != ':') { *ok = false; break; }
+    const float theta = std::strtof(end + 1, &end);
+    stages.push_back({trees, theta});
+    q = *end == ',' ? end + 1 : end;
+  }
+  return stages;
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
   if (argc < 3) {
-    std::fprintf(
-        stderr,
-        "usage: fastdet_score model.fdt fixture.f32 [expected.f32] [iters=50] [trees:theta,...]\n");
+    std::fprintf(stderr, "usage: %s model.fdt fixture.f32 [expected.f32] [iters] [stages trees:theta,...]\n", argv[0]);
     return 2;
   }
-  const int iters = (argc >= 5) ? std::atoi(argv[4]) : 50;
-
-  const std::string model_raw = read_all(argv[1]);
+  const std::string container = read_all(argv[1]);
+  if (container.empty()) { std::fprintf(stderr, "cannot read %s\n", argv[1]); return 1; }
   const uint8_t* blob = nullptr;
   size_t blob_size = 0;
-  if (!locate_blob(model_raw, &blob, &blob_size)) {
-    std::fprintf(stderr, "not an FDT1/IMSY model: %s\n", argv[1]);
+  if (!find_blob(container, &blob, &blob_size)) { std::fprintf(stderr, "no IMSY blob in %s\n", argv[1]); return 1; }
+  ImysModel model;
+  if (!load_imys(blob, blob_size, &model)) { std::fprintf(stderr, "bad IMSY blob\n"); return 1; }
+  const int iters = argc >= 5 ? std::max(1, std::atoi(argv[4])) : 20;
+  std::vector<Stage> stages = model.stages;
+  if (argc >= 6) {
+    bool ok = false;
+    stages = parse_stages(argv[5], &ok);
+    if (!ok) { std::fprintf(stderr, "bad stage list: want trees:theta,trees:theta,...\n"); return 9; }
+  }
+  const TiledModel tiled = build_tiled(model);
+  const std::vector<size_t> offset = native_offsets(model);
+  const std::string fixture = read_all(argv[2]);
+  const size_t native_values = offset.back();
+  if (fixture.size() != native_values * sizeof(float)) {
+    std::fprintf(stderr, "fixture has %zu floats, model wants %zu native values\n", fixture.size() / sizeof(float), native_values);
     return 3;
   }
-  ImysModel model;
-  if (!load_imys(blob, blob_size, &model)) {
-    std::fprintf(stderr, "malformed IMSY blob\n");
-    return 4;
+  std::vector<float> xn(native_values);
+  std::memcpy(xn.data(), fixture.data(), fixture.size());
+  std::printf("simd target: %s, %zu tiles per index vector, %u-bit leaf codes\n", hwy::TargetName(HWY_TARGET), kPack, model.leaf_bits);
+  std::printf("model: %u trees x depth %u (%u tile-constant, then fine), %u features, %u borders, %zu exit stages\n",
+              model.n_trees, model.depth, model.coarse_trees, model.n_features, static_cast<uint32_t>(model.borders.size()), stages.size());
+  {
+    uint32_t hist[8] = {};
+    for (uint32_t t = 0; t < model.n_trees; ++t) hist[tiled.nvary[t]]++;
+    std::printf("used features: %u vary inside a 4x4 tile, %u are constant on it; trees by varying splits:", tiled.n_fine, tiled.n_coarse);
+    for (uint32_t v = 0; v < 8; ++v) std::printf(" %u:%u", v, hist[v]);
+    std::printf("\n");
   }
-  if (model.depth > 8 || model.depth == 0) {
-    std::fprintf(stderr, "depth %u unsupported: a leaf index must fit a byte lane\n", model.depth);
-    return 5;
-  }
-
-  const std::string fixture_raw = read_all(argv[2]);
-  const size_t n_features = model.n_features;
-  const std::vector<size_t> offset = native_offsets(model);
-  if (fixture_raw.size() != 4 * offset[n_features]) {
-    std::fprintf(stderr, "fixture size mismatch: %zu bytes, expected %zu (native layout)\n",
-                 fixture_raw.size(), 4 * offset[n_features]);
-    return 6;
-  }
-  std::vector<float> xn(offset[n_features]);
-  std::memcpy(xn.data(), fixture_raw.data(), xn.size() * 4);
-  const std::vector<float> X = expand_native(model, xn.data(), offset);
-
-  // Reference: every feature binned at every cell.  Shipped: used features, at tile layout.
-  std::vector<uint8_t> full_bins(n_features * kCells);
-  bin_full(model, X.data(), kCells, full_bins.data());
-  const TiledModel tiled = build_tiled(model);
-  auto fine = hwy::AllocateAligned<uint8_t>(static_cast<size_t>(tiled.n_fine) * kCells + 64);
-  auto coarse = hwy::AllocateAligned<uint8_t>(static_cast<size_t>(tiled.n_coarse) * kTiles + 64);
-  bin_tiles(model, tiled, xn.data(), offset, fine.get(), coarse.get());
-
-  // Gate: the tile planes must hold the reference bins, cell for cell.
-  size_t bin_mismatch = 0;
-  for (uint32_t f = 0; f < n_features; ++f)
-    for (size_t r = 0; r < kGrid; ++r)
-      for (size_t c = 0; c < kGrid; ++c) {
-        const uint8_t expect = full_bins[(size_t)f * kCells + r * kGrid + c];
-        const size_t tile = (r / kTile) * kTileGrid + c / kTile;
-        if (tiled.fine_slot[f] >= 0)
-          bin_mismatch += fine[(size_t)tiled.fine_slot[f] * kCells + tile * kTileCells +
-                               (r % kTile) * kTile + c % kTile] != expect;
-        if (tiled.coarse_slot[f] >= 0)
-          bin_mismatch += coarse[(size_t)tiled.coarse_slot[f] * kTiles + tile] != expect;
-      }
-
+  // -- reference: dense bins per cell, scalar traversal -------------------------------------
+  const std::vector<float> dense = expand_native(model, xn.data(), offset);
+  std::vector<uint8_t> full_bins(kCells * model.n_features);
+  bin_full(model, dense.data(), kCells, full_bins.data());
   std::vector<float> scalar_out(kCells), simd_out(kCells);
   score_cells_scalar(model, full_bins.data(), kCells, scalar_out.data());
-  score_cells_simd(model, tiled, fine.get(), coarse.get(), simd_out.data());
-
-  std::printf("simd target: %s, %zu tiles per vector\n", hwy::TargetName(HWY_TARGET), kPack);
-  std::printf("model: %u trees x depth %u, %u leaves, %u features, %u borders\n",
-              model.n_trees, model.depth, model.n_leafs_total, model.n_features,
-              model.border_offset[model.n_features]);
-  uint32_t by_v[9] = {0};
-  for (uint32_t t = 0; t < model.n_trees; ++t) by_v[std::min<uint32_t>(tiled.nvary[t], 8)]++;
-  std::printf(
-      "used features: %u vary inside a 4x4 tile, %u are constant on it; trees by varying splits:",
-      tiled.n_fine, tiled.n_coarse);
-  for (uint32_t v = 0; v <= model.depth; ++v) std::printf(" %u:%u", v, by_v[v]);
-  std::printf("\ntile binner == reference binner: %zu mismatches %s\n", bin_mismatch,
-              bin_mismatch == 0 ? "PASS" : "FAIL");
-  const float dv = max_abs_diff(scalar_out, simd_out);
-  std::printf("simd vs scalar max|dprob| = %.3e  %s\n", dv,
-              dv == 0.0f ? "BIT-IDENTICAL" : "DIVERGED");
-
-  float ds = 0.0f, da = 0.0f;
-  if (argc >= 4) {
-    const std::string expected_raw = read_all(argv[3]);
-    if (expected_raw.size() != 4 * kCells) {
-      std::fprintf(stderr, "expected size mismatch: %zu bytes\n", expected_raw.size());
-      return 7;
-    }
-    std::vector<float> expected(kCells);
-    std::memcpy(expected.data(), expected_raw.data(), expected.size() * 4);
-    ds = max_abs_diff(scalar_out, expected);
-    da = max_abs_diff(simd_out, expected);
-    std::printf("scalar max|got-expected| = %.3e\n", ds);
-    std::printf("simd   max|got-expected| = %.3e\n", da);
-  }
-
-  if (bin_mismatch != 0 || dv != 0.0f || ds > 1e-4f || da > 1e-4f) {
-    std::fprintf(stderr, "GATE FAILED\n");
-    return 8;
-  }
-
-  std::vector<Stage> stages;
-  if (argc >= 6) {  // "trees:theta,trees:theta,..."
-    for (const char* q = argv[5]; *q;) {
-      char* end = nullptr;
-      const uint32_t trees = static_cast<uint32_t>(std::strtoul(q, &end, 10));
-      if (*end != ':') {
-        std::fprintf(stderr, "bad stage list: want trees:theta,trees:theta,...\n");
-        return 9;
+  auto fine = hwy::AllocateAligned<uint8_t>(static_cast<size_t>(tiled.n_fine) * kCells + 64);
+  auto coarse = hwy::AllocateAligned<uint8_t>(static_cast<size_t>(tiled.n_coarse) * kTiles + 64);
+  ScoreOptions plain;
+  score_cells(model, tiled, xn.data(), offset, fine.get(), coarse.get(), simd_out.data(), plain);
+  // binner gate: every plane against the dense bins
+  size_t bin_mismatch = 0;
+  for (uint32_t f = 0; f < model.n_features; ++f) {
+    if (tiled.fine_slot[f] < 0 && tiled.coarse_slot[f] < 0) continue;
+    for (size_t r = 0; r < kGrid; ++r)
+      for (size_t c = 0; c < kGrid; ++c) {
+        const uint8_t expect = full_bins[static_cast<size_t>(f) * kCells + r * kGrid + c];
+        const size_t tile = (r / kTile) * kTileGrid + c / kTile;
+        if (tiled.fine_slot[f] >= 0)
+          bin_mismatch += fine[static_cast<size_t>(tiled.fine_slot[f]) * kCells + tile * kTileCells + (r % kTile) * kTile + c % kTile] != expect;
+        if (tiled.coarse_slot[f] >= 0) bin_mismatch += coarse[static_cast<size_t>(tiled.coarse_slot[f]) * kTiles + tile] != expect;
       }
-      const float theta = std::strtof(end + 1, &end);
-      stages.push_back({trees, theta});
-      q = *end == ',' ? end + 1 : end;
-    }
   }
-
-  const double probes = (double)model.n_trees * model.depth;
-  const double ms_bin =
-      time_it([&] { bin_tiles(model, tiled, xn.data(), offset, fine.get(), coarse.get()); }, iters);
-  const double ms_scalar = time_it([&] { score_cells_scalar(model, full_bins.data(), kCells, scalar_out.data()); }, iters);
-  const double ms_simd = time_it(
-      [&] { score_cells_simd(model, tiled, fine.get(), coarse.get(), simd_out.data()); }, iters);
-  std::printf("tile binner      : %8.3f ms (p50, %d iters)\n", ms_bin, iters);
-  std::printf("scalar traversal : %8.3f ms (%.3f ns/probe)\n", ms_scalar,
-              ms_scalar * 1e6 / (probes * kCells));
-  std::printf("simd traversal   : %8.3f ms (%.3f ns/probe)\n", ms_simd,
-              ms_simd * 1e6 / (probes * kCells));
-  std::printf("model total      : %8.3f ms (binner + simd traversal)\n", ms_bin + ms_simd);
+  std::printf("tile binner == reference binner: %zu mismatches %s\n", bin_mismatch, bin_mismatch ? "FAIL" : "PASS");
+  float dv = 0.0f;
+  for (size_t i = 0; i < kCells; ++i) dv = std::max(dv, std::fabs(simd_out[i] - scalar_out[i]));
+  std::printf("simd vs scalar max|dprob| = %.3e  %s\n", dv, dv == 0.0f ? "BIT-IDENTICAL" : "DIVERGED");
+  float ds = 0.0f, da = 0.0f;
+  if (argc >= 4 && std::strcmp(argv[3], "-") != 0) {
+    const std::string expected = read_all(argv[3]);
+    if (expected.size() != kCells * sizeof(float)) { std::fprintf(stderr, "expected.f32 must hold %zu floats\n", kCells); return 4; }
+    std::vector<float> want(kCells);
+    std::memcpy(want.data(), expected.data(), expected.size());
+    for (size_t i = 0; i < kCells; ++i) { ds = std::max(ds, std::fabs(scalar_out[i] - want[i])); da = std::max(da, std::fabs(simd_out[i] - want[i])); }
+    std::printf("scalar max|got-expected| = %.3e\nsimd   max|got-expected| = %.3e\n", ds, da);
+  }
+  if (bin_mismatch != 0 || dv != 0.0f || ds > 1e-4f || da > 1e-4f) { std::printf("GATE FAILED\n"); return 5; }
+  // -- early exit, as the model ships (or the override): the same scorer, stages applied ------------
   if (!stages.empty()) {
-    std::vector<float> early_out(kCells);
+    ScoreOptions exit_opt;
+    exit_opt.stages = &stages;
+    exit_opt.lazy = true;
     size_t finished = 0;
-    score_cells_simd(model, tiled, fine.get(), coarse.get(), early_out.data(), &stages, &finished);
+    exit_opt.packs_finished = &finished;
+    std::vector<float> exit_out(kCells);
+    score_cells(model, tiled, xn.data(), offset, fine.get(), coarse.get(), exit_out.data(), exit_opt);
     size_t same = 0;
-    float top_dropped = 0.0f;  // the highest TRUE probability among cells whose score was cut short
+    float top_cut = 0.0f;
     for (size_t i = 0; i < kCells; ++i) {
-      if (early_out[i] == simd_out[i])
-        ++same;
-      else
-        top_dropped = std::max(top_dropped, simd_out[i]);
+      if (exit_out[i] == scalar_out[i]) ++same;
+      else top_cut = std::max(top_cut, scalar_out[i]);
     }
-    const double ms_early = time_it(
-        [&] {
-          score_cells_simd(model, tiled, fine.get(), coarse.get(), early_out.data(), &stages,
-                           &finished);
-        },
-        iters);
-    std::printf(
-        "early exit       : %8.3f ms traversal, %8.3f ms with binning; %zu of %zu packs ran every "
-        "tree;\n"
-        "                   %zu of %zu cells bit-identical to the full scores; highest full "
-        "probability among "
-        "the rest: %.4f\n",
-        ms_early, ms_bin + ms_early, finished, kTiles / kPack, same, kCells, top_dropped);
+    std::printf("early exit: %zu of %zu packs ran every tree; %zu of %zu cells bit-identical to the full scores; highest full probability among the rest %.4f\n",
+                finished, kTiles / kPack, same, kCells, top_cut);
+  }
+  // -- timings --------------------------------------------------------------------------------
+  const double probes = static_cast<double>(model.n_trees) * model.depth;
+  const double ms_bin = time_it([&] { bin_tiles(model, tiled, xn.data(), offset, fine.get(), coarse.get()); }, iters);
+  const double ms_scalar = time_it([&] { score_cells_scalar(model, full_bins.data(), kCells, scalar_out.data()); }, iters);
+  const double ms_full = time_it([&] { score_cells(model, tiled, xn.data(), offset, fine.get(), coarse.get(), simd_out.data(), plain); }, iters);
+  std::printf("tile binner      : %8.3f ms (p50, %d iters)\n", ms_bin, iters);
+  std::printf("scalar traversal : %8.3f ms (%.3f ns/probe)\n", ms_scalar, 1e6 * ms_scalar / (probes * kCells));
+  std::printf("simd traversal   : %8.3f ms (binning + every tree on every cell)\n", ms_full - ms_bin < 0 ? 0.0 : ms_full - ms_bin);
+  std::printf("model total      : %8.3f ms (binning + every tree on every cell)\n", ms_full);
+  if (!stages.empty()) {
+    ScoreOptions exit_opt;
+    exit_opt.stages = &stages;
+    exit_opt.lazy = true;
+    size_t finished = 0;
+    exit_opt.packs_finished = &finished;
+    std::vector<float> exit_out(kCells);
+    const double ms_exit = time_it([&] { score_cells(model, tiled, xn.data(), offset, fine.get(), coarse.get(), exit_out.data(), exit_opt); }, iters);
+    std::printf("model, as shipped: %8.3f ms (lazy binning, coarse tier per tile, early exit; %zu of %zu packs ran every tree)\n", ms_exit, finished, kTiles / kPack);
   }
   return 0;
 }

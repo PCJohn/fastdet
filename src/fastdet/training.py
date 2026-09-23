@@ -3,30 +3,36 @@
 from __future__ import annotations
 
 import json
+import math
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from catboost import CatBoostClassifier
+from numpy.typing import NDArray  # noqa: TC002 -- used in dataclass field annotations at runtime
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
-    from numpy.typing import NDArray
-
     from .config import ModelConfig
 
 __all__ = [
+    "LeafGrid",
     "build_ranking",
+    "calibrate_exit_stages",
     "default_feature_ranks_path",
     "fit_booster",
+    "leaf_grid",
     "load_ranking",
     "quantise_leaves",
     "select_columns",
+    "stage_tree_counts",
 ]
 
 _DATA_DIR = Path(__file__).resolve().parent / "data"
 _LEAF_TABLE_NDIM = 2  # leaves are (n_trees, n_leaves)
+_EMPTY_CHUNK_EXPONENT = -60  # a chunk whose trees are all constant: any step will do
 
 
 def default_feature_ranks_path() -> Path:
@@ -67,29 +73,112 @@ def select_columns(
     return columns
 
 
-def quantise_leaves(leaves: NDArray[np.floating], bits: int, chunk: int) -> NDArray[np.float64]:
-    """Put leaf values on a low-bit grid: ``offset[tree] + code * step[chunk]``.
+@dataclass
+class LeafGrid:
+    """The low-bit leaf grid: ``leaf = offset[tree] + code * 2**(e_min + shift[chunk])``.
 
-    ``leaves`` is ``(n_trees, n_leaves)``.  Each tree keeps its own offset (its
-    smallest leaf) and each chunk of ``chunk`` trees shares one step, because leaf
-    magnitudes shrink as boosting proceeds: one step for the whole model would
-    quantise the later, smaller trees into noise.  ``code`` spans ``[0, 2**bits)``.
+    Steps are powers of two, one per chunk of trees, so the scorer sums integer
+    codes shifted by the chunk's exponent -- exactly, in any order.  Chunks restart
+    at every stage boundary (``stage_starts``) so that a chunked, quantisation-aware
+    fit and the export land on the same grid.
+    """
 
-    Training (quantisation-aware fitting) and export call this, so the values a
-    quantised model is fitted against are exactly the values the blob stores.
+    bits: int
+    chunk: int
+    stage_starts: tuple[int, ...]
+    offsets: NDArray[np.float32]  # (n_trees,)
+    exponents: NDArray[np.int64]  # (n_chunks,) step = 2**exponent
+    codes: NDArray[np.uint8]  # (n_trees, n_leaves)
+
+    @property
+    def n_chunks(self) -> int:
+        """Number of quantisation chunks."""
+        return len(self.exponents)
+
+    @property
+    def e_min(self) -> int:
+        """Smallest chunk exponent; every chunk's step is ``2**(e_min + shift)``."""
+        return int(self.exponents.min())
+
+    @property
+    def shifts(self) -> NDArray[np.uint8]:
+        """Per-chunk exponent above ``e_min`` (what the blob stores)."""
+        return (self.exponents - self.e_min).astype(np.uint8)
+
+    def chunk_of_tree(self, n_trees: int) -> NDArray[np.int64]:
+        """Chunk index of every tree (chunks restart at each stage boundary)."""
+        out = np.zeros(n_trees, dtype=np.int64)
+        base = 0
+        starts = [*self.stage_starts, n_trees]
+        for stage in range(len(starts) - 1):
+            lo, hi = starts[stage], starts[stage + 1]
+            out[lo:hi] = base + (np.arange(hi - lo) // self.chunk)
+            base += -(-(hi - lo) // self.chunk)
+        return out
+
+    def values(self) -> NDArray[np.float64]:
+        """The leaf values on the grid, ``(n_trees, n_leaves)`` float64."""
+        n_trees = len(self.offsets)
+        step = np.ldexp(1.0, self.exponents[self.chunk_of_tree(n_trees)])[:, None]
+        return self.offsets[:, None].astype(np.float64) + self.codes.astype(np.float64) * step
+
+    @property
+    def offset_sum(self) -> float:
+        """Sum of the per-tree offsets."""
+        return float(np.sum(self.offsets.astype(np.float64)))
+
+
+def leaf_grid(
+    leaves: NDArray[np.floating], bits: int, chunk: int, stage_starts: tuple[int, ...] = (0,)
+) -> LeafGrid:
+    """Quantise ``(n_trees, n_leaves)`` leaves onto the grid :class:`LeafGrid` describes.
+
+    Each tree's offset is its smallest leaf; each chunk's step is the smallest power
+    of two that spans the widest tree of the chunk with ``2**bits - 1`` codes.  Leaf
+    magnitudes shrink as boosting proceeds, so one step for the whole model would
+    turn the later trees into noise; a step per chunk keeps them resolved.
     """
     values = np.asarray(leaves, dtype=np.float64)
     if values.ndim != _LEAF_TABLE_NDIM:
         msg = "leaves must be (n_trees, n_leaves)"
         raise ValueError(msg)
-    out = np.empty_like(values)
+    n_trees = len(values)
     levels = float((1 << bits) - 1)
-    for start in range(0, len(values), chunk):
-        block = values[start : start + chunk]
-        offset = block.min(axis=1, keepdims=True)
-        step = max(float((block.max(axis=1) - block.min(axis=1)).max()) / levels, 1e-12)
-        out[start : start + chunk] = offset + np.round((block - offset) / step) * step
-    return out
+    offsets = values.min(axis=1)
+    ranges = values.max(axis=1) - offsets
+    starts = [*stage_starts, n_trees]
+    exponents: list[int] = []
+    chunk_of: list[int] = []
+    for stage in range(len(starts) - 1):
+        for lo in range(starts[stage], starts[stage + 1], chunk):
+            hi = min(lo + chunk, starts[stage + 1])
+            widest = float(ranges[lo:hi].max())
+            exponent = (
+                math.ceil(math.log2(widest / levels)) if widest > 0.0 else _EMPTY_CHUNK_EXPONENT
+            )
+            chunk_of.extend([len(exponents)] * (hi - lo))
+            exponents.append(exponent)
+    exp_arr = np.asarray(exponents, dtype=np.int64)
+    steps = np.ldexp(1.0, exp_arr[np.asarray(chunk_of, dtype=np.int64)])
+    codes = np.rint((values - offsets[:, None]) / steps[:, None])
+    codes = np.clip(codes, 0, levels).astype(np.uint8)
+    return LeafGrid(
+        bits=bits,
+        chunk=chunk,
+        stage_starts=tuple(stage_starts),
+        offsets=offsets.astype(np.float32),
+        exponents=exp_arr,
+        codes=codes,
+    )
+
+
+def quantise_leaves(
+    leaves: NDArray[np.floating], bits: int, chunk: int, stage_starts: tuple[int, ...] = (0,)
+) -> NDArray[np.float64]:
+    """Leaf values on the low-bit grid (see :func:`leaf_grid`), same shape as ``leaves``."""
+    grid = leaf_grid(leaves, bits, chunk, stage_starts)
+    # the float32 offset is what the blob stores, so it is what training fits against
+    return grid.values()
 
 
 def _leaf_table(booster: CatBoostClassifier, n_trees: int) -> NDArray[np.float64]:
@@ -123,9 +212,12 @@ def _fit_stage(  # noqa: PLR0913 -- a private helper with one call site per stag
     """Fit ``n_trees`` on top of ``running``; return the models and the new score.
 
     With ``bits`` the stage is fitted in chunks of ``chunk`` trees and each chunk's
-    leaves are quantised before the next chunk starts, so later trees see -- and
-    correct -- the rounding of earlier ones.  Without it the stage is one fit.
-    ``ignored`` hides feature columns from this stage (resolution tiering).
+    leaves are put on the grid before the next chunk starts, so later trees see
+    -- and correct -- the rounding of earlier ones.  The grid is the one
+    :func:`leaf_grid` builds for this stage on export (chunks counted from the
+    stage's first tree), so the fitted model is the shipped model.  Without
+    ``bits`` the stage is one fit.  ``ignored`` hides feature columns from this
+    stage (resolution tiering).
     """
     from catboost import Pool  # noqa: PLC0415 -- optional heavy import
 
@@ -177,7 +269,8 @@ def fit_booster(
         "thread_count": -1,
     }
     bits = model_cfg.leaf_bits if model_cfg.quantisation_aware else None
-    if bits is None and not model_cfg.coarse_trees:
+    coarse_trees = model_cfg.coarse_trees if model_cfg.coarse_trees < model_cfg.n_trees else 0
+    if bits is None and not coarse_trees:
         booster = CatBoostClassifier(iterations=model_cfg.n_trees, **params)
         booster.fit(features, labels)
         return booster
@@ -186,7 +279,7 @@ def fit_booster(
 
     models: list[CatBoostClassifier] = []
     score = np.zeros(len(labels), dtype=np.float64)
-    if model_cfg.coarse_trees:
+    if coarse_trees:
         if feature_sides is None:
             msg = "coarse_trees needs feature_sides (the pyramid side of each column)"
             raise ValueError(msg)
@@ -198,7 +291,7 @@ def fit_booster(
             features,
             labels,
             params,
-            n_trees=model_cfg.coarse_trees,
+            n_trees=coarse_trees,
             chunk=model_cfg.leaf_chunk,
             bits=bits,
             running=score,
@@ -209,7 +302,7 @@ def fit_booster(
         features,
         labels,
         params,
-        n_trees=model_cfg.n_trees - model_cfg.coarse_trees,
+        n_trees=model_cfg.n_trees - coarse_trees,
         chunk=model_cfg.leaf_chunk,
         bits=bits,
         running=score,
@@ -237,3 +330,44 @@ def build_ranking(booster: CatBoostClassifier, feature_names: Sequence[str]) -> 
         "gains": [float(gains[int(i)]) for i in order],
         "width": len(feature_names),
     }
+
+
+def stage_tree_counts(model_cfg: ModelConfig) -> list[int]:
+    """Tree counts at which the scorer may stop tiles.
+
+    The coarse/fine boundary and ``exit_stage_fractions`` of the fine tier, each
+    rounded to a chunk boundary of the fine stage so a chunked scorer can stop there.
+    """
+    coarse, n_trees, chunk = model_cfg.coarse_trees, model_cfg.n_trees, model_cfg.leaf_chunk
+    counts: list[int] = []
+    for frac in model_cfg.exit_stage_fractions:
+        raw = coarse + frac * (n_trees - coarse)
+        # stay on a chunk boundary of the fine stage so a chunked scorer can stop there
+        trees = coarse + round((raw - coarse) / chunk) * chunk
+        if 0 < trees < n_trees and trees not in counts:
+            counts.append(trees)
+    return sorted(counts)
+
+
+def calibrate_exit_stages(
+    partials: NDArray[np.float64],
+    finals: NDArray[np.float64],
+    stages: Sequence[int],
+    *,
+    keep_prob: float,
+    margin: float,
+) -> list[tuple[int, float]]:
+    """Per-stage thresholds from the training cells.
+
+    ``partials`` is ``(n_stages, n_cells)`` raw scores after each stage's trees and
+    ``finals`` the ``(n_cells,)`` raw scores after every tree.  A stage's threshold is
+    the lowest partial score of any cell whose final probability reaches
+    ``keep_prob``, minus ``margin``: on the calibration cells no such cell can be
+    stopped, and the margin covers what unseen images move.
+    """
+    keep = finals >= float(np.log(keep_prob / (1.0 - keep_prob)))
+    out: list[tuple[int, float]] = []
+    for i, trees in enumerate(stages):
+        theta = float(partials[i][keep].min()) - margin if keep.any() else -1e30
+        out.append((int(trees), theta))
+    return out

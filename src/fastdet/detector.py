@@ -26,7 +26,13 @@ from .features import GRID, FeatureCache, FeatureExtractor, feature_level_bits
 from .images import read_image
 from .metrics import pooled_pr_auc, score_validation_per_image
 from .runtime import ImysModel, parse_blob
-from .training import fit_booster, load_ranking, select_columns
+from .training import (
+    calibrate_exit_stages,
+    fit_booster,
+    load_ranking,
+    select_columns,
+    stage_tree_counts,
+)
 
 if TYPE_CHECKING:
     from catboost import CatBoostClassifier
@@ -68,6 +74,7 @@ class Detector:
 
         self.booster: CatBoostClassifier | None = None  # when training in-process
         self.runtime: ImysModel | None = None  # scoring engine (fitted or loaded)
+        self.exit_stages: list[tuple[int, float]] = []  # calibrated at fit time, stored in the blob
         self.col_keep: Int64Array | None = None  # kept columns into the full design
         self.base_names: list[str] | None = None  # full (unpruned) column names
         self.feature_names: list[str] | None = None  # kept column names
@@ -92,6 +99,7 @@ class Detector:
         det.base_names = det.extractor.base_names
         det.col_keep = det._columns_for(det.feature_names)
         det.metrics = dict(artifact.metadata)
+        det.exit_stages = list(det.runtime.exit_stages)
         return det
 
     @property
@@ -172,13 +180,19 @@ class Detector:
         kept = self.col_keep if self.col_keep is not None else np.arange(len(self.base_names))
         sides = [feature_level_bits(self.base_names[int(i)])[0] for i in kept]
         self.booster = fit_booster(design, labels, cfg.model, feature_sides=sides)
+        self.exit_stages = []
         runtime = self._refresh_runtime()
-
+        if cfg.model.use_exit:
+            self.exit_stages = self._calibrate_exit(runtime, train_cache)
+            runtime = self._refresh_runtime()  # the blob now carries the stages
         if evaluate:
             val_cache = FeatureCache(val_pairs, cfg.train, "val")
-            # With quantised leaves the booster is no longer what ships, so score
-            # the exported runtime instead: the reported PR-AUC is the model's.
-            shipped = runtime.predict_proba if cfg.model.leaf_bits is not None else None
+
+            # The booster's float leaves are not what ships: score with the exported
+            # runtime, early exit included, so the reported PR-AUC is the model's.
+            def shipped(design: NDArray[np.floating[Any]]) -> NDArray[np.float64]:
+                return runtime.predict_proba(design, use_exit=cfg.model.use_exit)
+
             scores, targets, _grids = score_validation_per_image(
                 self.booster, val_cache, col_keep=self.col_keep, scorer=shipped
             )
@@ -187,6 +201,33 @@ class Detector:
             self.val_ids = [Path(pair[0]).name for pair in val_pairs]
             print(f"[fastdet] validation pooled PR-AUC = {pr_auc:.4f}")
         return self
+
+    def _calibrate_exit(self, runtime: ImysModel, cache: FeatureCache) -> list[tuple[int, float]]:
+        """Stage thresholds from the training images (see :func:`calibrate_exit_stages`)."""
+        cfg = self.config.model
+        stages = stage_tree_counts(cfg)
+        if not stages:
+            return []
+        full = np.arange(GRID * GRID)
+        partials, finals = [], []
+        for i in range(cache.n):
+            bins = runtime.bins(cache.gather(i, full, col_keep=self.col_keep))
+            partial = runtime.partial_scores(bins, [*stages, runtime.n_trees])
+            partials.append(partial[:-1])
+            finals.append(partial[-1])
+        calibrated = calibrate_exit_stages(
+            np.concatenate(partials, axis=1),
+            np.concatenate(finals),
+            stages,
+            keep_prob=cfg.exit_keep_prob,
+            margin=cfg.exit_margin,
+        )
+        print(
+            "[fastdet] early-exit stages: "
+            + ", ".join(f"{trees}:{theta:.2f}" for trees, theta in calibrated)
+            + f" (keep p>={cfg.exit_keep_prob}, margin {cfg.exit_margin})"
+        )
+        return calibrated
 
     def _refresh_runtime(self) -> ImysModel:
         """(Re)parse the in-memory export of the fitted booster and return it."""
@@ -214,12 +255,16 @@ class Detector:
             self.booster.save_model(str(json_path), format="json")
             with json_path.open(encoding="utf-8") as fh:
                 model_json = json.load(fh)
+        model_cfg = self.config.model
         return build_blob(
             model_json,
             level_shift,
-            shuffle_tables=self.config.export.shuffle_tables,
-            leaf_bits=self.config.model.leaf_bits,
-            leaf_chunk=self.config.model.leaf_chunk,
+            leaf_bits=model_cfg.leaf_bits,
+            leaf_chunk=model_cfg.leaf_chunk,
+            coarse_trees=(
+                model_cfg.coarse_trees if model_cfg.coarse_trees < model_cfg.n_trees else 0
+            ),
+            exit_stages=self.exit_stages,
         )
 
     # -- inference ----------------------------------------------------------
@@ -264,7 +309,9 @@ class Detector:
         if self.runtime is None:
             msg = "detector is not fitted; call fit() or load()"
             raise RuntimeError(msg)
-        return self.runtime.predict_grid(self.design_matrix(image), grid=GRID)
+        return self.runtime.predict_grid(
+            self.design_matrix(image), grid=GRID, use_exit=self.config.model.use_exit
+        )
 
     # -- persistence --------------------------------------------------------
     def export(self, path: str | Path) -> Path:
@@ -286,6 +333,7 @@ class Detector:
         metadata = dict(self.metrics)
         metadata.update(info)
         metadata["val_ids"] = list(self.val_ids)
+        metadata["exit_stages"] = [[int(t), float(theta)] for t, theta in self.exit_stages]
         return ModelArtifact(
             config=self.config,
             feature_names=[self.base_names[int(i)] for i in self.col_keep],
