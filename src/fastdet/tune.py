@@ -379,7 +379,18 @@ def write_report(
 ) -> Path:
     """``report.md`` plus ``pr.png`` / ``roc.png`` from the stored results."""
     ranked = sorted(results, key=lambda r: -r["metrics"]["pr_auc"])
-    swept = sorted(k for k, v in sweep.items() if len(v) > 1) or sorted(sweep)
+    # columns: every knob whose effective value differs between the runs on file, whichever
+    # sweep set it (a report folder accumulates runs across invocations)
+    knobs = _knob_fields()
+    values: dict[str, set[str]] = {}
+    for r in results:
+        for name, (section, _f) in knobs.items():
+            values.setdefault(name, set()).add(str(r["config"][section].get(name)))
+    swept = sorted(k for k, v in values.items() if len(v) > 1) or sorted(sweep)
+
+    def effective(r: dict[str, Any], k: str) -> str:
+        return str(r["config"][knobs[k][0]].get(k))
+
     baseline_path = out_dir / "baseline.json"
     baseline = json.loads(baseline_path.read_text())["metrics"] if baseline_path.exists() else None
     lines = ["# fastdet hyperparameter sweep", ""]
@@ -408,7 +419,7 @@ def write_report(
         m = r["metrics"]
         cells = [
             f"{'**' if rank == 1 else ''}{rank}{'**' if rank == 1 else ''}",
-            *(str(r["overrides"].get(k, "default")) for k in swept),
+            *(effective(r, k) for k in swept),
         ]
         cells += [
             f"{m['pr_auc']:.4f}",
@@ -476,7 +487,8 @@ def _write_charts(out_dir: Path, ranked: list[dict[str, Any]], swept: list[str])
         curve = _load_curve(out_dir, r["key"])
         if curve is not None:
             label = (
-                ", ".join(f"{k}={r['overrides'].get(k, 'default')}" for k in swept) or "defaults"
+                ", ".join(f"{k}={r['config'][_knob_fields()[k][0]].get(k)}" for k in swept)
+                or "defaults"
             )
             entries.append((f"{label} (PR-AUC {r['metrics']['pr_auc']:.3f})", *curve))
     b_scores, b_labels = out_dir / "baseline.scores.npy", out_dir / "baseline.labels.npy"
