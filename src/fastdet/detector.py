@@ -22,7 +22,14 @@ from .artifact import ModelArtifact
 from .config import Config, ModelConfig
 from .dataset import build_split, gather_training_matrix, sample_training_cells
 from .exporter import build_blob
-from .features import GRID, FeatureCache, FeatureExtractor, feature_level_bits
+from .features import (
+    GRID,
+    FeatureCache,
+    FeatureExtractor,
+    FloatArray,
+    LevelBanks,
+    feature_level_bits,
+)
 from .images import read_image
 from .metrics import pooled_pr_auc, score_validation_per_image
 from .native import NativeScorer, load_native
@@ -36,6 +43,8 @@ from .training import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from catboost import CatBoostClassifier
 
 __all__ = ["Detector"]
@@ -329,6 +338,46 @@ class Detector:
                 raise ValueError(msg)
             return decoded
         return cast("UInt8Array", np.asarray(image))  # no dtype coercion, as before
+
+    @property
+    def front_end_spec(self) -> dict[str, Any]:
+        """The imfeat call this model's features come from (see :meth:`predict_from_imfeat`)."""
+        return self.extractor.front_end_spec
+
+    def predict_from_imfeat(
+        self,
+        result: Any,
+        image_hw: tuple[int, int],
+        extra_results: Sequence[Any] = (),
+    ) -> NDArray[np.floating[Any]]:
+        """Per-cell probabilities from an imfeat result the caller already computed.
+
+        For hosts that run imfeat themselves (framegate): make the thumbnail and the
+        ``FeatureComputer`` exactly as :attr:`front_end_spec` says, pass its result and
+        the original frame's ``(height, width)``, and fastdet skips its own pass.  Same
+        map as :meth:`predict_proba` on the frame, through the same scorer (C++ when
+        the library is built, NumPy otherwise).
+        """
+        if self.runtime is None:
+            msg = "detector is not fitted; call fit() or load()"
+            raise RuntimeError(msg)
+        level_maps, broadcast_vecs = self.extractor.compose(result, image_hw, extra_results)
+        return self._predict_from_maps(level_maps, broadcast_vecs)
+
+    def _predict_from_maps(
+        self, level_maps: dict[int, LevelBanks], broadcast_vecs: dict[int, FloatArray]
+    ) -> NDArray[np.floating[Any]]:
+        if self.runtime is None:
+            msg = "detector is not fitted; call fit() or load()"
+            raise RuntimeError(msg)
+        use_exit = self.config.model.use_exit
+        if self.native is not None:
+            native = self.extractor.native(level_maps, broadcast_vecs, self.col_keep)
+            return self.native.score(native, use_exit=use_exit).reshape(GRID, GRID)
+        design = self.extractor.gather(
+            level_maps, broadcast_vecs, np.arange(GRID * GRID), col_keep=self.col_keep
+        )
+        return self.runtime.predict_grid(design, grid=GRID, use_exit=use_exit)
 
     def predict_proba(self, image: str | Path | UInt8Array) -> NDArray[np.floating[Any]]:
         """Per-cell positive probability for one image as a ``GRID x GRID`` map.

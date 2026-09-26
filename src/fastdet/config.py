@@ -31,8 +31,8 @@ MAX_LEAF_CHUNK = 17
 class ModelConfig:
     """Gradient-boosted symmetric (oblivious) tree model hyper-parameters."""
 
-    depth: int = 7  # Tree depth; one split per level, 2**depth leaves per tree.
-    n_trees: int = 2400  # Number of boosting iterations (symmetric trees).
+    depth: int = 5  # Tree depth; one split per level, 2**depth leaves per tree.
+    n_trees: int = 1000  # Number of boosting iterations (symmetric trees).
     learning_rate: float = 0.1  # CatBoost learning_rate / shrinkage per tree.
     border_count: int = 15  # Per-feature split candidates; <= 15 for the 4-bit blob.
     random_seed: int = 42  # Seed for the booster; independent of the data split.
@@ -42,15 +42,15 @@ class ModelConfig:
     # Where CatBoost trains: "CPU" or "GPU" (any CUDA device CatBoost's wheel can see;
     # several times faster on millions of cells, and the chunked quantisation-aware
     # fit re-uploads the quantised data once per chunk).  Inference never needs a GPU.
-    task_type: str = "CPU"
+    task_type: str = "AUTO"  # AUTO = GPU when CatBoost sees one, else CPU.
     # Leaf values live on a low-bit grid (4, 6, 8 or 16 bits); None keeps float32
     # leaves.  8-bit costs no measurable accuracy and is the format a low-bit
     # scorer reads, so models are trained for it by default.
     # Leaf values live on a low-bit grid the scorer reads directly: per tree an
     # offset, per chunk of leaf_chunk trees a power-of-two step, per leaf a
-    # leaf_bits code.  8-bit costs nothing measurable; 4-bit halves the fine-tree
-    # work again and needs the quantisation-aware fit below.
-    leaf_bits: int = 8
+    # leaf_bits code.  4-bit halves the fine-tree work against 8-bit and, with the
+    # quantisation-aware fit below, measured no quality difference.
+    leaf_bits: int = 4
     leaf_chunk: int = 16  # Trees sharing one step; also the scorer's pass length (<= 17).
     # Quantisation-aware training: fit in chunks of leaf_chunk trees and quantise
     # each chunk's leaves before fitting the next, so later trees correct the
@@ -114,8 +114,8 @@ class ModelConfig:
             msg = "scale_pos_weight must be > 0"
             raise ValueError(msg)
         self.task_type = str(self.task_type).upper()
-        if self.task_type not in {"CPU", "GPU"}:
-            msg = "task_type must be CPU or GPU"
+        if self.task_type not in {"AUTO", "CPU", "GPU"}:
+            msg = "task_type must be AUTO, CPU or GPU"
             raise ValueError(msg)
         self.exit_stage_fractions = tuple(float(f) for f in self.exit_stage_fractions)
         if any(not 0.0 <= f < 1.0 for f in self.exit_stage_fractions):
@@ -147,7 +147,7 @@ class TrainConfig:
     levels: tuple[int, ...] = (64, 32, 16, 8, 4, 2)  # Grid sizes per level; finest must be 64.
     feature_mode: str = "raw_plus_global_context_ext"  # Which feature banks to build.
     thumb: int = 1024  # Square resize target the feature pyramid is computed on.
-    stride: int = 4  # imfeat sampling stride at the primary scale.
+    stride: int = 1  # imfeat sampling stride at the primary scale (1 = every pixel).
     extra_scales: str = ""  # Extra imfeat scales, 'thumb:stride;...' ('' disables).
     resize_interp: str = "area"  # Thumbnail resize kernel: 'area' or 'nearest'.
     imfeat_space: str = "hsv"  # Color space fed to imfeat: hsv|lab|luv|yuv.
@@ -160,8 +160,10 @@ class TrainConfig:
     split_seed: int = 42  # Seed for the group-aware train/val split.
     val_frac: float = 0.15  # Fraction of near-duplicate groups held out for validation.
     max_hamming: int = 8  # pHash Hamming distance below which images are one group.
-    neg_pos_ratio: float | None = None  # Negative:positive sampling ratio; None = keep all.
-    max_train_cells: int | None = None  # Cap on sampled training cells; None = no cap.
+    neg_pos_ratio: float | None = (
+        5.0  # Negatives kept per positive in the training sample; None = all.
+    )
+    max_train_cells: int | None = 1_000_000  # Cap on sampled training cells; None = no cap.
 
     def __post_init__(self) -> None:
         """Normalize multi-valued fields and validate the front-end knobs."""

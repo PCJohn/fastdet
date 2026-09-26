@@ -51,8 +51,8 @@ if TYPE_CHECKING:
 # framegate's pass: HSV, 64x64 finest grid, six levels, ~4 samples per cell per axis.
 FRAMEGATE_LEVELS = (64, 32, 16, 8, 4, 2)
 SIZES = (256, 512, 1024)
-N_TREES = 2400
-DEPTH = 7
+N_TREES = 1000  # the shipped shape (ModelConfig defaults)
+DEPTH = 5
 KEPT_COLUMNS = (512, 1178)
 # Calibration against a model trained on the real dataset (1178 columns): it held
 # 6906 thresholds, i.e. ~6 per column, and binning cost is proportional to them.

@@ -7,7 +7,7 @@ and a dependency-free C++ runtime read the same bytes and produce identical
 scores.
 
 The front-end matches [framegate](https://github.com/PCJohn/framegate)'s single
-imfeat pass (1024 px square, HSV, stride 4, 64×64 finest grid, six levels), so a
+imfeat pass (1024 px square, HSV, stride 1, 64×64 finest grid, six levels), so a
 framegate process can feed its own features to a fastdet model. **No model has
 been trained or measured on this front-end yet**: the quality and latency figures
 in [`research_report.md`](research_report.md) describe earlier front-ends
@@ -47,7 +47,7 @@ Every image in `images/` needs a matching mask in `masks/` named
 from fastdet import Detector
 
 det = Detector()                          # frozen, measured defaults
-# det = Detector(depth=7, n_trees=2400)   # override booster fields only
+# det = Detector(depth=5, n_trees=1000)   # override booster fields only
 # det = Detector.from_config_file("config.yaml")
 
 det.fit("data/images", "data/masks")
@@ -113,13 +113,63 @@ for path in Path("data/test").glob("*.png"):
 source resolution to crop or overlay. The C++ runtime scores the same file; see
 [C++ runtime](#c-runtime).
 
+## Demo (`fastdet-demo`)
+
+```
+fastdet-demo --model model.fdt --source photo.png      # one image
+fastdet-demo --model model.fdt --source clip.mp4       # a video, live
+fastdet-demo --model model.fdt --source 0              # webcam 0, live
+```
+
+Left: the frame with the cell probabilities blended over it (JET colormap, opacity
+following the probability). Right: latency -- for an image the two numbers, for a
+video or webcam a live time series over the last 240 frames of (1) feature
+extraction (resize, colour conversion, imfeat, context banks, packing) and (2) the
+model (binning, coarse tier, fine trees, sigmoid), plus the total and the frame rate.
+Frames are scored as they arrive; nothing is buffered ahead. Keys: `q`/`Esc` quit,
+`space` pause, `s` save the composite. `--headless --output out.png` renders without
+a window; `--display-width` scales the frame panel; `--native-lib` points at the C++
+library if it is not found automatically (without it the NumPy runtime scores, tens
+of milliseconds, and the panel says so).
+
+## Using fastdet inside a host that already runs imfeat (framegate)
+
+framegate computes the same 1024-px HSV thumbnail and imfeat pyramid for its own
+signals, so fastdet must not pay for a second pass. `Detector.front_end_spec` says
+exactly what the model was trained on, and `Detector.predict_from_imfeat` scores an
+imfeat result the host already has:
+
+```python
+det = Detector.load("model.fdt")
+spec = det.front_end_spec
+# {'thumb': 1024, 'stride': 1, 'resize_interp': 'area', 'space': 'hsv',
+#  'levels': [64, 32, 16, 8, 4, 2], 'raw_channels_per_level': 162, 'extra_scales': []}
+
+# host side, once: the FeatureComputer for that spec (imfeat appends its whole-image level)
+fc = imfeat.FeatureComputer(shape=(spec["thumb"], spec["thumb"], 3),
+                            grid=[(int(np.log2(n)),) * 2 for n in spec["levels"]],
+                            stride=spec["stride"], threads=1)
+# per frame: the host's own resize (INTER_AREA to thumb x thumb), conversion to spec["space"], imfeat
+result = fc.features(hsv_thumbnail)
+probabilities = det.predict_from_imfeat(result, image_hw=frame.shape[:2])   # (64, 64)
+```
+
+The result must come from a thumbnail and computer matching the spec (size, stride,
+colour space, levels; the map shapes are checked); `image_hw` is the original frame's
+height and width, which the global feature block records. A model trained with
+`extra_scales` needs those passes too: run a computer per `(thumb, stride)` in
+`spec["extra_scales"]` on downsized copies of the thumbnail and pass their results as
+`extra_results`. The map is the same as `predict_proba(frame)`, through the same
+scorer (C++ when the library is built). `FeatureExtractor.run_imfeat` / `.compose` are
+the two halves fastdet itself uses, if a host wants to share at a different point.
+
 ## How it works
 
 ### Features
 
 Each image is squashed to a 1024×1024 thumbnail (`INTER_AREA`; the aspect ratio
 is kept as a global feature instead), converted to HSV, and passed to `imfeat`
-once at stride 4 with six pyramid levels (64/32/16/8/4/2 cells) — framegate's
+once at stride 1 with six pyramid levels (64/32/16/8/4/2 cells) — framegate's
 exact configuration. For every cell of the finest 64×64 grid, the front-end
 concatenates the features of all levels into one row (1178 columns):
 
@@ -138,6 +188,18 @@ comes from imfeat in a single pass; the banks above are cheap reductions of its
 output. The assembly lives in
 [`FeatureExtractor.extract`](src/fastdet/features.py) and
 [`FeatureExtractor.gather`](src/fastdet/features.py).
+
+### Two measurement scales (`extra_scales`)
+
+Every pyramid level is a bigger *window* over the same per-pixel measurements: imfeat's
+3x3 kernels run once, at the thumbnail's pixel scale. `extra_scales` adds passes on
+downsized copies of the thumbnail (`"256:1"` = a 256-px copy at stride 1), whose kernels
+therefore see the image one or two octaves coarser; their 162 raw columns per level are
+tagged `64@256px/s1/...` and sit beside the primary ones, so a tree can split on the
+fine-scale and the coarse-scale version of the same statistic. On the OCR dataset it is
+worth +0.01 to +0.02 PR-AUC on top of stride 1, at the cost of one more imfeat pass per
+frame and a host that must compute that pass too (see `front_end_spec`). Off by default
+for that reason.
 
 ### Labels and split
 
@@ -165,8 +227,8 @@ ensemble. In a symmetric tree every node at the same depth shares one
 | Parameter | Value | Role |
 | --- | --- | --- |
 | `loss_function` | `Logloss` | binary cross-entropy per cell |
-| `iterations` | 2400 | number of trees |
-| `depth` | 7 | levels per tree, 128 leaves |
+| `iterations` | 1000 | number of trees (the first 667 tile-constant, see tiering) |
+| `depth` | 5 | levels per tree, 32 leaves |
 | `learning_rate` | 0.1 | shrinkage per tree |
 | `border_count` | 15 | split candidates per feature |
 | `grow_policy` | `SymmetricTree` | required by the export format |
@@ -181,7 +243,7 @@ better than accuracy.
 
 The ensemble is regularized by construction and by the usual tree controls:
 
-- **depth 7** limits interaction order to seven splits;
+- **depth 5** limits interaction order to five splits;
 - **learning rate 0.1** shrinks each tree's contribution;
 - **L2 leaf regularization** (CatBoost default `l2_leaf_reg = 3`) penalizes leaf
   magnitudes;
@@ -215,8 +277,8 @@ Every model ships with its leaves on a low-bit grid, and is *trained for* that g
   work is one byte shuffle per nibble plane of codes instead of four per float leaf.
 
 ```python
-det = Detector(Config()).fit(images_dir, masks_dir)                 # 8-bit, QAT, tiered, exit
-det = Detector(Config(model=ModelConfig(leaf_bits=4))).fit(...)     # 4-bit
+det = Detector(Config()).fit(images_dir, masks_dir)                 # 4-bit, QAT, tiered, exit
+det = Detector(Config(model=ModelConfig(leaf_bits=8))).fit(...)     # 8-bit
 ```
 
 `fit()` reports validation PR-AUC from the exported runtime with early exit on:
@@ -430,8 +492,8 @@ the knobs that matter:
   is ~4 GB, fine for a 6 GB card). The chunked quantisation-aware fit uploads the
   pool once per chunk of `leaf_chunk` trees, so a GPU pays off most for big
   matrices. Inference never uses the GPU.
-* **Fewer fits**: the quantisation-aware fit is 150 chunked fits for 2400 trees. At
-  8-bit leaves the rounding is one decision in ~25,000, so `quantisation_aware=False`
+* **Fewer fits**: the quantisation-aware fit is one chunked fit per 16 trees (63 for
+  1000 trees). At 8-bit leaves the rounding is one decision in ~25,000, so `quantisation_aware=False`
   (one fit per stage) is the fast path; keep it on for 4-bit leaves, where it is
   worth a few PR-AUC points.
 * `thread_count=-1` already uses every core; the front-end feature pass is a few
@@ -448,13 +510,15 @@ early exit), and writes a report folder:
   threshold, fit time, model size and, when the C++ library is built, `predict_proba`
   latency; the framegate text heuristic as a baseline row; the best run's full config.
 * `curves.png` -- precision-recall and ROC curves side by side, for the best runs and the baseline.
-* `results.json`, `models/<key>.fdt` -- every run's config, metrics and exported model.
+* `results.json`, `models/<label>-<key>.fdt` -- every run's config, metrics and exported model;
+  the file name spells out the swept knobs (`n_trees=1000_stride=2-3f9a...fdt`) and the
+  `model` column of the table names it.
   Re-running with the same `--out` resumes: finished combinations are skipped.
 
 ```
 pip install -e ".[tune]"                     # matplotlib, for the charts
 fastdet-tune --images data/images --masks data/masks --out tune_report \
-    --n-trees 1200,2400 --leaf-bits 4,8 --coarse-fraction 0.5,0.667
+    --n-trees 1000,2000 --leaf-bits 4,8 --coarse-fraction 0.5,0.667
 ```
 
 That is 2 x 2 x 2 = 8 fits. Every knob takes a comma-separated list and the sweep is
@@ -472,29 +536,54 @@ them with their current defaults). The ones worth sweeping:
 
 | knob | default | what it does |
 |---|---|---|
-| `--n-trees` | 2400 | boosting iterations; latency grows linearly, quality saturates |
-| `--depth` | 7 | tree depth; 7 varying splits is the scorer's limit |
+| `--n-trees` | 1000 | boosting iterations; latency grows linearly, quality saturates (see the trends below) |
+| `--depth` | 5 | tree depth; 7 varying splits is the scorer's limit |
 | `--learning-rate` | 0.1 | shrinkage; lower needs more trees |
-| `--border-count` | 15 | split candidates per feature (max 15); 7 makes binning ~40% cheaper |
-| `--leaf-bits` | 8 | leaf code width, 4 or 8; 4 halves the fine-tree cost (quantisation-aware fit) |
+| `--border-count` | 15 | split candidates per feature (max 15); 7 makes binning ~40% cheaper at no measured cost |
+| `--leaf-bits` | 4 | leaf code width, 4 or 8; 4 halves the fine-tree cost (quantisation-aware fit, no measured loss) |
 | `--leaf-chunk` | 16 | trees per quantisation step and scorer pass (<= 17) |
 | `--quantisation-aware` | true | chunked fit on the quantised running score; `false` = one fit per stage (fast path at 8-bit) |
-| `--task-type` | CPU | `GPU` trains on CUDA (see Training time and memory) |
+| `--task-type` | AUTO | `GPU` when CatBoost sees a CUDA device, else `CPU`; force either (see Training time and memory) |
+| `--scale-pos-weight` | none (1) | CatBoost class weight on positives; the alternative to subsampling that keeps every negative |
 | `--coarse-fraction` | 0.667 | share of trees restricted to tile-constant features (evaluated once per tile); 0 disables tiering |
 | `--coarse-max-side` | 16 | largest feature grid that counts as tile-constant |
 | `--use-exit` | true | early exit on |
 | `--exit-keep-prob` | 0.05 | cells ending at or above this probability are never stopped |
 | `--exit-margin` | 2.0 | raw-score safety margin under the calibrated thresholds |
 | `--exit-stage-fractions` | 0/0.125/0.25/0.5/0.75 | where in the fine tier the stages sit |
-| `--top-k-features` | 0 (all) | keep the top-k gain-ranked columns; 512 halves binning |
-| `--thumb`, `--stride` | 1024, 4 | front-end resize target and imfeat sampling stride |
+| `--thumb` | 1024 | square resize target the feature pyramid is computed on (framegate's) |
+| `--stride` | 1 | imfeat sampling stride at that size: 1 = every pixel (16x16 samples per finest cell), 2, 4 |
+| `--extra-scales` | none | extra imfeat passes on downsized copies of the thumbnail, `thumb:stride` pairs separated by `;` (`--extra-scales "256:1"`, `--extra-scales "512:2;256:1"`; commas separate sweep values); each adds 162 raw columns per level measured at a coarser scale and one more imfeat pass of latency |
 | `--levels` | 64/32/16/8/4/2 | pyramid grids (finest must be 64) |
 | `--feature-mode`, `--imfeat-space` | raw_plus_global_context_ext, hsv | feature banks and colour space |
+| `--resize-interp` | area | thumbnail resize kernel, `area` or `nearest` |
+| `--top-k-features` | 0 (all) | keep the top-k gain-ranked columns; 512 halves binning |
 | `--gt-cell-thresh` | 0.10 | mask coverage at which a cell is a positive |
-| `--val-frac`, `--split-seed` | 0.15, 42 | held-out share of near-duplicate groups and the split seed |
-| `--neg-pos-ratio` | none (keep all) | negatives kept per positive in the training sample (`none,3,5`); rebalances the classes by discarding negatives, which shifts the probability scale (use `thr*`) |
-| `--scale-pos-weight` | none (1) | CatBoost class weight on positives; the usual alternative to subsampling for boosting, keeps every negative |
-| `--max-train-cells` | none | cap on sampled training cells |
+| `--val-frac`, `--split-seed`, `--max-hamming` | 0.15, 42, 8 | held-out share of near-duplicate groups, the split seed, the perceptual-hash distance that makes two images a group |
+| `--neg-pos-ratio` | 5 | negatives kept per positive in the training sample (`none` keeps all); rebalances the classes by discarding negatives, which shifts the probability scale (use `thr*`) |
+| `--max-train-cells` | 1,000,000 | cap on sampled training cells (RAM: ~4.4 GiB per million cells as float32 before quantisation) |
+
+### Trends on an OCR dataset (1,925 images, 6.8% positive cells)
+
+Recorded from the sweeps that chose the defaults above, so they can be re-checked on a
+new dataset with the same commands. Every row is a d5 x 1000, 4-bit, 0.667-coarse model
+unless the knob says otherwise; the baseline framegate heuristic is at PR-AUC 0.42–0.45.
+
+| knob | values | validation PR-AUC | note |
+|---|---|---|---|
+| `--stride` (1024 px, 100k cells) | 4 / 2 / 1 | 0.722 / 0.753 / 0.762 | the largest single effect: more samples per cell. Stride 1 costs ~9 ms of imfeat per frame at 1024 px, stride 2 ~3 ms, stride 4 ~1.6 ms; 512 px at stride 2 matches 1024/2 (0.749) at the cost of 1024/4 |
+| `--max-train-cells` | 100k / 1M | 0.76 / 0.77–0.78 | still rising; more data is the next lever |
+| `--neg-pos-ratio` | none / 3 / 5 / larger | 0.690 / ≈ / 0.712 / drops mildly | 3 and 5 are equivalent; keeping every negative (none) is worse at a fixed cell budget |
+| `--n-trees` | 1000 / 2000 | saturates | at 100k–1M cells 2000 trees is not better than 1000 |
+| `--depth` | 3 / 5 / 7 | 5 ≈ 3 > 7 | the signal is low-order; depth 5 costs a third less than 7 in the scorer |
+| `--leaf-bits` | 4 / 8 | equal | the quantisation-aware fit closes the gap |
+| `--coarse-fraction` | 0.5 / 0.667 / 0.75 | equal | pick for latency |
+| `--border-count`, `--leaf-chunk` | 7 / 10 / 15, 8 / 12 / 16 | within run-to-run noise (±0.01) | `border_count 7` is free speed |
+| `--learning-rate` | 0.1 / 0.01 | 0.1 better at 1000 trees | 0.01 needs many more trees |
+| `--extra-scales` (on top of the defaults) | `256:2` or `256:1` | +0.01 to +0.02 | a second, coarser measurement scale (see Front-end). Not the default: each extra scale is another imfeat pass on the frame; revisit when the front-end can afford it |
+
+Two identical configurations fitted on the GPU differed by 0.011 PR-AUC, so differences
+below about 0.01 in a table are noise; re-run a candidate pair before deciding on them.
 
 Reading the report: PR-AUC is the number to rank by (the positive rate is a few
 percent, so ROC-AUC flatters everything); `thr*` is the probability threshold with the

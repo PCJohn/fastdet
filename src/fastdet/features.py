@@ -478,24 +478,72 @@ class FeatureExtractor:
             bvec[low:high] = global_vec[low:high]
         return tuple(banks), bvec
 
-    def extract(self, img_bgr: Image) -> tuple[dict[int, LevelBanks], dict[int, FloatArray]]:
-        """Image -> ``(level_maps, broadcast_vecs)`` (see module docstring)."""
+    @property
+    def front_end_spec(self) -> dict[str, Any]:
+        """The imfeat call this extractor makes, for hosts that run imfeat themselves.
+
+        A host (framegate) that computes the same thumbnail and ``FeatureComputer``
+        checks its settings against this and feeds :meth:`compose` instead of paying
+        for a second pass.  ``thumb`` is the square resize target, ``stride`` the
+        imfeat sampling stride, ``levels`` the grid sizes requested (imfeat appends
+        its whole-image level), ``space`` the colour space of the array given to
+        imfeat; ``extra_scales`` are further ``(thumb, stride)`` passes on downsized
+        copies of the thumbnail, in the order :meth:`compose` expects them.
+        """
+        cfg = self.cfg
+        return {
+            "thumb": cfg.thumb,
+            "stride": cfg.stride,
+            "resize_interp": cfg.resize_interp,
+            "space": cfg.imfeat_space,
+            "levels": list(self.levels),
+            "raw_channels_per_level": RAW_CHANNELS * RAW_PER_CHANNEL,
+            "extra_scales": [(e.thumb, e.stride) for e in self.extra_scales],
+        }
+
+    def run_imfeat(self, img_bgr: Image) -> tuple[Any, list[Any]]:
+        """Resize, convert and run imfeat: ``(result, extra_results)`` for :meth:`compose`."""
         cfg = self.cfg
         interpolation = cv2.INTER_AREA if cfg.resize_interp == "area" else cv2.INTER_NEAREST
         thumb_bgr = self._resize_bgr(img_bgr, cfg.thumb, interpolation)
         space = SPACE_INFO[cfg.imfeat_space]
-        feature_img = self._convert(thumb_bgr, space)
-        result = self.fc.features(feature_img)
+        result = self.fc.features(self._convert(thumb_bgr, space))
+        extra_results = []
+        for computer, extra_thumb, _label in self.extra_computers:
+            extra_bgr = self._resize_bgr(thumb_bgr, extra_thumb)
+            extra_results.append(computer.features(self._convert(extra_bgr, space)))
+        return result, extra_results
 
+    def compose(
+        self,
+        result: Any,
+        image_hw: tuple[int, int],
+        extra_results: Sequence[Any] = (),
+    ) -> tuple[dict[int, LevelBanks], dict[int, FloatArray]]:
+        """Imfeat results -> ``(level_maps, broadcast_vecs)`` (see module docstring).
+
+        ``result`` is what ``imfeat.FeatureComputer.features`` returned for the
+        thumbnail :attr:`front_end_spec` describes, ``image_hw`` the original frame's
+        ``(height, width)`` (the global block records its aspect and area) and
+        ``extra_results`` the extra scales' results in spec order.  This is the second
+        half of :meth:`extract`; a host with its own imfeat pass calls it directly.
+        """
         maps = self._load_level_maps(result, "imfeat")
-        extra_maps = self._extra_level_maps(thumb_bgr, space)
-
-        orig_h, orig_w = img_bgr.shape[:2]
+        if len(extra_results) != len(self.extra_computers):
+            msg = f"expected {len(self.extra_computers)} extra-scale results, got {len(extra_results)}"
+            raise ValueError(msg)
+        extra_maps = [self._load_level_maps(r, "extra scale") for r in extra_results]
+        for level_maps_of_scale in (maps, *extra_maps):
+            for size, arr in zip(self.levels, level_maps_of_scale, strict=True):
+                want = (size, size, RAW_CHANNELS * RAW_PER_CHANNEL)
+                if tuple(arr.shape) != want:
+                    msg = f"imfeat map has shape {tuple(arr.shape)}, this model expects {want}"
+                    raise ValueError(msg)
+        orig_h, orig_w = image_hw
         # result.maps[-1] is imfeat's whole-image level: the same raw block, one cell.
         global_vec = compute_global_stats(
             np.asarray(result.maps[-1], dtype=np.float32).ravel(), orig_h, orig_w
         )
-
         level_maps: dict[int, LevelBanks] = {}
         broadcast_vecs: dict[int, FloatArray] = {}
         for i, size in enumerate(self.levels):
@@ -504,6 +552,11 @@ class FeatureExtractor:
             level_maps[size] = out
             broadcast_vecs[size] = bvec
         return level_maps, broadcast_vecs
+
+    def extract(self, img_bgr: Image) -> tuple[dict[int, LevelBanks], dict[int, FloatArray]]:
+        """Image -> ``(level_maps, broadcast_vecs)`` (see module docstring)."""
+        result, extra_results = self.run_imfeat(img_bgr)
+        return self.compose(result, img_bgr.shape[:2], extra_results)
 
     def gather(
         self,

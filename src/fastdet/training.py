@@ -28,6 +28,7 @@ __all__ = [
     "leaf_grid",
     "load_ranking",
     "quantise_leaves",
+    "resolve_task_type",
     "select_columns",
     "stage_tree_counts",
 ]
@@ -200,6 +201,18 @@ def _leaf_table(booster: CatBoostClassifier, n_trees: int) -> NDArray[np.float64
     return table
 
 
+def resolve_task_type(task_type: str) -> str:
+    """``AUTO`` -> ``GPU`` when CatBoost can see a CUDA device, else ``CPU``."""
+    if task_type != "AUTO":
+        return task_type
+    try:
+        from catboost.utils import get_gpu_device_count  # noqa: PLC0415 -- optional heavy import
+
+        return "GPU" if get_gpu_device_count() > 0 else "CPU"
+    except Exception:  # noqa: BLE001 -- any failure to probe means no usable GPU
+        return "CPU"
+
+
 def make_pool(
     features: NDArray[np.floating],
     labels: NDArray[np.bool_] | NDArray[np.integer[Any]],
@@ -291,9 +304,9 @@ def fit_booster(
         "verbose": False,
         "allow_writing_files": False,
         "thread_count": -1,
-        "task_type": model_cfg.task_type,
+        "task_type": resolve_task_type(model_cfg.task_type),
     }
-    if model_cfg.task_type == "GPU":
+    if params["task_type"] == "GPU":
         params["devices"] = "0"
     bits = model_cfg.leaf_bits if model_cfg.quantisation_aware else None
     coarse_trees = model_cfg.coarse_trees if model_cfg.coarse_trees < model_cfg.n_trees else 0

@@ -27,6 +27,7 @@ import hashlib
 import itertools
 import json
 import os
+import re
 import sys
 import time
 from dataclasses import fields
@@ -215,6 +216,13 @@ def _parse_value(text: str, annotation: str, default: Any) -> Any:
     return text if default is None else type(default)(text)
 
 
+def _run_label(overrides: dict[str, Any]) -> str:
+    """A file-name-safe label naming the run's knobs: ``n_trees=1000_stride=2``."""
+    parts = [f"{k}={v}" for k, v in sorted(overrides.items())]
+    label = "_".join(parts) or "defaults"
+    return re.sub(r"[^A-Za-z0-9=._-]+", "-", label)[:120]
+
+
 def _run_key(overrides: dict[str, Any]) -> str:
     return hashlib.sha256(json.dumps(overrides, sort_keys=True, default=str).encode()).hexdigest()[
         :12
@@ -326,7 +334,7 @@ def run_sweep(  # noqa: PLR0913, PLR0915 -- the whole sweep in one readable func
         cache = caches[train_key][1]
         scores, labels = _validation_scores(det, cache)
         metrics = summarise(scores, labels)
-        model_path = out_dir / "models" / f"{key}.fdt"
+        model_path = out_dir / "models" / f"{_run_label(overrides)}-{key}.fdt"
         model_path.parent.mkdir(exist_ok=True)
         det.export(model_path)
         sample = np.asarray(cv2.imread(cache.img_paths[0]), dtype=np.uint8) if cache.n else None
@@ -334,6 +342,8 @@ def run_sweep(  # noqa: PLR0913, PLR0915 -- the whole sweep in one readable func
         results.append(
             {
                 "key": key,
+                "label": _run_label(overrides),
+                "model": model_path.name,
                 "overrides": overrides,
                 "config": cfg.to_dict(),
                 "metrics": metrics,
@@ -412,6 +422,7 @@ def write_report(
         "fit s",
         "size KB",
         "latency ms",
+        "model",
     ]
     lines.append("| " + " | ".join(header) + " |")
     lines.append("|" + "|".join(["---"] * len(header)) + "|")
@@ -432,6 +443,7 @@ def write_report(
             f"{r['fit_seconds']:.0f}",
             f"{r['model_bytes'] / 1024:.0f}",
             "-" if r["latency_ms"] is None else f"{r['latency_ms']:.2f}",
+            f"`models/{r.get('model', r['key'] + '.fdt')}`",
         ]
         lines.append("| " + " | ".join(cells) + " |")
     if baseline is not None:
@@ -445,6 +457,7 @@ def write_report(
             f"{baseline['precision']:.3f}",
             f"{baseline['recall']:.3f}",
             f"{baseline['iou']:.3f}",
+            "-",
             "-",
             "-",
             "-",
