@@ -202,9 +202,13 @@ colour space, levels; the map shapes are checked); `image_hw` is the original fr
 height and width, which the global feature block records. A model trained with
 `extra_scales` needs those passes too: run a computer per `(thumb, stride)` in
 `spec["extra_scales"]` on downsized copies of the thumbnail and pass their results as
-`extra_results`. The map is the same as `predict_proba(frame)`, through the same
-scorer (C++ when the library is built). `FeatureExtractor.run_imfeat` / `.compose` are
-the two halves fastdet itself uses, if a host wants to share at a different point.
+`extra_results`. The map is the same as `predict_proba(frame)`, through the same C++
+scorer, and a detector used only this way never builds its own imfeat computers (they
+are made on the first `predict_proba`), so the host's pool is the only one.
+`FeatureExtractor.run_imfeat` / `.compose` are the two halves fastdet itself uses, if a
+host wants to share at a different point. framegate does exactly this: a `text.fdt` in
+its `models/` folder (or `GateConfig(models={"text": path})`) replaces its heuristic
+text map with the model, on the pass it already makes.
 
 ## How it works
 

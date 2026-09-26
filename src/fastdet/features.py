@@ -364,13 +364,37 @@ class FeatureExtractor:
         self._all_cells = np.arange(GRID * GRID)
 
         self.threads = threads
-        self.fc, self.n_levels = make_feature_computer(self.levels, cfg.thumb, cfg.stride, threads)
-        self.extra_computers: list[tuple[Any, int, str]] = []
-        for scale in self.extra_scales:
-            computer, _ = make_feature_computer(self.levels, scale.thumb, scale.stride, threads)
-            self.extra_computers.append((computer, scale.thumb, scale.label))
+        self.n_levels = len(self.levels)
+        # The imfeat computers (and their worker pools) are built on the first pass, so a
+        # host that runs imfeat itself and feeds compose() never spawns them.
+        self._computers: tuple[Any, list[tuple[Any, int, str]]] | None = None
 
         self.base_names = self._build_names()
+
+    @property
+    def fc(self) -> Any:
+        """The imfeat computer of the main pass (built on first use)."""
+        return self._imfeat()[0]
+
+    @property
+    def extra_computers(self) -> list[tuple[Any, int, str]]:
+        """``(computer, thumb, label)`` per extra scale (built on first use)."""
+        return self._imfeat()[1]
+
+    def _imfeat(self) -> tuple[Any, list[tuple[Any, int, str]]]:
+        if self._computers is None:
+            cfg = self.cfg
+            fc, _ = make_feature_computer(self.levels, cfg.thumb, cfg.stride, self.threads)
+            extras = [
+                (
+                    make_feature_computer(self.levels, scale.thumb, scale.stride, self.threads)[0],
+                    scale.thumb,
+                    scale.label,
+                )
+                for scale in self.extra_scales
+            ]
+            self._computers = (fc, extras)
+        return self._computers
 
     def _compute_block_ranges(self) -> tuple[RangeTable, RangeTable]:
         """Offset tables indexing the per-cell array and the broadcast vector."""
@@ -488,9 +512,11 @@ class FeatureExtractor:
         return tuple(banks), bvec
 
     def close(self) -> None:
-        """Drop the imfeat computers (their worker threads are joined by the destructor)."""
-        self.fc = None
-        self.extra_computers = []
+        """Drop the imfeat computers (their worker threads are joined by the destructor).
+
+        The next pass builds them again; a host feeding :meth:`compose` never needs them.
+        """
+        self._computers = None
 
     @property
     def front_end_spec(self) -> dict[str, Any]:
@@ -543,8 +569,8 @@ class FeatureExtractor:
         half of :meth:`extract`; a host with its own imfeat pass calls it directly.
         """
         maps = self._load_level_maps(result, "imfeat")
-        if len(extra_results) != len(self.extra_computers):
-            msg = f"expected {len(self.extra_computers)} extra-scale results, got {len(extra_results)}"
+        if len(extra_results) != len(self.extra_scales):
+            msg = f"expected {len(self.extra_scales)} extra-scale results, got {len(extra_results)}"
             raise ValueError(msg)
         extra_maps = [self._load_level_maps(r, "extra scale") for r in extra_results]
         for level_maps_of_scale in (maps, *extra_maps):
