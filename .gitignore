@@ -13,3 +13,4 @@ dist/
 *.exe
 *.obj
 .phash_cache.json
+_native/

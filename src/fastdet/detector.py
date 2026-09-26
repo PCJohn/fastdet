@@ -12,6 +12,7 @@ import dataclasses
 import json
 import os
 import tempfile
+import warnings
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -54,6 +55,23 @@ UInt8Array = NDArray[np.uint8]
 
 
 _LARGE_MATRIX_GIB = 8.0  # above this the fit prints how to shrink the training matrix
+
+
+_warned_no_native = False
+
+
+def _load_native_or_warn(blob: bytes) -> NativeScorer | None:
+    """The in-process C++ scorer, or ``None`` with a one-time warning about the slow fallback."""
+    global _warned_no_native  # noqa: PLW0603 -- one warning per process
+    native = load_native(blob)
+    if native is None and not _warned_no_native:
+        _warned_no_native = True
+        warnings.warn(
+            "fastdet_native (the C++ scorer) was not found; predictions use the NumPy runtime, which is "
+            "bit-identical but hundreds of times slower. Run `fastdet-native-build` once (or set FASTDET_NATIVE_LIB).",
+            stacklevel=3,
+        )
+    return native
 
 
 class Detector:
@@ -115,7 +133,7 @@ class Detector:
         det.col_keep = det._columns_for(det.feature_names)
         det.metrics = dict(artifact.metadata)
         det.exit_stages = list(det.runtime.exit_stages)
-        det.native = load_native(artifact.blob)
+        det.native = _load_native_or_warn(artifact.blob)
         return det
 
     @property
@@ -272,7 +290,9 @@ class Detector:
         blob, info = self._build_blob()
         runtime = parse_blob(blob)
         self.runtime = runtime
-        self.native = load_native(blob)  # the same engine a loaded model uses, when it is built
+        self.native = _load_native_or_warn(
+            blob
+        )  # the same engine a loaded model uses, when it is built
         self.metrics.update(info)
         if self.col_keep is not None and self.base_names is not None:
             self.feature_names = [self.base_names[int(i)] for i in self.col_keep]

@@ -26,6 +26,17 @@ Runtime dependencies are `numpy`, `opencv-python`, `imfeat`, and `catboost`.
 `yaml` adds PyYAML for YAML configs; `dev` adds the test and lint tools. Drop
 both extras for a minimal install.
 
+Then build the C++ scorer once and install it into the package:
+
+```
+fastdet-native-build          # cmake on cpp/, copies fastdet_native into fastdet/_native/
+```
+
+Without it `Detector` still works but scores with the NumPy runtime, which is
+bit-identical and hundreds of times slower; every entry point warns when that happens.
+`FASTDET_NATIVE_LIB=path` (or `--native-lib` on the commands) points at a library built
+elsewhere. Needs `cmake` and a C++17 compiler (Visual Studio Build Tools on Windows).
+
 ## Quickstart
 
 ```python

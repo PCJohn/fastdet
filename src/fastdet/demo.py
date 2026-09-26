@@ -303,10 +303,14 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901 -- the display loo
 
         os.environ["FASTDET_NATIVE_LIB"] = str(args.native_lib)
     det = Detector.load(args.model)
+    if det.native is None:
+        print(
+            "[fastdet-demo] WARNING: the C++ scorer (fastdet_native) was not found; scoring with the NumPy runtime,"
+            " hundreds of times slower. Run `fastdet-native-build` once, or pass --native-lib / set FASTDET_NATIVE_LIB.",
+            file=sys.stderr,
+        )
     target = (
-        det.native.target
-        if det.native is not None
-        else "NumPy runtime: build cpp/ for the C++ scorer"
+        det.native.target if det.native is not None else "NumPy runtime: run fastdet-native-build"
     )
     frames, live = _frames(args.source)
     view = LatencyView(target=target, live=live, headless=args.headless)
