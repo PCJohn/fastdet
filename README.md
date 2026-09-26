@@ -117,17 +117,43 @@ source resolution to crop or overlay. The C++ runtime scores the same file; see
 
 ## Threads
 
-imfeat partitions its pass by cell, so its output is bit-identical for any thread count;
-`Detector(..., threads=n)`, `Detector.load(path, threads=n)` and `fastdet-demo --threads n`
-set how many it uses (default: the machine's cores, at most 4). At 1024 px and stride 1
-the pass is ~9 ms single-threaded; on a 22-thread laptop two threads took a frame's
-feature extraction from 17 to 10 ms and eight to 9, so the default stops at four and
-`--threads` is the knob to check on a given machine. Training extraction uses the
-same setting. `Detector.close()` releases the front-end (joins imfeat's threads) and
-the scorer explicitly; long-running hosts and scripts should call it before exit. The
-model itself runs on one thread: at ~0.5 ms it has little to gain, and its tiles are
-independent, so a threaded scorer (tile ranges per thread, bit-identical) is possible
-when the front-end has become cheap enough for it to matter.
+Both halves of a frame run on a small thread pool, and both are bit-identical at any
+thread count: imfeat partitions its pass by cell, the scorer partitions its pass by
+tile (below). `Detector(..., threads=n)`, `Detector.load(path, threads=n)` and
+`fastdet-demo --threads n` set one count for both (default: the machine's cores, at
+most 4; `NativeScorer(blob, threads=n)` sets the scorer alone). The workers park on a
+condition variable between frames, so a frame costs one wake-up per pool, not thread
+creation, and idle detectors use no CPU. `Detector.close()` joins both pools; call it
+in long-running hosts and before interpreter shutdown on Windows, where joining threads
+during DLL unload can stall the process (the demo does).
+
+What to expect: at 1024 px and stride 1 the imfeat pass is ~9 ms single-threaded; on a
+22-thread laptop two threads took a frame's feature extraction from 17 to 10 ms and
+eight to 9, so the default stops at four and `--threads` is the knob to check on a
+given machine. The scorer's pass is ~0.5 ms, so its gain flattens sooner: for the
+benchmark's random 1178-column model (`pytest -s tests/test_latency.py` prints the
+one-thread and threaded rows), an AVX2 build on a 2-core VM went from 0.45 ms to
+0.35 ms on two threads. Training extraction uses the same setting.
+
+How the scorer splits a pass, in three phases separated by barriers, with no thread
+reading what another writes inside a phase:
+
+1. **Binning by feature.** The threads take the features round robin and bin whole
+   planes (side-32 and coarse features; side-64 features wait for the exit).
+2. **Coarse tier by unit.** A unit is one vector of tiles (32 with 256-bit vectors,
+   64 with 512-bit); each thread runs the tile-constant trees on its own units,
+   applies the coarse tier's exit stage to its packs and writes the probabilities of
+   the packs it dropped.
+3. **Fine tier by block.** The packs still alive are dealt out again in balanced,
+   cache-line-aligned blocks -- text clusters, so the fine tier's work does not
+   follow the tile layout -- and each thread bins its packs' side-64 features
+   lazily, runs the fine trees and the remaining exit stages on them, and writes
+   their probabilities.
+
+Every cell's total is the same integer sum whichever thread adds it up, and the
+integer-to-probability step is one vector expression, so the output does not depend
+on the thread count. A `NativeScorer` scores one image at a time (calls are
+serialised); the GIL is released while it runs.
 
 ## Demo (`fastdet-demo`)
 
@@ -451,16 +477,18 @@ model, bins the native-resolution features, walks the trees and reports timings.
 Build it with CMake (Highway is fetched automatically) and run:
 
 ```
-fastdet_score model.fdt fixture.f32 [expected.f32] [iters] [stages]
+fastdet_score model.fdt fixture.f32 [expected.f32|-] [iters] [stages|-] [threads]
 ```
 
 `fixture.f32` is `Detector.native_matrix(image)` as little-endian float32,
 `expected.f32` the Python runtime's full probabilities (`predict_grid(...,
 use_exit=False)`). The program gates itself: the tile binner must reproduce the
-reference bins exactly and the SIMD traversal must reproduce the scalar integer
-reference to the bit, and it exits non-zero otherwise. `stages` overrides the blob's
-calibrated exit stages (`trees:theta,...`, applied at chunk ends; an empty string
-disables the exit).
+reference bins exactly, the SIMD traversal must reproduce the scalar integer
+reference to the bit, and the threaded pass must reproduce the single-threaded one
+to the bit; it exits non-zero otherwise. `stages` overrides the blob's calibrated
+exit stages (`trees:theta,...`, applied at chunk ends; an empty string disables the
+exit, `-` keeps the blob's). `threads` is the thread count of the threaded rows
+(default: the cores, at most 4).
 
 What it does, in order:
 
@@ -480,11 +508,13 @@ What it does, in order:
    group's codes is fetched with one byte shuffle and added into byte-lane sums,
    which are widened once per chunk of trees with the chunk's shift into the
    integer totals. No float arithmetic until the final score.
-5. **Score.** `sigmoid(sum(offsets) + total * 2**e_min)` per cell, in row-major order.
+5. **Score.** `sigmoid(sum(offsets) + total * 2**e_min)` per cell (Highway's vector
+   `Exp`, within 1 ulp of `std::exp`), written the moment a pack's total is final.
 
 Timings printed: `tile binner`, `simd traversal` (every tree on every cell),
 `model total` (binning + full traversal) and `model, as shipped` (lazy binning,
-coarse tier per tile, early exit) -- the last one is the production number.
+coarse tier per tile, early exit) -- the last one is the production number -- each
+followed by the same pass on `threads` threads (see [Threads](#threads)).
 
 ## Training time and memory
 

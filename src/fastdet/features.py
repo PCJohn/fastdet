@@ -62,9 +62,9 @@ __all__ = [
     "parse_level_list",
 ]
 
-_MAX_DEFAULT_THREADS = (
-    4  # imfeat threads by default: 2 -> most of the gain, 8 measured no better than 4
-)
+# Default thread count of imfeat and of the scorer: for imfeat, 2 gave most of the gain and 8
+# measured no better than 4; the scorer's pass is ~10x shorter, so its gain flattens sooner.
+_MAX_DEFAULT_THREADS = 4
 Image = NDArray[np.uint8]
 FloatArray = NDArray[np.float32]
 
@@ -306,7 +306,7 @@ def compute_global_stats(global_raw: FloatArray, orig_h: int, orig_w: int) -> Fl
 
 
 def default_threads() -> int:
-    """Imfeat threads used when none are given: the machine's cores, at most 8."""
+    """Threads used when none are given (imfeat and the scorer): the cores, at most 4."""
     return max(1, min(_MAX_DEFAULT_THREADS, os.cpu_count() or 1))
 
 

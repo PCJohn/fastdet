@@ -5,8 +5,7 @@ Two totals are reported separately because they scale with different things:
 * **model inference** -- binning the features to 4-bit codes, then walking every tree
   for every cell.  It runs on the fixed 64x64 output grid, so its cost is set by the
   kept column count, the tree count and the depth, and is **the same for any input
-  image size**.  Leaf values are float32: the shipped blob has no low-precision leaf
-  format, whatever the leaf-quantisation ablations measured.
+  image size**.
 * **front-end** -- turning an image into those features: resize, colour conversion,
   imfeat's pass, the context banks, and packing the result for the scorer.  This is
   what the input size changes.
@@ -201,6 +200,7 @@ def _report_model(name: str, out: str) -> None:
     target = re.search(r"simd target: (\S+?),", out)
     varying = re.search(r"trees by varying splits: (.+)", out)
     shipped = re.search(r"model, as shipped:\s*([\d.]+) ms", out)
+    threaded = re.search(r"model, as shipped, (\d+) threads:\s*([\d.]+) ms", out)
     print(
         f"   {name:<24s} bin features {_ms('tile binner', out):6.3f} ms"
         f" + walk trees {_ms('simd traversal', out):6.3f} ms"
@@ -208,6 +208,11 @@ def _report_model(name: str, out: str) -> None:
         + (
             f"\n{'':27s} as shipped (coarse tier per tile, exit, lazy binning): {float(shipped.group(1)):6.3f} ms"
             if shipped
+            else ""
+        )
+        + (
+            f"\n{'':27s} as shipped, on {threaded.group(1)} threads: {float(threaded.group(2)):6.3f} ms"
+            if threaded
             else ""
         )
     )
@@ -218,10 +223,10 @@ def _report_model(name: str, out: str) -> None:
 
 
 def test_model_inference_latency(scorer: Path, scratch: Path) -> None:
-    """Binning + tree traversal for the whole 64x64 grid, one thread."""
+    """Binning + tree traversal for the whole 64x64 grid, on one thread and on the default count."""
     print(
         f"\n[fastdet-lat] MODEL INFERENCE -- {N_TREES} trees x depth {DEPTH}, "
-        f"{GRID * GRID} cells, low-bit leaf codes, one thread."
+        f"{GRID * GRID} cells, low-bit leaf codes, one thread (and the default thread count)."
     )
     print("              'bin features' = float features -> 4-bit bins, once per")
     print("              distinct value; 'walk trees' = every tree on every cell.")
@@ -244,13 +249,16 @@ def test_model_inference_latency(scorer: Path, scratch: Path) -> None:
         runs = [_run_scorer(scorer, *paths) for _ in range(2)]
         for out in runs:
             assert "0 mismatches PASS" in out  # binner agrees with the reference binner
-            assert "BIT-IDENTICAL" in out  # SIMD traversal agrees with the scalar one
+            assert "DIVERGED" not in out  # SIMD vs scalar, and threads vs one thread: bit-identical
         out = min(runs, key=lambda text: _ms("model total", text))  # the less disturbed run
         label = f"random, {n_features} columns, {bits}-bit leaves"
         _report_model(label, out)
     print("   'as shipped' uses a synthetic exit stage that keeps half of the tiles after the")
     print("   coarse tier (random leaves cannot be calibrated); a fitted model's stages are")
     print("   calibrated on its training images and its share of alive tiles depends on the frame.")
+    print(
+        "   The threaded row is the same pass split by tiles (bit-identical), default thread count."
+    )
 
 
 def _strides_for(size: int) -> tuple[int, ...]:

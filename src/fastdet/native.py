@@ -13,6 +13,8 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
+from .features import default_threads
+
 if TYPE_CHECKING:
     from numpy.typing import NDArray
 
@@ -20,14 +22,20 @@ __all__ = ["NativeScorer", "load_scorer"]
 
 
 class NativeScorer:
-    """One loaded model in the C++ scorer."""
+    """One loaded model in the C++ scorer, with its worker threads.
 
-    def __init__(self, blob: bytes) -> None:
+    ``threads`` is how many threads score each image (``None`` = :func:`default_threads`);
+    the output is bit-identical at any count.  The workers park between images and are
+    joined when the scorer is dropped (:meth:`Detector.close` does that explicitly).
+    """
+
+    def __init__(self, blob: bytes, threads: int | None = None) -> None:
         """Load ``blob`` (an FDT1 container or bare IMSY blob) into the extension."""
         ext = _extension()
-        self._scorer = ext.Scorer(blob)
+        self._scorer = ext.Scorer(blob, threads if threads is not None else default_threads())
         self.native_size = int(self._scorer.native_size)  # floats in Detector.native_matrix
         self.cells = int(self._scorer.cells)
+        self.threads = int(self._scorer.threads)  # the count actually used (clamped to 1..16)
         self.target = str(ext.target())  # the SIMD target the module was compiled for
 
     def score(self, native: NDArray[np.floating], *, use_exit: bool = True) -> NDArray[np.float32]:
@@ -47,6 +55,6 @@ def _extension() -> Any:
         raise ImportError(msg) from exc
 
 
-def load_scorer(blob: bytes) -> NativeScorer:
-    """The C++ scorer for ``blob``."""
-    return NativeScorer(blob)
+def load_scorer(blob: bytes, threads: int | None = None) -> NativeScorer:
+    """The C++ scorer for ``blob`` on ``threads`` threads (``None`` = :func:`default_threads`)."""
+    return NativeScorer(blob, threads)

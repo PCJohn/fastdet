@@ -49,6 +49,37 @@ def test_scorer_rejects_garbage() -> None:
         load_scorer(b"not a model")
 
 
+def test_threaded_scorer_is_bit_identical(
+    tiny_dataset: tuple[Path, Path], small_config: Config, tmp_path: Path
+) -> None:
+    """Any thread count gives the same bytes as one thread, with and without the exit."""
+    images_dir, masks_dir = tiny_dataset
+    det = Detector(small_config).fit(images_dir, masks_dir, evaluate=False)
+    blob = (det.export(tmp_path / "model.fdt")).read_bytes()
+    single = load_scorer(blob, threads=1)
+    assert single.threads == 1
+    assert load_scorer(blob, threads=0).threads == 1  # clamped
+    assert load_scorer(blob, threads=1000).threads == 16  # clamped
+    natives = [det.native_matrix(sample) for sample in sorted(images_dir.glob("*.png"))[:3]]
+    for threads in (2, 3, 5, 16):
+        scorer = load_scorer(blob, threads=threads)
+        assert scorer.threads == threads
+        for native in natives:
+            for use_exit in (False, True):
+                np.testing.assert_array_equal(
+                    scorer.score(native, use_exit=use_exit),
+                    single.score(native, use_exit=use_exit),
+                )
+    # the detector's own scorer follows its thread setting
+    loaded = Detector.load(tmp_path / "model.fdt", threads=2)
+    assert loaded.native is not None
+    assert loaded.native.threads == 2
+    first = sorted(images_dir.glob("*.png"))[0]
+    np.testing.assert_array_equal(loaded.predict_proba(first), det.predict_proba(first))
+    loaded.close()
+    det.close()
+
+
 def test_native_scorer_latency(
     tiny_dataset: tuple[Path, Path], small_config: Config, tmp_path: Path
 ) -> None:
@@ -70,6 +101,7 @@ def test_native_scorer_latency(
         det.native.score(native)
     t2 = time.perf_counter()
     print(
-        f"\n[fastdet-lat] IN-PROCESS ({det.native.target}): front-end {1e3 * (t1 - t0) / reps:.3f} ms"
+        f"\n[fastdet-lat] IN-PROCESS ({det.native.target}, {det.native.threads} thread(s)):"
+        f" front-end {1e3 * (t1 - t0) / reps:.3f} ms"
         f" + C++ model {1e3 * (t2 - t1) / reps:.3f} ms per image (tiny test model: {det.runtime.n_trees} trees)"
     )

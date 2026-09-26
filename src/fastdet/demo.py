@@ -303,7 +303,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--threads",
         type=int,
         default=None,
-        help="imfeat threads for the front-end (default: cores, at most 4)",
+        help="threads for the front-end and the model (default: cores, at most 4)",
     )
     return parser
 
@@ -313,6 +313,7 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901 -- the display loo
     args = build_parser().parse_args(argv)
     det = Detector.load(args.model, threads=args.threads)
     target = det.native.target if det.native is not None else "unknown"
+    model_threads = det.native.threads if det.native is not None else 1
     frames, live = _frames(args.source)
     view = LatencyView(target=target, live=live, headless=args.headless)
     feature_hist: collections.deque[float] = collections.deque(maxlen=HISTORY)
@@ -357,12 +358,12 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901 -- the display loo
         view.close()
         if hasattr(frames, "close"):
             frames.close()  # releases the capture
-        det.close()  # joins imfeat's worker threads now, not during interpreter shutdown
+        det.close()  # joins the worker threads now, not during interpreter shutdown
         gc.collect()
     if feature_hist:
         print(
             f"[fastdet-demo] {len(feature_hist)} frame(s): feature extraction median {np.median(feature_hist):.2f} ms,"
-            f" model median {np.median(model_hist):.2f} ms ({target})"
+            f" model median {np.median(model_hist):.2f} ms ({target}, {model_threads} thread(s))"
         )
     return 0
 

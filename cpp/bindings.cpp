@@ -1,8 +1,7 @@
 // nanobind module `fastdet._native_ext`: the C++ scorer as a Python extension, built by pip.
 //
 // Wraps the C API at the end of fastdet_score.cpp (compiled into this module with
-// FASTDET_LIBRARY=1) so `pip install .` yields an in-process scorer with no separate build
-// step; fastdet.native prefers it and falls back to the ctypes-loaded shared library.
+// FASTDET_LIBRARY=1) so `pip install .` yields an in-process scorer with no separate build step.
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
 #include <nanobind/stl/string.h>
@@ -15,10 +14,11 @@
 namespace nb = nanobind;
 
 extern "C" {
-void* fastdet_open(const uint8_t* bytes, size_t size);
+void* fastdet_open(const uint8_t* bytes, size_t size, size_t threads);
 void fastdet_close(void* handle);
 size_t fastdet_native_size(void* handle);
 size_t fastdet_cells(void* handle);
+size_t fastdet_threads(void* handle);
 const char* fastdet_target();
 int fastdet_score(void* handle, const float* native, float* out, int use_exit);
 }
@@ -27,19 +27,22 @@ namespace {
 
 class Scorer {
  public:
-  explicit Scorer(nb::bytes blob) : handle_(fastdet_open(reinterpret_cast<const uint8_t*>(blob.c_str()), blob.size())) {
+  Scorer(nb::bytes blob, size_t threads)
+      : handle_(fastdet_open(reinterpret_cast<const uint8_t*>(blob.c_str()), blob.size(), threads)) {
     if (handle_ == nullptr) throw std::invalid_argument("the C++ scorer rejected the model blob");
   }
   ~Scorer() {
-    if (handle_ != nullptr) fastdet_close(handle_);
+    if (handle_ != nullptr) fastdet_close(handle_);  // joins the scorer's worker threads
   }
   Scorer(const Scorer&) = delete;
   Scorer& operator=(const Scorer&) = delete;
 
   size_t native_size() const { return fastdet_native_size(handle_); }
   size_t cells() const { return fastdet_cells(handle_); }
+  size_t threads() const { return fastdet_threads(handle_); }
 
   // native: Detector.native_matrix as a contiguous float32 array; returns kCells probabilities.
+  // The GIL is released while the scorer runs.
   nb::ndarray<nb::numpy, float, nb::ndim<1>> score(
       nb::ndarray<const float, nb::ndim<1>, nb::c_contig, nb::device::cpu> native, bool use_exit) {
     if (native.shape(0) != native_size())
@@ -48,7 +51,11 @@ class Scorer {
     const size_t n = cells();
     float* out = new float[n];
     nb::capsule owner(out, [](void* p) noexcept { delete[] static_cast<float*>(p); });
-    const int status = fastdet_score(handle_, native.data(), out, use_exit ? 1 : 0);
+    int status = 0;
+    {
+      const nb::gil_scoped_release nogil;
+      status = fastdet_score(handle_, native.data(), out, use_exit ? 1 : 0);
+    }
     if (status != 0) throw std::runtime_error("the C++ scorer failed with status " + std::to_string(status));
     return nb::ndarray<nb::numpy, float, nb::ndim<1>>(out, {n}, owner);
   }
@@ -63,9 +70,11 @@ NB_MODULE(_native_ext, m) {
   m.doc() = "fastdet's C++ scorer (Highway SIMD), built with the package";
   m.def("target", [] { return std::string(fastdet_target()); }, "the SIMD target this module was compiled for");
   nb::class_<Scorer>(m, "Scorer")
-      .def(nb::init<nb::bytes>(), nb::arg("blob"), "load an FDT1 container or bare IMSY blob")
+      .def(nb::init<nb::bytes, size_t>(), nb::arg("blob"), nb::arg("threads") = 1,
+           "load an FDT1 container or bare IMSY blob; threads >= 1 score each image together")
       .def_prop_ro("native_size", &Scorer::native_size, "floats in Detector.native_matrix for this model")
       .def_prop_ro("cells", &Scorer::cells, "cells in the output grid (64 x 64)")
+      .def_prop_ro("threads", &Scorer::threads, "threads a pass runs on (the request, capped by the SIMD width)")
       .def("score", &Scorer::score, nb::arg("native"), nb::arg("use_exit") = true,
            "probabilities (row-major grid) for one native-resolution feature matrix");
 }

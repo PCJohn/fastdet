@@ -80,8 +80,9 @@ class Detector:
 
         ``config`` may be a full :class:`Config` or just a :class:`ModelConfig`;
         ``**model_overrides`` (e.g. ``depth=7``) are applied on top of it.  ``threads``
-        is imfeat's thread count for the front-end (``None`` = the machine's cores, at
-        most 4); it changes speed only, the features are bit-identical at any count.
+        is the thread count of both the front-end (imfeat) and the C++ scorer (``None`` =
+        the machine's cores, at most 4); it changes speed only, features and scores are
+        bit-identical at any count.
         """
         resolved = config or Config()
         # Accept a plain ModelConfig too, so Detector(ModelConfig(depth=7)) works.
@@ -91,7 +92,7 @@ class Detector:
             model = dataclasses.replace(resolved.model, **model_overrides)
             resolved = dataclasses.replace(resolved, model=model)
         self.config = resolved
-        self.threads = threads  # imfeat threads for the front-end (None = default_threads())
+        self.threads = threads  # front-end and scorer threads (None = default_threads())
 
         self.booster: CatBoostClassifier | None = None  # when training in-process
         self.runtime: ImysModel | None = None  # scoring engine (fitted or loaded)
@@ -116,7 +117,7 @@ class Detector:
     def load(cls, path: str | Path, threads: int | None = None) -> Detector:
         """Load a detector from a single-file artifact written by :meth:`export`.
 
-        ``threads`` is imfeat's thread count for the front-end (see :meth:`__init__`).
+        ``threads`` is the front-end's and the scorer's thread count (see :meth:`__init__`).
         """
         artifact = ModelArtifact.load(path)
         det = cls(config=artifact.config, threads=threads)
@@ -126,7 +127,7 @@ class Detector:
         det.col_keep = det._columns_for(det.feature_names)
         det.metrics = dict(artifact.metadata)
         det.exit_stages = list(det.runtime.exit_stages)
-        det.native = load_scorer(artifact.blob)
+        det.native = load_scorer(artifact.blob, threads)
         return det
 
     @property
@@ -283,7 +284,7 @@ class Detector:
         blob, info = self._build_blob()
         runtime = parse_blob(blob)
         self.runtime = runtime
-        self.native = load_scorer(blob)
+        self.native = load_scorer(blob, self.threads)
         self.metrics.update(info)
         if self.col_keep is not None and self.base_names is not None:
             self.feature_names = [self.base_names[int(i)] for i in self.col_keep]
@@ -351,7 +352,7 @@ class Detector:
         return cast("UInt8Array", np.asarray(image))  # no dtype coercion, as before
 
     def close(self) -> None:
-        """Release the front-end (imfeat's worker threads are joined) and the scorer.
+        """Release the front-end and the scorer, joining both pools' worker threads.
 
         Python's refcounting does this when the detector is garbage-collected; call
         it explicitly in long-running hosts, or before interpreter shutdown on
@@ -378,8 +379,7 @@ class Detector:
         For hosts that run imfeat themselves (framegate): make the thumbnail and the
         ``FeatureComputer`` exactly as :attr:`front_end_spec` says, pass its result and
         the original frame's ``(height, width)``, and fastdet skips its own pass.  Same
-        map as :meth:`predict_proba` on the frame, through the same scorer (C++ when
-        the library is built, NumPy otherwise).
+        map as :meth:`predict_proba` on the frame, through the same C++ scorer.
         """
         if self.runtime is None:
             msg = "detector is not fitted; call fit() or load()"
