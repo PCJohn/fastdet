@@ -105,7 +105,7 @@ class LatencyView:
         self.quit = False
         self.paused = False
         self.save_requested = False
-        self.fig = plt.figure(figsize=(14, 6.5), facecolor="#181818")
+        self.fig = plt.figure(figsize=(14, 6.5), facecolor="#181818", layout="constrained")
         grid = self.fig.add_gridspec(
             2, 2, width_ratios=[3, 1.6], height_ratios=[1, 2.6], hspace=0.05
         )
@@ -155,7 +155,6 @@ class LatencyView:
         if not live:
             ax.set_xticks([])
             ax.set_yticks([])
-        self.fig.tight_layout()
         if not headless:
             self.fig.canvas.mpl_connect("key_press_event", self._on_key)
             self.fig.canvas.mpl_connect("close_event", lambda _event: setattr(self, "quit", True))

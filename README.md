@@ -32,7 +32,11 @@ Then build the C++ scorer once and install it into the package:
 fastdet-native-build          # cmake on cpp/, copies fastdet_native into fastdet/_native/
 ```
 
-Without it `Detector` still works but scores with the NumPy runtime, which is
+Run it from the repository root (it looks for `cpp/` there, or next to an editable
+install). A plain `pip install .` replaces the package directory, so repeat the
+command after each reinstall -- or use `pip install -e .`, which keeps the built
+library across reinstalls. `--build-dir build\pytest-cpp` reuses the test build.
+Without the library `Detector` still works but scores with the NumPy runtime, which is
 bit-identical and hundreds of times slower; every entry point warns when that happens.
 `FASTDET_NATIVE_LIB=path` (or `--native-lib` on the commands) points at a library built
 elsewhere. Needs `cmake` and a C++17 compiler (Visual Studio Build Tools on Windows).

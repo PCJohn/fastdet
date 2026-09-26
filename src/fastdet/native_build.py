@@ -36,7 +36,11 @@ _LIB_CANDIDATES = (
 def _cpp_dir() -> Path | None:
     """The ``cpp/`` source directory: next to ``src/`` in a checkout, else none."""
     here = Path(__file__).resolve().parent
-    for root in (here.parent.parent, here.parent):
+    for root in (
+        Path.cwd(),
+        here.parent.parent,
+        here.parent,
+    ):  # a checkout in the cwd, or an editable install
         if (root / "cpp" / "CMakeLists.txt").exists():
             return root / "cpp"
     return None
@@ -53,7 +57,7 @@ def main(argv: list[str] | None = None) -> int:
         "--cpp",
         type=Path,
         default=None,
-        help="the cpp/ directory (default: found from the checkout)",
+        help="the cpp/ directory (default: ./cpp, or the checkout of an editable install)",
     )
     parser.add_argument(
         "--build-dir", type=Path, default=None, help="CMake build directory (default: <cpp>/build)"
