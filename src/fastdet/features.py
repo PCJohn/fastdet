@@ -62,7 +62,9 @@ __all__ = [
     "parse_level_list",
 ]
 
-_MAX_DEFAULT_THREADS = 8  # imfeat threads by default; more buys little on a 1024-px pass
+_MAX_DEFAULT_THREADS = (
+    4  # imfeat threads by default: 2 -> most of the gain, 8 measured no better than 4
+)
 Image = NDArray[np.uint8]
 FloatArray = NDArray[np.float32]
 
@@ -484,6 +486,11 @@ class FeatureExtractor:
         if high > low:
             bvec[low:high] = global_vec[low:high]
         return tuple(banks), bvec
+
+    def close(self) -> None:
+        """Drop the imfeat computers (their worker threads are joined by the destructor)."""
+        self.fc = None
+        self.extra_computers = []
 
     @property
     def front_end_spec(self) -> dict[str, Any]:

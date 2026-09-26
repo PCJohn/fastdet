@@ -88,3 +88,16 @@ def test_view_stops_when_the_window_is_closed() -> None:
     view.pump()
     assert view.quit
     view.close()  # idempotent
+
+
+def test_detector_close_is_explicit_and_idempotent(
+    tiny_dataset: tuple[Path, Path], small_config: Config, tmp_path: Path
+) -> None:
+    images_dir, masks_dir = tiny_dataset
+    det = Detector.load(
+        Detector(small_config).fit(images_dir, masks_dir, evaluate=False).export(tmp_path / "m.fdt")
+    )
+    assert det.native is not None
+    det.close()
+    det.close()
+    assert det.native is None

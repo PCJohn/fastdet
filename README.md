@@ -119,9 +119,12 @@ source resolution to crop or overlay. The C++ runtime scores the same file; see
 
 imfeat partitions its pass by cell, so its output is bit-identical for any thread count;
 `Detector(..., threads=n)`, `Detector.load(path, threads=n)` and `fastdet-demo --threads n`
-set how many it uses (default: the machine's cores, at most 8). At 1024 px and stride 1
-the pass is ~9 ms single-threaded and scales close to linearly, so this is the largest
-latency lever on a multi-core machine; training extraction uses the same setting. The
+set how many it uses (default: the machine's cores, at most 4). At 1024 px and stride 1
+the pass is ~9 ms single-threaded; on a 22-thread laptop two threads took a frame's
+feature extraction from 17 to 10 ms and eight to 9, so the default stops at four and
+`--threads` is the knob to check on a given machine. Training extraction uses the
+same setting. `Detector.close()` releases the front-end (joins imfeat's threads) and
+the scorer explicitly; long-running hosts and scripts should call it before exit. The
 model itself runs on one thread: at ~0.5 ms it has little to gain, and its tiles are
 independent, so a threaded scorer (tile ranges per thread, bit-identical) is possible
 when the front-end has become cheap enough for it to matter.

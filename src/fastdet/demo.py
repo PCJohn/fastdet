@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import gc
 import sys
 import time
 from pathlib import Path
@@ -302,7 +303,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--threads",
         type=int,
         default=None,
-        help="imfeat threads for the front-end (default: cores, at most 8)",
+        help="imfeat threads for the front-end (default: cores, at most 4)",
     )
     return parser
 
@@ -348,14 +349,16 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901 -- the display loo
     except KeyboardInterrupt:
         print("\n[fastdet-demo] interrupted")
     finally:
-        if hasattr(frames, "close"):
-            frames.close()  # releases the capture
         if args.output is not None and n and not view.closed:
             view.save(args.output)
             print(f"[fastdet-demo] wrote {args.output}")
         if not args.headless and not live and not view.quit:
             view.block()
         view.close()
+        if hasattr(frames, "close"):
+            frames.close()  # releases the capture
+        det.close()  # joins imfeat's worker threads now, not during interpreter shutdown
+        gc.collect()
     if feature_hist:
         print(
             f"[fastdet-demo] {len(feature_hist)} frame(s): feature extraction median {np.median(feature_hist):.2f} ms,"

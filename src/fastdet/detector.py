@@ -81,7 +81,7 @@ class Detector:
         ``config`` may be a full :class:`Config` or just a :class:`ModelConfig`;
         ``**model_overrides`` (e.g. ``depth=7``) are applied on top of it.  ``threads``
         is imfeat's thread count for the front-end (``None`` = the machine's cores, at
-        most 8); it changes speed only, the features are bit-identical at any count.
+        most 4); it changes speed only, the features are bit-identical at any count.
         """
         resolved = config or Config()
         # Accept a plain ModelConfig too, so Detector(ModelConfig(depth=7)) works.
@@ -349,6 +349,18 @@ class Detector:
                 raise ValueError(msg)
             return decoded
         return cast("UInt8Array", np.asarray(image))  # no dtype coercion, as before
+
+    def close(self) -> None:
+        """Release the front-end (imfeat's worker threads are joined) and the scorer.
+
+        Python's refcounting does this when the detector is garbage-collected; call
+        it explicitly in long-running hosts, or before interpreter shutdown on
+        Windows, where joining threads during DLL unload can stall the process.
+        """
+        if self._extractor is not None:
+            self._extractor.close()
+            self._extractor = None
+        self.native = None
 
     @property
     def front_end_spec(self) -> dict[str, Any]:
