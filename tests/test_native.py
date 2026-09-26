@@ -10,6 +10,15 @@ import pytest
 
 from fastdet import Detector
 from fastdet.native import NativeScorer, load_scorer
+from fastdet.runtime import parse_blob
+from random_model import random_model
+
+THREAD_COUNTS = (
+    2,
+    3,
+    5,
+    16,
+)  # past the vectors of tiles a pass has (4, 8 or 16): some threads own none
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -60,19 +69,9 @@ def test_scorer_rejects_garbage() -> None:
         load_scorer(b"not a model")
 
 
-def test_threaded_scorer_is_bit_identical(
-    tiny_dataset: tuple[Path, Path], tiny_model: Path
-) -> None:
-    """Any thread count gives the same bytes as one thread, with and without the exit."""
-    images_dir, _masks_dir = tiny_dataset
-    blob = tiny_model.read_bytes()
+def _assert_threads_agree(blob: bytes, natives: list[np.ndarray]) -> None:
     single = load_scorer(blob, threads=1)
-    assert single.threads == 1
-    assert load_scorer(blob, threads=0).threads == 1  # clamped
-    assert load_scorer(blob, threads=1000).threads == 16  # clamped
-    det = Detector.load(tiny_model)
-    natives = [det.native_matrix(sample) for sample in sorted(images_dir.glob("*.png"))[:3]]
-    for threads in (2, 3, 5, 16):
+    for threads in THREAD_COUNTS:
         scorer = load_scorer(blob, threads=threads)
         assert scorer.threads == threads
         for native in natives:
@@ -80,7 +79,21 @@ def test_threaded_scorer_is_bit_identical(
                 np.testing.assert_array_equal(
                     scorer.score(native, use_exit=use_exit),
                     single.score(native, use_exit=use_exit),
+                    err_msg=f"{threads} threads, use_exit={use_exit}",
                 )
+
+
+def test_threaded_scorer_is_bit_identical_on_a_fitted_model(
+    tiny_dataset: tuple[Path, Path], tiny_model: Path
+) -> None:
+    """Any thread count gives the same bytes as one thread, with and without the exit."""
+    images_dir, _masks_dir = tiny_dataset
+    blob = tiny_model.read_bytes()
+    assert load_scorer(blob, threads=0).threads == 1  # clamped
+    assert load_scorer(blob, threads=1000).threads == 16  # clamped
+    det = Detector.load(tiny_model)
+    natives = [det.native_matrix(sample) for sample in sorted(images_dir.glob("*.png"))[:3]]
+    _assert_threads_agree(blob, natives)
     # the detector's own scorer follows its thread setting
     loaded = Detector.load(tiny_model, threads=2)
     assert loaded.native is not None
@@ -89,6 +102,24 @@ def test_threaded_scorer_is_bit_identical(
     np.testing.assert_array_equal(loaded.predict_proba(first), det.predict_proba(first))
     loaded.close()
     det.close()
+
+
+@pytest.mark.parametrize("leaf_bits", [4, 8])
+def test_threaded_scorer_is_bit_identical_through_every_exit(leaf_bits: int) -> None:
+    """Same, on a model whose stages are known to drop some packs and keep others.
+
+    The fitted model's calibrated stages may drop nothing on the tiny dataset, so this one
+    has a stage after the coarse tier and one inside the fine tier that each keep about
+    half of the tiles: every thread must apply both, including threads that owned no tiles
+    in the coarse tier and only receive packs afterwards.
+    """
+    blob, native, dense = random_model(300, leaf_bits=leaf_bits, fine_stage_keep=0.5)
+    runtime = parse_blob(blob)
+    assert len(runtime.exit_stages) == 2
+    full = runtime.predict_grid(dense, use_exit=False).reshape(-1)
+    exited = runtime.predict_grid(dense, use_exit=True).reshape(-1)
+    assert 0 < np.count_nonzero(exited != full) < full.size  # the stages bite, and not everywhere
+    _assert_threads_agree(blob, [native])
 
 
 def test_native_scorer_latency(tiny_dataset: tuple[Path, Path], tiny_model: Path) -> None:

@@ -119,7 +119,8 @@ struct ImysModel {
   std::vector<uint32_t> n_borders, border_offset;
   std::vector<float> borders;
   std::vector<uint8_t> level_shift;
-  std::vector<uint32_t> chunk_of;  // per tree
+  std::vector<uint32_t> chunk_of;       // per tree
+  std::vector<double> offsets_through;  // per chunk: the offsets of every tree up to its end
   double offset_sum = 0.0;
 
   uint32_t chunk_start(uint32_t c) const { return chunk_starts[c]; }
@@ -219,7 +220,12 @@ bool load_imys(const uint8_t* p, size_t size, ImysModel* m) {
     std::fprintf(stderr, "IMSY blob: %zu chunks, header says %u\n", m->chunk_starts.size(), m->n_chunks);
     return false;
   }
-  for (uint32_t t = 0; t < m->n_trees; ++t) m->offset_sum += m->offsets[t];
+  // running offsets, summed in tree order (the exit thresholds depend on that order)
+  m->offsets_through.assign(m->n_chunks, 0.0);
+  for (uint32_t c = 0; c < m->n_chunks; ++c) {
+    for (uint32_t t = m->chunk_start(c); t < m->chunk_end(c); ++t) m->offset_sum += m->offsets[t];
+    m->offsets_through[c] = m->offset_sum;
+  }
   return true;
 }
 
@@ -891,7 +897,8 @@ struct PassShared {
   bool lazy = false;
   bool prebinned = false;
   const std::vector<Stage>* stages = nullptr;
-  std::atomic<size_t> finished{0};  // packs that ran every tree
+  const int32_t* stage_at = nullptr;  // per chunk: the stage applied at its end, or -1
+  std::atomic<size_t> finished{0};    // packs that ran every tree
 };
 
 // One thread's share of a pass: chunk by chunk (the quantisation chunks are the passes), coarse
@@ -991,11 +998,10 @@ class Pass {
         run_tree<NP>(tr, active_.data(), active_.size(), bsum);
       }
       if (n_flat) coarse_trees_codes<NP>(m_, tm_, coarse_, flat, n_flat, tsum, lo, hi);
-      for (uint32_t t = t0; t < t1; ++t) offsets_done_ += m_.offsets[t];
       widen(fine_trees, lo, hi);
-      if (sh_.stages && next_stage_ < sh_.stages->size() && (*sh_.stages)[next_stage_].trees == t1) {
+      if (sh_.stage_at[c] >= 0) {  // a stage ends here: the totals must be final to test them
         fold();
-        exit_stage((*sh_.stages)[next_stage_++].theta);
+        exit_stage((*sh_.stages)[sh_.stage_at[c]].theta, m_.offsets_through[c]);
       }
     }
   }
@@ -1059,10 +1065,11 @@ class Pass {
     }
   }
 
-  // Drop every active pack whose cells are all below theta; their scores are final.
-  void exit_stage(double theta) {
+  // Drop every active pack whose cells are all below theta; their scores are final.  The trees
+  // run so far contribute `offsets_done` on top of the integer totals.
+  void exit_stage(double theta, double offsets_done) {
     // integer threshold: total * 2^e_min + offsets_done >= theta  <=>  total >= ceil((theta - offsets_done) / 2^e_min)
-    const double lim = std::ceil(std::ldexp(theta - offsets_done_, -m_.e_min));
+    const double lim = std::ceil(std::ldexp(theta - offsets_done, -m_.e_min));
     const int64_t theta_int = lim <= -9.0e18 ? INT64_MIN : lim >= 9.0e18 ? INT64_MAX : static_cast<int64_t>(lim);
     const hn::ScalableTag<int64_t> d64;
     const size_t l64 = hn::Lanes(d64);
@@ -1094,8 +1101,6 @@ class Pass {
   Scratch& s_;
   std::vector<uint16_t>& active_;
   int acc_shift_ = 0;
-  double offsets_done_ = 0.0;
-  size_t next_stage_ = 0;
 };
 
 constexpr size_t kMaxThreads = 16;  // beyond this a 64 x 64 grid has nothing left to share out
@@ -1111,6 +1116,7 @@ struct FastdetHandle {
   hwy::AlignedFreeUniquePtr<float[]> prob;
   std::vector<uint16_t> alive;
   std::vector<uint32_t> n_alive;
+  std::vector<int32_t> stage_at;  // per chunk, for the pass in progress
   std::vector<Scratch> scratch;
   Pool pool;
   std::mutex busy;
@@ -1125,6 +1131,7 @@ struct FastdetHandle {
         prob(hwy::AllocateAligned<float>(kCells)),
         alive(kPacks),
         n_alive(std::max<size_t>(1, std::min(threads, kMaxThreads))),
+        stage_at(model.n_chunks, -1),
         scratch(n_alive.size()),
         pool(n_alive.size()) {}
 
@@ -1143,6 +1150,14 @@ struct FastdetHandle {
     sh.lazy = opt.lazy && model.coarse_trees > 0;
     sh.prebinned = opt.prebinned;
     sh.stages = opt.stages;
+    // The stage ending at each chunk (stages elsewhere than a chunk end never apply): every
+    // thread reads its exits from the chunk index, whatever chunks it ran itself.
+    std::fill(stage_at.begin(), stage_at.end(), -1);
+    if (opt.stages)
+      for (size_t i = 0; i < opt.stages->size(); ++i)
+        for (uint32_t c = 0; c < model.n_chunks; ++c)
+          if (model.chunk_end(c) == (*opt.stages)[i].trees) stage_at[c] = static_cast<int32_t>(i);
+    sh.stage_at = stage_at.data();
     const size_t n = pool.size();
     pool.run([&](size_t t) {
       if (model.leaf_bits == 4)
@@ -1278,7 +1293,8 @@ int main(int argc, char** argv) {
   const size_t threads =
       argc >= 7 ? std::max<size_t>(1, std::strtoul(argv[6], nullptr, 10)) : std::min<size_t>(4, cores);
   FastdetHandle single(loaded, 1);
-  FastdetHandle multi(std::move(loaded), threads);
+  FastdetHandle multi(loaded, threads);
+  FastdetHandle many(std::move(loaded), kMaxThreads);  // gates only: more threads than units of tiles
   const ImysModel& model = single.model;
   const TiledModel& tiled = single.tiled;
   const std::vector<size_t>& offset = single.offset;
@@ -1308,11 +1324,12 @@ int main(int argc, char** argv) {
   const std::vector<float> dense = expand_native(model, xn.data(), offset);
   std::vector<uint8_t> full_bins(kCells * model.n_features);
   bin_full(model, dense.data(), kCells, full_bins.data());
-  std::vector<float> scalar_out(kCells), simd_out(kCells), multi_out(kCells);
+  std::vector<float> scalar_out(kCells), simd_out(kCells), multi_out(kCells), many_out(kCells);
   score_cells_scalar(model, full_bins.data(), kCells, scalar_out.data());
   const ScoreOptions plain;
   single.score(xn.data(), simd_out.data(), plain);
   multi.score(xn.data(), multi_out.data(), plain);
+  many.score(xn.data(), many_out.data(), plain);
   // binner gate: every plane against the dense bins, from both scorers
   size_t bin_mismatch = 0;
   for (const FastdetHandle* h : {&single, &multi}) {
@@ -1331,14 +1348,17 @@ int main(int argc, char** argv) {
     }
   }
   std::printf("tile binner == reference binner: %zu mismatches %s\n", bin_mismatch, bin_mismatch ? "FAIL" : "PASS");
-  float dv = 0.0f, dt = 0.0f;
+  float dv = 0.0f, dt = 0.0f, dm = 0.0f;
   for (size_t i = 0; i < kCells; ++i) {
     dv = std::max(dv, std::fabs(simd_out[i] - scalar_out[i]));
     dt = std::max(dt, std::fabs(multi_out[i] - simd_out[i]));
+    dm = std::max(dm, std::fabs(many_out[i] - simd_out[i]));
   }
   std::printf("simd vs scalar max|dprob| = %.3e  %s\n", dv, dv == 0.0f ? "BIT-IDENTICAL" : "DIVERGED");
   std::printf("%zu threads vs 1 max|dprob| = %.3e  %s\n", multi.threads(), dt,
               dt == 0.0f ? "BIT-IDENTICAL" : "DIVERGED");
+  std::printf("%zu threads vs 1 max|dprob| = %.3e  %s\n", many.threads(), dm,
+              dm == 0.0f ? "BIT-IDENTICAL" : "DIVERGED");
   float ds = 0.0f, da = 0.0f;
   if (argc >= 4 && std::strcmp(argv[3], "-") != 0) {
     const std::string expected = read_all(argv[3]);
@@ -1354,7 +1374,7 @@ int main(int argc, char** argv) {
     }
     std::printf("scalar max|got-expected| = %.3e\nsimd   max|got-expected| = %.3e\n", ds, da);
   }
-  if (bin_mismatch != 0 || dv != 0.0f || dt != 0.0f || ds > 1e-4f || da > 1e-4f) {
+  if (bin_mismatch != 0 || dv != 0.0f || dt != 0.0f || dm != 0.0f || ds > 1e-4f || da > 1e-4f) {
     std::printf("GATE FAILED\n");
     return 5;
   }
@@ -1365,23 +1385,25 @@ int main(int argc, char** argv) {
     exit_opt.stages = &stages;
     exit_opt.lazy = true;
     exit_opt.packs_finished = &finished;
-    std::vector<float> exit_out(kCells), exit_multi(kCells);
+    std::vector<float> exit_out(kCells), exit_multi(kCells), exit_many(kCells);
     single.score(xn.data(), exit_out.data(), exit_opt);
     multi.score(xn.data(), exit_multi.data(), exit_opt);
+    many.score(xn.data(), exit_many.data(), exit_opt);
     size_t same = 0;
-    float top_cut = 0.0f, dm = 0.0f;
+    float top_cut = 0.0f, de = 0.0f;
     for (size_t i = 0; i < kCells; ++i) {
       if (exit_out[i] == scalar_out[i])
         ++same;
       else
         top_cut = std::max(top_cut, scalar_out[i]);
-      dm = std::max(dm, std::fabs(exit_multi[i] - exit_out[i]));
+      de = std::max(de, std::max(std::fabs(exit_multi[i] - exit_out[i]), std::fabs(exit_many[i] - exit_out[i])));
     }
     std::printf(
         "early exit: %zu of %zu packs ran every tree; %zu of %zu cells bit-identical to the full scores; highest full "
-        "probability among the rest %.4f; %zu threads vs 1: %s\n",
-        finished, kPacks, same, kCells, top_cut, multi.threads(), dm == 0.0f ? "BIT-IDENTICAL" : "DIVERGED");
-    if (dm != 0.0f) {
+        "probability among the rest %.4f; %zu and %zu threads vs 1: %s\n",
+        finished, kPacks, same, kCells, top_cut, multi.threads(), many.threads(),
+        de == 0.0f ? "BIT-IDENTICAL" : "DIVERGED");
+    if (de != 0.0f) {
       std::printf("GATE FAILED\n");
       return 5;
     }

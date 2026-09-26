@@ -494,7 +494,8 @@ fastdet_score model.fdt fixture.f32 [expected.f32|-] [iters] [stages|-] [threads
 use_exit=False)`). The program gates itself: the tile binner must reproduce the
 reference bins exactly, the SIMD traversal must reproduce the scalar integer
 reference to the bit, and the threaded pass must reproduce the single-threaded one
-to the bit; it exits non-zero otherwise. `stages` overrides the blob's calibrated
+to the bit -- on `threads` threads and on the maximum of 16, where some threads own
+no tiles until the fine tier; it exits non-zero otherwise. `stages` overrides the blob's calibrated
 exit stages (`trees:theta,...`, applied at chunk ends; an empty string disables the
 exit, `-` keeps the blob's). `threads` is the thread count of the threaded rows
 (default: the cores, at most 4).
