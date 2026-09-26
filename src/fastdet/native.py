@@ -9,6 +9,7 @@ not a fallback: a missing extension is a broken install, and :func:`load_scorer`
 from __future__ import annotations
 
 import importlib
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -48,9 +49,17 @@ def _extension() -> Any:
     try:
         return importlib.import_module("fastdet._native_ext")
     except ImportError as exc:
+        package = Path(__file__).resolve().parent
+        hint = (
+            "the import resolved to the source checkout, which a plain `pip install .` leaves "
+            "without the extension (it goes to site-packages, and src/ on sys.path shadows it): "
+            "import the installed package, or install editable (`pip install -e .`)"
+            if (package.parent / "pyproject.toml").is_file()
+            else "reinstall the package with cmake and a C++17 compiler available"
+        )
         msg = (
-            "fastdet._native_ext (the C++ scorer) is not built. It is compiled by `pip install .`; "
-            "this install is missing it, so reinstall the package with cmake and a C++17 compiler available."
+            f"fastdet._native_ext (the C++ scorer, built by `pip install .`) is not importable "
+            f"from {package}: {hint}."
         )
         raise ImportError(msg) from exc
 

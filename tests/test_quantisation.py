@@ -7,8 +7,9 @@ from typing import TYPE_CHECKING
 import numpy as np
 import pytest
 
-from fastdet import Detector
+from fastdet import Detector, ModelConfig
 from fastdet.artifact import ModelArtifact
+from fastdet.features import feature_level_bits
 from fastdet.runtime import parse_blob
 from fastdet.training import leaf_grid, quantise_leaves, stage_tree_counts
 
@@ -69,9 +70,11 @@ def test_blob_stores_codes_that_reproduce_the_grid(
     np.testing.assert_allclose(
         model.leaf_values.reshape(model.n_trees, -1), expected, rtol=0, atol=1e-6
     )
-    sample = next(iter(sorted(images_dir.glob("*.png"))))
+    sample = min(images_dir.glob("*.png"))
     reloaded = Detector.load(tmp_path / "q4.fdt")
     np.testing.assert_array_equal(reloaded.predict_proba(sample), detector.predict_proba(sample))
+    reloaded.close()
+    detector.close()
 
 
 def test_quantisation_aware_fit_matches_its_export(
@@ -89,7 +92,7 @@ def test_quantisation_aware_fit_matches_its_export(
     assert detector.runtime is not None
     assert detector.runtime.coarse_trees == 12
     # the exported model scores a training image exactly as the quantised booster does
-    sample = next(iter(sorted(images_dir.glob("*.png"))))
+    sample = min(images_dir.glob("*.png"))
     design = detector.design_matrix(sample)
     booster_logit = detector.booster.predict(design, prediction_type="RawFormulaVal")
     grid_leaves = detector.runtime.leaf_values.reshape(24, -1)
@@ -104,6 +107,7 @@ def test_quantisation_aware_fit_matches_its_export(
     assert (
         np.abs(runtime_logit - booster_logit).max() < 0.5
     )  # same trees, leaves rounded to the grid
+    detector.close()
 
 
 def test_tiered_fit_keeps_the_coarse_stage_coarse(
@@ -118,40 +122,46 @@ def test_tiered_fit_keeps_the_coarse_stage_coarse(
     assert detector.feature_names is not None
     assert detector.runtime is not None
     assert detector.runtime.coarse_trees == 6
-    from fastdet.features import feature_level_bits  # noqa: PLC0415
-
     sides = [feature_level_bits(n)[0] for n in detector.feature_names]
     splits = detector.runtime.splits["feat"].reshape(16, -1)
     coarse = [sides[int(f)] for f in splits[:6].reshape(-1)]
     fine = [sides[int(f)] for f in splits[6:].reshape(-1)]
     assert max(coarse) <= small_config.model.coarse_max_side
     assert max(fine) > small_config.model.coarse_max_side
+    detector.close()
 
 
 def test_exit_stages_are_calibrated_and_applied(
-    tiny_dataset: tuple[Path, Path], small_config: Config
+    tiny_dataset: tuple[Path, Path], tiny_model: Path
 ) -> None:
     """Stages land on chunk boundaries, the blob carries them, and exit never lifts a score."""
-    images_dir, masks_dir = tiny_dataset
-    detector = Detector(small_config).fit(images_dir, masks_dir, evaluate=False)
+    images_dir, _masks_dir = tiny_dataset
+    detector = Detector.load(tiny_model)
+    model_cfg = detector.config.model
     assert detector.runtime is not None
     stages = detector.runtime.exit_stages
-    assert [t for t, _ in stages] == stage_tree_counts(small_config.model)
-    coarse = small_config.model.coarse_trees
+    assert stages == detector.exit_stages
+    assert [t for t, _ in stages] == stage_tree_counts(model_cfg)
+    coarse = model_cfg.coarse_trees
     assert all(
-        (t - coarse) % small_config.model.leaf_chunk == 0 for t, _ in stages
+        (t - coarse) % model_cfg.leaf_chunk == 0 for t, _ in stages
     )  # chunk ends of the fine tier
-    sample = next(iter(sorted(images_dir.glob("*.png"))))
-    design = detector.design_matrix(sample)
+    design = detector.design_matrix(min(images_dir.glob("*.png")))
     full = detector.runtime.predict_proba(design)
     exited = detector.runtime.predict_proba(design, use_exit=True)
     assert exited.shape == full.shape
     # a stopped cell keeps a partial score; every cell that reaches the keep probability is untouched
-    keep = full >= small_config.model.exit_keep_prob
+    keep = full >= model_cfg.exit_keep_prob
     np.testing.assert_array_equal(exited[keep], full[keep])
+    detector.close()
 
 
 @pytest.mark.parametrize("bits", [4, 8])
-def test_config_accepts_supported_leaf_bits(small_config: Config, bits: int) -> None:
-    small_config.model.leaf_bits = bits
-    small_config.model.__post_init__()
+def test_config_accepts_supported_leaf_bits(bits: int) -> None:
+    assert ModelConfig(leaf_bits=bits).leaf_bits == bits
+
+
+@pytest.mark.parametrize("bits", [3, 6, 16])
+def test_config_rejects_other_leaf_bits(bits: int) -> None:
+    with pytest.raises(ValueError, match="leaf_bits"):
+        ModelConfig(leaf_bits=bits)

@@ -13,16 +13,12 @@ from fastdet.demo import main, overlay, score_frame
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from fastdet import Config
-
 
 def test_demo_image_and_video_headless(
-    tiny_dataset: tuple[Path, Path], small_config: Config, tmp_path: Path
+    tiny_dataset: tuple[Path, Path], tiny_model: Path, tmp_path: Path
 ) -> None:
-    images_dir, masks_dir = tiny_dataset
-    model = (
-        Detector(small_config).fit(images_dir, masks_dir, evaluate=False).export(tmp_path / "m.fdt")
-    )
+    images_dir, _masks_dir = tiny_dataset
+    model = tiny_model
     sample = min(images_dir.glob("*.png"))
     out = tmp_path / "image.png"
     assert (
@@ -33,10 +29,10 @@ def test_demo_image_and_video_headless(
     assert composite is not None
     assert composite.shape[1] > composite.shape[0]  # two panels side by side
     # a three-frame video
-    frame = cv2.imread(str(sample))
+    frame = np.asarray(cv2.imread(str(sample)), dtype=np.uint8)
     video = tmp_path / "clip.avi"
     writer = cv2.VideoWriter(
-        str(video), cv2.VideoWriter_fourcc(*"MJPG"), 5, (frame.shape[1], frame.shape[0])
+        str(video), cv2.VideoWriter.fourcc(*"MJPG"), 5, (frame.shape[1], frame.shape[0])
     )
     for _ in range(3):
         writer.write(frame)
@@ -61,6 +57,7 @@ def test_demo_image_and_video_headless(
     assert out2.exists()
     det = Detector.load(model)
     probs, feature_ms, model_ms = score_frame(det, frame)
+    det.close()
     assert probs.shape == (64, 64)
     assert feature_ms > 0
     assert model_ms > 0
@@ -81,23 +78,18 @@ def test_view_stops_when_the_window_is_closed() -> None:
     hist = collections.deque([1.0, 2.0])
     frame = np.zeros((64, 64, 3), np.uint8)
     view.update(frame, hist, hist, fps=10.0, frame_index=1)
-    assert not view.closed
     view.plt.close(view.fig)  # what closing the window does
-    assert view.closed
+    assert not view.plt.fignum_exists(view.fig.number)
     view.update(frame, hist, hist, fps=10.0, frame_index=2)  # must not raise
     view.pump()
-    assert view.quit
+    assert view.quit  # noticed by update()/pump(): the loop stops
     view.close()  # idempotent
 
 
-def test_detector_close_is_explicit_and_idempotent(
-    tiny_dataset: tuple[Path, Path], small_config: Config, tmp_path: Path
-) -> None:
-    images_dir, masks_dir = tiny_dataset
-    det = Detector.load(
-        Detector(small_config).fit(images_dir, masks_dir, evaluate=False).export(tmp_path / "m.fdt")
-    )
+def test_detector_close_is_explicit_and_idempotent(tiny_model: Path) -> None:
+    det = Detector.load(tiny_model)
     assert det.native is not None
     det.close()
     det.close()
-    assert det.native is None
+    # read back through getattr: mypy keeps the narrowing from the assert above
+    assert getattr(det, "native") is None  # noqa: B009

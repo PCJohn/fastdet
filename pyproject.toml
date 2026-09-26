@@ -81,7 +81,8 @@ line-length = 100
 target-version = ["py310"]
 
 [tool.mypy]
-python_version = "3.10"
+# no python_version pin: numpy's stubs use the `type` statement, which mypy accepts only
+# when targeting 3.12+; ruff's target-version keeps the code itself 3.10-compatible
 strict = true
 files = ["src/fastdet", "tests"]
 mypy_path = "src"
@@ -95,7 +96,8 @@ ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"]
+# no pythonpath = ["src"]: the tests import the *installed* package (editable or not),
+# which is where the compiled scorer lives; putting src/ first would shadow it
 addopts = "-ra"
 markers = [
     "slow: builds and runs the C++ runtime (needs a compiler and an AVX2 host)",

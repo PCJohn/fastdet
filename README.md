@@ -17,7 +17,8 @@ feature ranking from a full-width fit before pruning (see *Pruning*).
 ## Install
 
 ```
-pip install .            # or:  pip install -e .
+pip install .                  # to use it
+pip install -e ".[tune,dev]"   # to work on it: editable, with the tuning and test extras
 ```
 
 `pip install` builds the C++ scorer as a Python extension (`fastdet._native_ext`,
@@ -27,6 +28,10 @@ Build Tools on Windows, Xcode command-line tools on macOS); Highway is fetched b
 at build time. The extension is compiled for the machine it is built on
 (`-march=native`; `/arch:AVX2` with MSVC). The NumPy runtime in `fastdet.runtime` is the
 bit-identical reference the tests compare against, not a fallback.
+
+The tests (`pytest`) run against the installed package, since that is where the
+compiled scorer lives; an editable install keeps it in step with the source tree. After
+changing `cpp/`, reinstall to rebuild the extension.
 
 ## Quickstart
 

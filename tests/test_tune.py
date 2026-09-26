@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import pytest
@@ -32,7 +32,6 @@ def test_metrics_on_a_separable_toy() -> None:
 
 
 def test_heuristic_prefers_texture() -> None:
-    rng = np.random.default_rng(0)
     flat = np.full((64, 64), 128.0, np.float32)
     var = np.zeros((64, 64), np.float32)
     var[16:48, 16:48] = 900.0  # textured block
@@ -41,7 +40,6 @@ def test_heuristic_prefers_texture() -> None:
     )
     assert score[32, 32] > score[2, 2]
     assert np.all(score >= 0)
-    assert rng.random() < 1.0
 
 
 def test_cli_sweep_parsing() -> None:
@@ -86,7 +84,7 @@ def test_sweep_writes_report_and_charts(tiny_dataset: tuple[Path, Path], tmp_pat
     pytest.importorskip("matplotlib")
     images_dir, masks_dir = tiny_dataset
     out = tmp_path / "report"
-    sweep = {
+    sweep: dict[str, list[Any]] = {
         "n_trees": [12, 24],
         "depth": [3],
         "val_frac": [0.25],
@@ -95,11 +93,11 @@ def test_sweep_writes_report_and_charts(tiny_dataset: tuple[Path, Path], tmp_pat
         "top_k_features": [0],
     }
     report = run_sweep(images_dir, masks_dir, out, sweep, top_charts=2)
-    text = report.read_text()
+    text = report.read_text(encoding="utf-8")
     assert "| run | n_trees | PR-AUC" in text
     assert "baseline: framegate heuristic" in text
     assert (out / "curves.png").exists()
     assert len(list((out / "models").glob("*.fdt"))) == 2
     # resuming does not refit
     report2 = run_sweep(images_dir, masks_dir, out, sweep, top_charts=2)
-    assert report2.read_text().count("| baseline") == 1
+    assert report2.read_text(encoding="utf-8").count("| baseline") == 1

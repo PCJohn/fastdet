@@ -30,7 +30,6 @@ from __future__ import annotations
 
 import os
 import re
-import subprocess
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -45,7 +44,12 @@ from fastdet.features import GRID, FeatureExtractor, feature_level_bits
 from fastdet.runtime import parse_blob
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+    from subprocess import CompletedProcess
+
     from numpy.typing import NDArray
+
+    RunScorer = Callable[..., CompletedProcess[str]]
 
 # framegate's pass: HSV, 64x64 finest grid, six levels, ~4 samples per cell per axis.
 FRAMEGATE_LEVELS = (64, 32, 16, 8, 4, 2)
@@ -177,13 +181,9 @@ def _random_model(
     return blob, native, dense
 
 
-def _run_scorer(scorer: Path, model: Path, fixture: Path, expected: Path | None) -> str:
-    """Run the scorer and return its output, skipping if the host cannot run it."""
-    argv = [str(scorer), str(model), str(fixture)]
-    argv += [str(expected), str(_ITERS)] if expected else [str(_ITERS)]
-    run = subprocess.run(argv, capture_output=True, text=True, check=False)  # noqa: S603
-    if run.returncode != 0 and "Illegal instruction" in (run.stderr or ""):
-        pytest.skip("host CPU lacks the SIMD target the scorer was built for")
+def _timings(run_scorer: RunScorer, model: Path, fixture: Path, expected: Path | None) -> str:
+    """The scorer's report for one model (its gates must pass)."""
+    run = run_scorer(model, fixture, expected or "-", _ITERS)
     assert run.returncode == 0, f"{run.stdout}\n{run.stderr}"
     return run.stdout
 
@@ -222,7 +222,7 @@ def _report_model(name: str, out: str) -> None:
         )
 
 
-def test_model_inference_latency(scorer: Path, scratch: Path) -> None:
+def test_model_inference_latency(run_scorer: RunScorer, scratch: Path) -> None:
     """Binning + tree traversal for the whole 64x64 grid, on one thread and on the default count."""
     print(
         f"\n[fastdet-lat] MODEL INFERENCE -- {N_TREES} trees x depth {DEPTH}, "
@@ -237,7 +237,7 @@ def test_model_inference_latency(scorer: Path, scratch: Path) -> None:
         fixture = os.environ.get("FASTDET_FIXTURE")
         if not fixture:
             pytest.skip("FASTDET_MODEL needs FASTDET_FIXTURE (Detector.native_matrix output)")
-        _report_model("real model", _run_scorer(scorer, Path(model_path), Path(fixture), None))
+        _report_model("real model", _timings(run_scorer, Path(model_path), Path(fixture), None))
         return
 
     for n_features, bits in [(n, 8) for n in KEPT_COLUMNS] + [(KEPT_COLUMNS[-1], 4)]:
@@ -246,7 +246,7 @@ def test_model_inference_latency(scorer: Path, scratch: Path) -> None:
         paths = [scratch / name for name in ("m.imsy", "f.f32", "e.f32")]
         for path, payload in zip(paths, (blob, native.tobytes(), expected.tobytes()), strict=True):
             path.write_bytes(payload)
-        runs = [_run_scorer(scorer, *paths) for _ in range(2)]
+        runs = [_timings(run_scorer, *paths) for _ in range(2)]
         for out in runs:
             assert "0 mismatches PASS" in out  # binner agrees with the reference binner
             assert "DIVERGED" not in out  # SIMD vs scalar, and threads vs one thread: bit-identical

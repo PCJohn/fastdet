@@ -288,7 +288,7 @@ def run_sweep(  # noqa: PLR0913, PLR0915 -- the whole sweep in one readable func
     out_dir.mkdir(parents=True, exist_ok=True)
     results_path = out_dir / "results.json"
     results: list[dict[str, Any]] = (
-        json.loads(results_path.read_text()) if results_path.exists() else []
+        json.loads(results_path.read_text(encoding="utf-8")) if results_path.exists() else []
     )
     done = {r["key"] for r in results}
     knobs = _knob_fields()
@@ -350,14 +350,16 @@ def run_sweep(  # noqa: PLR0913, PLR0915 -- the whole sweep in one readable func
                 "val_cells": len(labels),
             }
         )
-        results_path.write_text(json.dumps(results, indent=1, default=str))
+        results_path.write_text(json.dumps(results, indent=1, default=str), encoding="utf-8")
         np.save(out_dir / "models" / f"{key}.scores.npy", scores.astype(np.float32))
         np.save(out_dir / "models" / f"{key}.labels.npy", labels)
         curves[key] = (scores, labels)
         if baseline and not baseline_done:
             b_scores = np.concatenate(heuristic_scores(det, cache))
             b_metrics = summarise(b_scores, labels)
-            (out_dir / "baseline.json").write_text(json.dumps({"metrics": b_metrics}, indent=1))
+            (out_dir / "baseline.json").write_text(
+                json.dumps({"metrics": b_metrics}, indent=1), encoding="utf-8"
+            )
             np.save(out_dir / "baseline.scores.npy", b_scores.astype(np.float32))
             np.save(out_dir / "baseline.labels.npy", labels)
             baseline_done = True
@@ -398,7 +400,11 @@ def write_report(
         return str(r["config"][knobs[k][0]].get(k))
 
     baseline_path = out_dir / "baseline.json"
-    baseline = json.loads(baseline_path.read_text())["metrics"] if baseline_path.exists() else None
+    baseline = (
+        json.loads(baseline_path.read_text(encoding="utf-8"))["metrics"]
+        if baseline_path.exists()
+        else None
+    )
     lines = ["# fastdet hyperparameter sweep", ""]
     if ranked:
         lines.append(
@@ -477,7 +483,7 @@ def write_report(
     if charts:
         lines += ["## Charts", ""] + [f"![{name}]({name})" for name in charts] + [""]
     report = out_dir / "report.md"
-    report.write_text("\n".join(lines))
+    report.write_text("\n".join(lines), encoding="utf-8")
     print(f"[fastdet-tune] wrote {report}")
     return report
 
@@ -606,7 +612,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"no results.json in {args.out}", file=sys.stderr)
             return 2
         write_report(
-            args.out, json.loads(results_path.read_text()), sweep, top_charts=args.top_charts
+            args.out,
+            json.loads(results_path.read_text(encoding="utf-8")),
+            sweep,
+            top_charts=args.top_charts,
         )
         return 0
     run_sweep(

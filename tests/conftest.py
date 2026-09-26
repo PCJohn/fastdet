@@ -1,9 +1,15 @@
-"""Shared fixtures: a tiny synthetic images/masks dataset and a cheap config."""
+"""Shared fixtures.
+
+A tiny synthetic dataset, a cheap config, one model fitted on them once per session, and
+the C++ harness.  The tests import the *installed* ``fastdet`` (editable or not): that is where the compiled
+scorer lives, so ``src/`` is deliberately not on ``sys.path`` (see pyproject.toml).
+"""
 
 from __future__ import annotations
 
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -17,7 +23,7 @@ import pytest
 from fastdet import Config, Detector, ModelConfig, TrainConfig
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
 
     from numpy.typing import NDArray
 
@@ -41,11 +47,12 @@ def _make_mask(boxes: list[Box]) -> NDArray[np.uint8]:
     return mask
 
 
-@pytest.fixture
-def tiny_dataset(tmp_path: Path) -> tuple[Path, Path]:
-    """Write ``N_IMAGES`` textured images each with 1-2 bright masked boxes."""
-    images_dir = tmp_path / "images"
-    masks_dir = tmp_path / "masks"
+@pytest.fixture(scope="session")
+def tiny_dataset(tmp_path_factory: pytest.TempPathFactory) -> tuple[Path, Path]:
+    """``N_IMAGES`` textured images each with 1-2 bright masked boxes (read-only)."""
+    root = tmp_path_factory.mktemp("dataset")
+    images_dir = root / "images"
+    masks_dir = root / "masks"
     images_dir.mkdir()
     masks_dir.mkdir()
     rng = np.random.RandomState(0)
@@ -60,14 +67,15 @@ def tiny_dataset(tmp_path: Path) -> tuple[Path, Path]:
     return images_dir, masks_dir
 
 
-@pytest.fixture
-def small_config() -> Config:
-    """A cheap but structurally complete config for end-to-end tests."""
+def make_small_config() -> Config:
+    """A cheap but structurally complete config for end-to-end tests.
+
+    The default front-end's shape (HSV, one scale, six dyadic levels down to 2x2, so
+    level shifts 8 and 10 reach the exporter and the C++ binner) at a quarter of its
+    resolution: 256 px at stride 1 keeps 4 samples per cell.
+    """
     return Config(
         model=ModelConfig(depth=3, n_trees=60, learning_rate=0.2, border_count=15),
-        # The default front-end's shape (HSV, one scale, six dyadic levels down to
-        # 2x2, so level shifts 8 and 10 reach the exporter and the C++ binner) at a
-        # quarter of its resolution: 256 px at stride 1 keeps 4 samples per cell.
         train=TrainConfig(
             levels=(64, 32, 16, 8, 4, 2),
             thumb=256,
@@ -79,7 +87,45 @@ def small_config() -> Config:
     )
 
 
+@pytest.fixture
+def small_config() -> Config:
+    """A fresh copy per test: tests tweak it before fitting."""
+    return make_small_config()
+
+
+@pytest.fixture(scope="session")
+def tiny_model(tiny_dataset: tuple[Path, Path], tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """An exported model fitted once with :func:`make_small_config` on the tiny dataset.
+
+    For tests that only need a loaded detector (``Detector.load(tiny_model)``); tests
+    that need the live fit, or that prune or otherwise mutate it, use ``fitted``.
+    """
+    images_dir, masks_dir = tiny_dataset
+    det = Detector(make_small_config()).fit(images_dir, masks_dir, evaluate=False)
+    path = det.export(tmp_path_factory.mktemp("model") / "tiny.fdt")
+    det.close()
+    return path
+
+
+@pytest.fixture
+def fitted(
+    tmp_path: Path,
+    tiny_dataset: tuple[Path, Path],
+    small_config: Config,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[Detector, Path]:
+    """A detector fitted (and evaluated) fresh for this test, in an isolated cwd."""
+    monkeypatch.chdir(tmp_path)
+    images_dir, masks_dir = tiny_dataset
+    det = Detector(small_config).fit(images_dir, masks_dir)
+    return det, images_dir
+
+
+# -- the C++ harness ---------------------------------------------------------------------
+
 CPP_DIR = Path(__file__).resolve().parents[1] / "cpp"
+# exit statuses of a process killed by an illegal instruction: POSIX signal, Windows NTSTATUS
+_ILLEGAL_INSTRUCTION = {-int(getattr(signal, "SIGILL", 4)), 0xC000001D, 0xC000001D - (1 << 32)}
 
 
 def _build_scorer(build_dir: Path) -> Path:
@@ -133,15 +179,20 @@ def scorer() -> Path:
     return _build_scorer(CPP_DIR.parent / "build" / "pytest-cpp")
 
 
-@pytest.fixture
-def fitted(
-    tmp_path: Path,
-    tiny_dataset: tuple[Path, Path],
-    small_config: Config,
-    monkeypatch: pytest.MonkeyPatch,
-) -> tuple[Detector, Path]:
-    """A detector fitted once on the tiny dataset, in an isolated cwd."""
-    monkeypatch.chdir(tmp_path)
-    images_dir, masks_dir = tiny_dataset
-    det = Detector(small_config).fit(images_dir, masks_dir)
-    return det, images_dir
+@pytest.fixture(scope="session")
+def run_scorer(scorer: Path) -> Callable[..., subprocess.CompletedProcess[str]]:
+    """``run_scorer(*args, cwd=None)``: the built scorer on ``args``, output captured.
+
+    Skips the test when the host cannot execute the SIMD target the scorer was built
+    for; the caller asserts on the exit status and output.
+    """
+
+    def run(*args: object, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+        result = subprocess.run(  # noqa: S603 -- argv is the binary this session built
+            [str(scorer), *map(str, args)], capture_output=True, text=True, check=False, cwd=cwd
+        )
+        if result.returncode in _ILLEGAL_INSTRUCTION:
+            pytest.skip("host CPU lacks the SIMD target the scorer was built for")
+        return result
+
+    return run
