@@ -152,6 +152,11 @@ class LatencyView:
             plt.ion()
             plt.show(block=False)
 
+    @property
+    def closed(self) -> bool:
+        """True once the window has been closed (by the user or with ``q``)."""
+        return self.quit or not self.plt.fignum_exists(self.fig.number)
+
     def _on_key(self, event: Any) -> None:
         if event.key in {"q", "escape"}:
             self.quit = True
@@ -169,7 +174,10 @@ class LatencyView:
         fps: float | None,
         frame_index: int,
     ) -> None:
-        """Draw one frame: overlay left, numbers and series right."""
+        """Draw one frame: overlay left, numbers and series right (a no-op once the window is closed)."""
+        if self.closed:
+            self.quit = True
+            return
         if self.image_artist is None:
             self.image_artist = self.ax_img.imshow(rgb, interpolation="nearest")
         else:
@@ -196,14 +204,22 @@ class LatencyView:
             lines.append("")
             lines.append("single image: one measurement")
         self.text.set_text("\n".join(lines))
-        self.fig.canvas.draw_idle()
-        self.fig.canvas.flush_events()
+        try:
+            self.fig.canvas.draw_idle()
+            self.fig.canvas.flush_events()
+        except Exception:  # noqa: BLE001 -- GUI teardown error
+            self.quit = True
 
     def pump(self, seconds: float = 0.001) -> None:
         """Let the window process events (keys, close); blocks while paused."""
-        self.plt.pause(seconds)
-        while self.paused and not self.quit:
-            self.plt.pause(0.05)
+        try:
+            self.plt.pause(seconds)
+            while self.paused and not self.closed:
+                self.plt.pause(0.05)
+        except Exception:  # noqa: BLE001 -- see update()
+            self.quit = True
+        if self.closed:
+            self.quit = True
 
     def save(self, path: Path) -> None:
         """Write the current figure as an image."""
@@ -211,15 +227,19 @@ class LatencyView:
 
     def block(self) -> None:
         """Keep a single image on screen until the window is closed or ``q`` is pressed."""
-        while not self.quit and self.plt.fignum_exists(self.fig.number):
-            self.plt.pause(0.05)
+        while not self.closed:
+            try:
+                self.plt.pause(0.05)
+            except Exception:  # noqa: BLE001 -- see update()
+                break
             if self.save_requested:
                 self.save_requested = False
                 self.save(Path("fastdet_image.png"))
 
     def close(self) -> None:
-        """Close the window."""
-        self.plt.close(self.fig)
+        """Close the window (safe to call after the user already closed it)."""
+        if self.plt.fignum_exists(self.fig.number):
+            self.plt.close(self.fig)
 
 
 def _frames(source: str) -> tuple[Iterator[NDArray[np.uint8]], bool]:
@@ -237,12 +257,14 @@ def _frames(source: str) -> tuple[Iterator[NDArray[np.uint8]], bool]:
         raise SystemExit(msg)
 
     def stream() -> Iterator[NDArray[np.uint8]]:
-        while True:
-            ok, frame = capture.read()
-            if not ok:
-                break
-            yield np.asarray(frame, dtype=np.uint8)
-        capture.release()
+        try:
+            while True:
+                ok, frame = capture.read()
+                if not ok:
+                    break
+                yield np.asarray(frame, dtype=np.uint8)
+        finally:
+            capture.release()
 
     return stream(), True
 
@@ -279,7 +301,7 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None) -> int:  # noqa: C901 -- the display loop and its exits
     """Entry point of ``fastdet-demo``."""
     args = build_parser().parse_args(argv)
     det = Detector.load(args.model)
@@ -291,37 +313,43 @@ def main(argv: list[str] | None = None) -> int:
     last_tick = time.perf_counter()
     fps: float | None = None
     n = 0
-    for n, frame in enumerate(frames, 1):
-        probs, feature_ms, model_ms = score_frame(det, frame)
-        feature_hist.append(feature_ms)
-        model_hist.append(model_ms)
-        now = time.perf_counter()
-        if live:
-            instant = 1.0 / max(now - last_tick, 1e-6)
-            fps = instant if fps is None else 0.9 * fps + 0.1 * instant
-        last_tick = now
-        view.update(
-            overlay(_fit_width(frame, args.display_width), probs),
-            feature_hist,
-            model_hist,
-            fps=fps,
-            frame_index=n,
-        )
-        if not args.headless:
-            view.pump()
-            if view.save_requested:
-                view.save_requested = False
-                view.save(Path(f"fastdet_{n:05d}.png"))
-            if view.quit:
+    try:
+        for n, frame in enumerate(frames, 1):
+            probs, feature_ms, model_ms = score_frame(det, frame)
+            feature_hist.append(feature_ms)
+            model_hist.append(model_ms)
+            now = time.perf_counter()
+            if live:
+                instant = 1.0 / max(now - last_tick, 1e-6)
+                fps = instant if fps is None else 0.9 * fps + 0.1 * instant
+            last_tick = now
+            view.update(
+                overlay(_fit_width(frame, args.display_width), probs),
+                feature_hist,
+                model_hist,
+                fps=fps,
+                frame_index=n,
+            )
+            if not args.headless:
+                view.pump()
+                if view.save_requested:
+                    view.save_requested = False
+                    view.save(Path(f"fastdet_{n:05d}.png"))
+                if view.quit:  # window closed, or q / Esc
+                    break
+            if args.max_frames is not None and n >= args.max_frames:
                 break
-        if args.max_frames is not None and n >= args.max_frames:
-            break
-    if args.output is not None and n:
-        view.save(args.output)
-        print(f"[fastdet-demo] wrote {args.output}")
-    if not args.headless and not live and not view.quit:
-        view.block()
-    view.close()
+    except KeyboardInterrupt:
+        print("\n[fastdet-demo] interrupted")
+    finally:
+        if hasattr(frames, "close"):
+            frames.close()  # releases the capture
+        if args.output is not None and n and not view.closed:
+            view.save(args.output)
+            print(f"[fastdet-demo] wrote {args.output}")
+        if not args.headless and not live and not view.quit:
+            view.block()
+        view.close()
     if feature_hist:
         print(
             f"[fastdet-demo] {len(feature_hist)} frame(s): feature extraction median {np.median(feature_hist):.2f} ms,"

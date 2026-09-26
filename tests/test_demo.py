@@ -67,3 +67,24 @@ def test_demo_image_and_video_headless(
     rgb = overlay(frame, probs)
     assert rgb.shape == frame.shape
     assert rgb.dtype == np.uint8
+
+
+def test_view_stops_when_the_window_is_closed() -> None:
+    import collections  # noqa: PLC0415
+
+    import matplotlib as mpl  # noqa: PLC0415
+
+    mpl.use("Agg")
+    from fastdet.demo import LatencyView  # noqa: PLC0415
+
+    view = LatencyView(target="test", live=True, headless=True)
+    hist = collections.deque([1.0, 2.0])
+    frame = np.zeros((64, 64, 3), np.uint8)
+    view.update(frame, hist, hist, fps=10.0, frame_index=1)
+    assert not view.closed
+    view.plt.close(view.fig)  # what closing the window does
+    assert view.closed
+    view.update(frame, hist, hist, fps=10.0, frame_index=2)  # must not raise
+    view.pump()
+    assert view.quit
+    view.close()  # idempotent
