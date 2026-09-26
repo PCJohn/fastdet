@@ -1,6 +1,6 @@
 [build-system]
-requires = ["setuptools>=64"]
-build-backend = "setuptools.build_meta"
+requires = ["scikit-build-core>=0.9", "nanobind>=2.0"]
+build-backend = "scikit_build_core.build"
 
 [project]
 name = "fastdet"
@@ -19,7 +19,6 @@ dependencies = [
 [project.scripts]
 fastdet-tune = "fastdet.tune:main"
 fastdet-demo = "fastdet.demo:main"
-fastdet-native-build = "fastdet.native_build:main"
 
 [project.optional-dependencies]
 yaml = ["PyYAML"]
@@ -32,11 +31,14 @@ dev = [
     "types-PyYAML",
 ]
 
-[tool.setuptools.packages.find]
-where = ["src"]
-
-[tool.setuptools.package-data]
-fastdet = ["data/feature_ranks.json", "py.typed", "_native/*"]  # _native: the C++ scorer, fastdet-native-build
+[tool.scikit-build]
+# CMake builds the nanobind scorer (fastdet._native_ext) into the wheel; the Python package
+# comes from src/fastdet.  cpp/CMakeLists.txt also builds the standalone scorer the tests use.
+cmake.source-dir = "cpp"
+cmake.build-type = "Release"
+cmake.args = ["-DFASTDET_BUILD_PYTHON=ON"]
+wheel.packages = ["src/fastdet"]
+build-dir = "build/skbuild/{wheel_tag}"
 
 [tool.ruff]
 line-length = 100

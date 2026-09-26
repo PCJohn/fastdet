@@ -12,7 +12,6 @@ import dataclasses
 import json
 import os
 import tempfile
-import warnings
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -33,7 +32,7 @@ from .features import (
 )
 from .images import read_image
 from .metrics import pooled_pr_auc, score_validation_per_image
-from .native import NativeScorer, load_native
+from .native import NativeScorer, load_scorer
 from .runtime import ImysModel, parse_blob
 from .training import (
     calibrate_exit_stages,
@@ -55,23 +54,6 @@ UInt8Array = NDArray[np.uint8]
 
 
 _LARGE_MATRIX_GIB = 8.0  # above this the fit prints how to shrink the training matrix
-
-
-_warned_no_native = False
-
-
-def _load_native_or_warn(blob: bytes) -> NativeScorer | None:
-    """The in-process C++ scorer, or ``None`` with a one-time warning about the slow fallback."""
-    global _warned_no_native  # noqa: PLW0603 -- one warning per process
-    native = load_native(blob)
-    if native is None and not _warned_no_native:
-        _warned_no_native = True
-        warnings.warn(
-            "fastdet_native (the C++ scorer) was not found; predictions use the NumPy runtime, which is "
-            "bit-identical but hundreds of times slower. Run `fastdet-native-build` once (or set FASTDET_NATIVE_LIB).",
-            stacklevel=3,
-        )
-    return native
 
 
 class Detector:
@@ -106,7 +88,7 @@ class Detector:
         self.booster: CatBoostClassifier | None = None  # when training in-process
         self.runtime: ImysModel | None = None  # scoring engine (fitted or loaded)
         self.exit_stages: list[tuple[int, float]] = []  # calibrated at fit time, stored in the blob
-        self.native: NativeScorer | None = None  # in-process C++ scorer, when its library is built
+        self.native: NativeScorer | None = None  # the in-process C++ scorer, once fitted or loaded
         self.train_cache: FeatureCache | None = None  # the last fit's training features (reusable)
         self.col_keep: Int64Array | None = None  # kept columns into the full design
         self.base_names: list[str] | None = None  # full (unpruned) column names
@@ -133,7 +115,7 @@ class Detector:
         det.col_keep = det._columns_for(det.feature_names)
         det.metrics = dict(artifact.metadata)
         det.exit_stages = list(det.runtime.exit_stages)
-        det.native = _load_native_or_warn(artifact.blob)
+        det.native = load_scorer(artifact.blob)
         return det
 
     @property
@@ -290,9 +272,7 @@ class Detector:
         blob, info = self._build_blob()
         runtime = parse_blob(blob)
         self.runtime = runtime
-        self.native = _load_native_or_warn(
-            blob
-        )  # the same engine a loaded model uses, when it is built
+        self.native = load_scorer(blob)
         self.metrics.update(info)
         if self.col_keep is not None and self.base_names is not None:
             self.feature_names = [self.base_names[int(i)] for i in self.col_keep]
@@ -390,14 +370,11 @@ class Detector:
         if self.runtime is None:
             msg = "detector is not fitted; call fit() or load()"
             raise RuntimeError(msg)
-        use_exit = self.config.model.use_exit
-        if self.native is not None:
-            native = self.extractor.native(level_maps, broadcast_vecs, self.col_keep)
-            return self.native.score(native, use_exit=use_exit).reshape(GRID, GRID)
-        design = self.extractor.gather(
-            level_maps, broadcast_vecs, np.arange(GRID * GRID), col_keep=self.col_keep
-        )
-        return self.runtime.predict_grid(design, grid=GRID, use_exit=use_exit)
+        if self.native is None:
+            msg = "detector is not fitted; call fit() or load()"
+            raise RuntimeError(msg)
+        native = self.extractor.native(level_maps, broadcast_vecs, self.col_keep)
+        return self.native.score(native, use_exit=self.config.model.use_exit).reshape(GRID, GRID)
 
     def predict_proba(self, image: str | Path | UInt8Array) -> NDArray[np.floating[Any]]:
         """Per-cell positive probability for one image as a ``GRID x GRID`` map.
@@ -408,11 +385,8 @@ class Detector:
         if self.runtime is None:
             msg = "detector is not fitted; call fit() or load()"
             raise RuntimeError(msg)
-        use_exit = self.config.model.use_exit
-        if self.native is not None:  # the C++ scorer, on the native-resolution features
-            probabilities = self.native.score(self.native_matrix(image), use_exit=use_exit)
-            return probabilities.reshape(GRID, GRID)
-        return self.runtime.predict_grid(self.design_matrix(image), grid=GRID, use_exit=use_exit)
+        level_maps, broadcast_vecs = self.extractor.extract(self._decode(image))
+        return self._predict_from_maps(level_maps, broadcast_vecs)
 
     # -- persistence --------------------------------------------------------
     def export(self, path: str | Path) -> Path:

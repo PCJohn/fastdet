@@ -434,14 +434,6 @@ class FeatureExtractor:
             raise RuntimeError(msg)
         return [np.asarray(m, dtype=np.float32) for m in maps]
 
-    def _extra_level_maps(self, thumb_bgr: Image, space: SpaceInfo) -> list[list[FloatArray]]:
-        extra_maps: list[list[FloatArray]] = []
-        for computer, extra_thumb, _label in self.extra_computers:
-            extra_bgr = self._resize_bgr(thumb_bgr, extra_thumb)
-            result = computer.features(self._convert(extra_bgr, space))
-            extra_maps.append(self._load_level_maps(result, "extra scale"))
-        return extra_maps
-
     def _lum_cell_mean(self, primary_raw: FloatArray, size: int) -> FloatArray:
         """Per-cell mean of the luminance channel at level ``size``, from imfeat."""
         full = primary_raw.reshape(size, size, RAW_CHANNELS, RAW_PER_CHANNEL)

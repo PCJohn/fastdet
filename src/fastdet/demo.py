@@ -53,25 +53,16 @@ def score_frame(
     """``(probability map, feature ms, model ms)`` for one BGR frame.
 
     Feature extraction is the front-end (resize, colour conversion, imfeat, context
-    banks, packing); the model is the scorer on that input.  Uses the C++ scorer when
-    its library is built, the NumPy runtime otherwise (tens of ms, reported as such).
+    banks, packing); the model is the C++ scorer on that input.
     """
-    if det.runtime is None:
+    if det.native is None:
         msg = "detector is not fitted; call fit() or load()"
         raise RuntimeError(msg)
-    use_exit = det.config.model.use_exit
     t0 = time.perf_counter()
     level_maps, broadcast_vecs = det.extractor.extract(frame)
-    if det.native is not None:
-        native = det.extractor.native(level_maps, broadcast_vecs, det.col_keep)
-        t1 = time.perf_counter()
-        probs = det.native.score(native, use_exit=use_exit)
-    else:
-        design = det.extractor.gather(
-            level_maps, broadcast_vecs, np.arange(GRID * GRID), col_keep=det.col_keep
-        )
-        t1 = time.perf_counter()
-        probs = det.runtime.predict_proba(design, use_exit=use_exit).astype(np.float32)
+    native = det.extractor.native(level_maps, broadcast_vecs, det.col_keep)
+    t1 = time.perf_counter()
+    probs = det.native.score(native, use_exit=det.config.model.use_exit)
     t2 = time.perf_counter()
     return probs.reshape(GRID, GRID).astype(np.float32), 1e3 * (t1 - t0), 1e3 * (t2 - t1)
 
@@ -285,32 +276,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-frames", type=int, default=None, help="stop after this many frames (tests)"
     )
-    parser.add_argument(
-        "--native-lib",
-        type=Path,
-        default=None,
-        help="the fastdet_native shared library, if not found automatically",
-    )
     return parser
 
 
-def main(argv: list[str] | None = None) -> int:  # noqa: C901 -- the display loop
+def main(argv: list[str] | None = None) -> int:
     """Entry point of ``fastdet-demo``."""
     args = build_parser().parse_args(argv)
-    if args.native_lib is not None:
-        import os  # noqa: PLC0415
-
-        os.environ["FASTDET_NATIVE_LIB"] = str(args.native_lib)
     det = Detector.load(args.model)
-    if det.native is None:
-        print(
-            "[fastdet-demo] WARNING: the C++ scorer (fastdet_native) was not found; scoring with the NumPy runtime,"
-            " hundreds of times slower. Run `fastdet-native-build` once, or pass --native-lib / set FASTDET_NATIVE_LIB.",
-            file=sys.stderr,
-        )
-    target = (
-        det.native.target if det.native is not None else "NumPy runtime: run fastdet-native-build"
-    )
+    target = det.native.target if det.native is not None else "unknown"
     frames, live = _frames(args.source)
     view = LatencyView(target=target, live=live, headless=args.headless)
     feature_hist: collections.deque[float] = collections.deque(maxlen=HISTORY)

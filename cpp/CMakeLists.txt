@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.15)
-project(fastdet_score LANGUAGES CXX)
+project(fastdet LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -39,12 +39,15 @@ FetchContent_MakeAvailable(highway)
 add_executable(fastdet_score fastdet_score.cpp)
 target_link_libraries(fastdet_score PRIVATE hwy)
 
-# The same scorer as a shared library with a small C API (see the end of fastdet_score.cpp),
-# loaded by fastdet.native through ctypes so Detector.predict_proba scores in-process.
-add_library(fastdet_native SHARED fastdet_score.cpp)
-target_compile_definitions(fastdet_native PRIVATE FASTDET_LIBRARY=1)
-target_link_libraries(fastdet_native PRIVATE hwy)
-set_target_properties(fastdet_native PROPERTIES POSITION_INDEPENDENT_CODE ON C_VISIBILITY_PRESET default)
-if(NOT MSVC)
-  set_target_properties(hwy PROPERTIES POSITION_INDEPENDENT_CODE ON)
+# The Python extension (fastdet._native_ext), built when scikit-build-core drives CMake during
+# `pip install` (SKBUILD is set) or when asked for explicitly.
+option(FASTDET_BUILD_PYTHON "Build the nanobind extension module" OFF)
+if(SKBUILD OR FASTDET_BUILD_PYTHON)
+  find_package(Python 3.10 COMPONENTS Interpreter Development.Module REQUIRED)
+  find_package(nanobind CONFIG REQUIRED)
+  # NOMINSIZE: nanobind builds for size (-Os) by default; the scorer is compute-bound.
+  nanobind_add_module(_native_ext NOMINSIZE fastdet_score.cpp bindings.cpp)
+  target_compile_definitions(_native_ext PRIVATE FASTDET_LIBRARY=1)
+  target_link_libraries(_native_ext PRIVATE hwy)
+  install(TARGETS _native_ext LIBRARY DESTINATION fastdet)
 endif()

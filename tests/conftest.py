@@ -94,17 +94,7 @@ def _build_scorer(build_dir: Path) -> Path:
     configure = [cmake, "-S", str(CPP_DIR), "-B", str(build_dir), "-DCMAKE_BUILD_TYPE=Release"]
     if os.environ.get("FASTDET_HWY_DIR"):
         configure.append(f"-DFETCHCONTENT_SOURCE_DIR_HIGHWAY={os.environ['FASTDET_HWY_DIR']}")
-    build = [
-        cmake,
-        "--build",
-        str(build_dir),
-        "--config",
-        "Release",
-        "--target",
-        "fastdet_score",
-        "--target",
-        "fastdet_native",
-    ]
+    build = [cmake, "--build", str(build_dir), "--config", "Release", "--target", "fastdet_score"]
     for step in (configure, build):
         result = subprocess.run(  # noqa: S603 -- argv is cmake and fixed arguments
             step, capture_output=True, text=True, check=False

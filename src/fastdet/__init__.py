@@ -18,7 +18,7 @@ Quickstart::
 from __future__ import annotations
 
 from .artifact import ModelArtifact
-from .config import Config, ExportConfig, ModelConfig, TrainConfig
+from .config import Config, ModelConfig, TrainConfig
 from .detector import Detector
 from .features import GRID, FeatureCache, FeatureExtractor
 from .metrics import paired_image_bootstrap, pooled_pr_auc
@@ -28,7 +28,6 @@ __all__ = [
     "GRID",
     "Config",
     "Detector",
-    "ExportConfig",
     "FeatureCache",
     "FeatureExtractor",
     "ImysModel",

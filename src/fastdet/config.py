@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping
 
-__all__ = ["Config", "ExportConfig", "ModelConfig", "TrainConfig"]
+__all__ = ["Config", "ModelConfig", "TrainConfig"]
 
 # Largest bin count the 4-bit (`vpshufb`) traversal can encode.
 MAX_BORDER_COUNT = 15
@@ -189,28 +189,11 @@ class TrainConfig:
 
 
 @dataclass
-class ExportConfig:
-    """Controls what the exported single-file artifact contains."""
-
-    shuffle_tables: bool = True  # Emit 4-bit vpshufb tables (blob v3) for the fast path.
-    verify: bool = True  # Decode the built artifact and compare to live scores.
-
-    def __post_init__(self) -> None:
-        """Reject export settings the shipped runtime cannot consume."""
-        if not self.shuffle_tables:
-            # The shipped C++ runtime scores via the shuffle tables; a v2 blob
-            # has no fast traversal, so refuse to emit a model nothing can run.
-            msg = "shuffle_tables must remain True for the shipped runtime"
-            raise ValueError(msg)
-
-
-@dataclass
 class Config:
     """The full model description: architecture, training front-end, export."""
 
     model: ModelConfig = field(default_factory=ModelConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
-    export: ExportConfig = field(default_factory=ExportConfig)
 
     # -- (de)serialization -------------------------------------------------
     def to_dict(self) -> dict[str, Any]:
@@ -229,8 +212,7 @@ class Config:
         if "levels" in train_d:
             train_d["levels"] = tuple(train_d["levels"])
         train = TrainConfig(**train_d)
-        export = ExportConfig(**(data.get("export") or {}))
-        return cls(model=model, train=train, export=export)
+        return cls(model=model, train=train)  # an "export" section in old artifacts is ignored
 
     def to_json(self, path: str | Path | None = None, indent: int = 2) -> str:
         """Serialize to a JSON string; also write it to ``path`` when given."""

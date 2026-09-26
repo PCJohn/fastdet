@@ -870,13 +870,8 @@ std::vector<Stage> parse_stages(const char* text, bool* ok) {
 }  // namespace
 
 // ---------------------------------------------------------------------------------------------
-// C API for in-process use (fastdet.native loads this through ctypes).
+// C API wrapped by the nanobind module in bindings.cpp (the module and this file are one build).
 
-#if defined(_WIN32)
-#define FASTDET_API extern "C" __declspec(dllexport)
-#else
-#define FASTDET_API extern "C" __attribute__((visibility("default")))
-#endif
 
 struct FastdetHandle {
   ImysModel model;
@@ -886,7 +881,7 @@ struct FastdetHandle {
 };
 
 // Parses an FDT1 container (or a bare IMSY blob) from memory; nullptr on failure.
-FASTDET_API void* fastdet_open(const uint8_t* bytes, size_t size) {
+extern "C" void* fastdet_open(const uint8_t* bytes, size_t size) {
   std::string raw(reinterpret_cast<const char*>(bytes), size);
   const uint8_t* blob = nullptr;
   size_t blob_size = 0;
@@ -903,25 +898,25 @@ FASTDET_API void* fastdet_open(const uint8_t* bytes, size_t size) {
   return h;
 }
 
-FASTDET_API void fastdet_close(void* handle) {
+extern "C" void fastdet_close(void* handle) {
   delete static_cast<FastdetHandle*>(handle);
 }
 
 // Number of floats the native fixture holds (Detector.native_matrix), and the grid's cell count.
-FASTDET_API size_t fastdet_native_size(void* handle) {
+extern "C" size_t fastdet_native_size(void* handle) {
   return static_cast<FastdetHandle*>(handle)->offset.back();
 }
-FASTDET_API size_t fastdet_cells(void*) {
+extern "C" size_t fastdet_cells(void*) {
   return kCells;
 }
-FASTDET_API const char* fastdet_target() {
+extern "C" const char* fastdet_target() {
   return hwy::TargetName(HWY_TARGET);
 }
 
 // Scores one image: `native` holds fastdet_native_size floats, `out` receives kCells probabilities
 // in row-major grid order.  With use_exit the model's calibrated stages apply (lazy binning, coarse
 // tier once per tile, early exit); without, every tree runs on every cell.  Returns 0 on success.
-FASTDET_API int fastdet_score(void* handle, const float* native, float* out, int use_exit) {
+extern "C" int fastdet_score(void* handle, const float* native, float* out, int use_exit) {
   auto* h = static_cast<FastdetHandle*>(handle);
   ScoreOptions opt;
   if (use_exit && !h->model.stages.empty()) {

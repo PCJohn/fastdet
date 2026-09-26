@@ -7,7 +7,7 @@ early exit), and writes:
 
 * ``report.md`` -- one row per combination (only the swept knobs as columns) with
   PR-AUC, ROC-AUC, best F1 and its threshold, precision / recall / IoU at that
-  threshold, fit time, model size and (when the C++ library is built) latency; the
+  threshold, fit time, model size and in-process latency; the
   framegate text heuristic as a baseline row; the best combination's full config.
 * ``curves.png`` -- precision-recall and ROC curves, side by side, of the best runs and the baseline.
 * ``results.json`` -- every run's config and metrics; re-running resumes from it.
@@ -26,7 +26,6 @@ import dataclasses
 import hashlib
 import itertools
 import json
-import os
 import re
 import sys
 import time
@@ -43,7 +42,6 @@ from .dataset import build_split
 from .detector import Detector
 from .features import _MEAN_IDX, GRID, RAW_FEATURE_NAMES, RAW_PER_CHANNEL, SPACE_INFO, FeatureCache
 from .metrics import pooled_pr_auc, score_validation_per_image
-from .native import native_library_path
 
 __all__ = ["framegate_text_heuristic", "main", "run_sweep"]
 
@@ -264,10 +262,8 @@ def _validation_scores(
     return np.concatenate(scores), np.concatenate(targets).astype(bool)
 
 
-def _latency_ms(det: Detector, image: NDArray[np.uint8], reps: int = 10) -> float | None:
-    """Milliseconds per ``predict_proba`` with the C++ scorer, or ``None`` without it."""
-    if det.native is None:
-        return None
+def _latency_ms(det: Detector, image: NDArray[np.uint8], reps: int = 10) -> float:
+    """Milliseconds per ``predict_proba`` (front-end + C++ scorer, in process)."""
     for _ in range(3):
         det.predict_proba(image)
     times = []
@@ -574,13 +570,6 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="rebuild report.md and the charts from results.json",
     )
-    parser.add_argument(
-        "--native-lib",
-        type=Path,
-        default=None,
-        help="the fastdet_native shared library (else FASTDET_NATIVE_LIB or the build directories); "
-        "with it the latency column is measured in-process",
-    )
     for name, (section, f) in _knob_fields().items():
         default = f.default if f.default is not dataclasses.MISSING else None
         parser.add_argument(
@@ -610,13 +599,6 @@ def sweep_from_args(args: argparse.Namespace) -> dict[str, list[Any]]:
 def main(argv: list[str] | None = None) -> int:
     """Entry point of ``fastdet-tune``."""
     args = build_parser().parse_args(argv)
-    if args.native_lib is not None:
-        os.environ["FASTDET_NATIVE_LIB"] = str(args.native_lib)
-    if native_library_path() is None:
-        print(
-            "[fastdet-tune] no fastdet_native library found (build cpp/ and pass --native-lib or set "
-            "FASTDET_NATIVE_LIB): the latency column will be empty"
-        )
     sweep = sweep_from_args(args)
     if args.report_only:
         results_path = args.out / "results.json"

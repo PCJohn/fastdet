@@ -16,30 +16,17 @@ feature ranking from a full-width fit before pruning (see *Pruning*).
 
 ## Install
 
-```sh
-git clone https://github.com/PCJohn/fastdet.git
-cd fastdet
-pip install -e ".[yaml,dev]"
+```
+pip install .            # or:  pip install -e .
 ```
 
-Runtime dependencies are `numpy`, `opencv-python`, `imfeat`, and `catboost`.
-`yaml` adds PyYAML for YAML configs; `dev` adds the test and lint tools. Drop
-both extras for a minimal install.
-
-Then build the C++ scorer once and install it into the package:
-
-```
-fastdet-native-build          # cmake on cpp/, copies fastdet_native into fastdet/_native/
-```
-
-Run it from the repository root (it looks for `cpp/` there, or next to an editable
-install). A plain `pip install .` replaces the package directory, so repeat the
-command after each reinstall -- or use `pip install -e .`, which keeps the built
-library across reinstalls. `--build-dir build\pytest-cpp` reuses the test build.
-Without the library `Detector` still works but scores with the NumPy runtime, which is
-bit-identical and hundreds of times slower; every entry point warns when that happens.
-`FASTDET_NATIVE_LIB=path` (or `--native-lib` on the commands) points at a library built
-elsewhere. Needs `cmake` and a C++17 compiler (Visual Studio Build Tools on Windows).
+`pip install` builds the C++ scorer as a Python extension (`fastdet._native_ext`,
+nanobind + Highway, via scikit-build-core), exactly as imfeat does, so a normal install
+scores in-process at full speed. It needs `cmake` and a C++17 compiler (Visual Studio
+Build Tools on Windows, Xcode command-line tools on macOS); Highway is fetched by CMake
+at build time. The extension is compiled for the machine it is built on
+(`-march=native`; `/arch:AVX2` with MSVC). The NumPy runtime in `fastdet.runtime` is the
+bit-identical reference the tests compare against, not a fallback.
 
 ## Quickstart
 
@@ -145,9 +132,7 @@ Frames are scored as they arrive; nothing is buffered ahead. The window is
 matplotlib's (`pip install -e ".[tune]"`), so it works with `opencv-python-headless`;
 OpenCV only decodes, resizes and colours. Keys: `q`/`Esc` quit, `space` pause, `s`
 save the figure. `--headless --output out.png` renders without a window;
-`--display-width` scales the frame panel; `--native-lib` points at the C++ library if
-it is not found automatically (without it the NumPy runtime scores, tens of
-milliseconds, and the panel says so). Drawing costs matplotlib a few tens of
+`--display-width` scales the frame panel. Drawing costs matplotlib a few tens of
 milliseconds per frame; the latency numbers exclude it.
 
 ## Using fastdet inside a host that already runs imfeat (framegate)
@@ -525,8 +510,7 @@ early exit), and writes a report folder:
 
 * `report.md` -- one row per combination (only the swept knobs appear as columns) with
   PR-AUC (primary), ROC-AUC, best F1 and its threshold, precision / recall / IoU at that
-  threshold, fit time, model size and, when the C++ library is built, `predict_proba`
-  latency; the framegate text heuristic as a baseline row; the best run's full config.
+  threshold, fit time, model size and in-process `predict_proba` latency; the framegate text heuristic as a baseline row; the best run's full config.
 * `curves.png` -- precision-recall and ROC curves side by side, for the best runs and the baseline.
 * `results.json`, `models/<label>-<key>.fdt` -- every run's config, metrics and exported model;
   the file name spells out the swept knobs (`n_trees=1000_stride=2-3f9a...fdt`) and the
@@ -543,9 +527,7 @@ That is 2 x 2 x 2 = 8 fits. Every knob takes a comma-separated list and the swee
 their Cartesian product, so name few knobs at a time; a knob you do not name keeps its
 default, which is the tuned production value. `--max-runs 2` smoke-tests a sweep,
 `--report-only` rebuilds the report and charts from `results.json`, `--no-baseline`
-skips the heuristic, `--native-lib path/to/fastdet_native.{dll,so,dylib}` (or the
-`FASTDET_NATIVE_LIB` variable) fills the latency column from the in-process scorer.
-Tuples take `/`: `--levels 64/32/16/8`. Runs that share front-end settings reuse the
+skips the heuristic. Tuples take `/`: `--levels 64/32/16/8`. Runs that share front-end settings reuse the
 extracted features and the perceptual-hash split cache, so only the first run of a
 sweep pays for extraction.
 
