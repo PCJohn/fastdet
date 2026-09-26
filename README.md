@@ -126,11 +126,14 @@ following the probability). Right: latency -- for an image the two numbers, for 
 video or webcam a live time series over the last 240 frames of (1) feature
 extraction (resize, colour conversion, imfeat, context banks, packing) and (2) the
 model (binning, coarse tier, fine trees, sigmoid), plus the total and the frame rate.
-Frames are scored as they arrive; nothing is buffered ahead. Keys: `q`/`Esc` quit,
-`space` pause, `s` save the composite. `--headless --output out.png` renders without
-a window; `--display-width` scales the frame panel; `--native-lib` points at the C++
-library if it is not found automatically (without it the NumPy runtime scores, tens
-of milliseconds, and the panel says so).
+Frames are scored as they arrive; nothing is buffered ahead. The window is
+matplotlib's (`pip install -e ".[tune]"`), so it works with `opencv-python-headless`;
+OpenCV only decodes, resizes and colours. Keys: `q`/`Esc` quit, `space` pause, `s`
+save the figure. `--headless --output out.png` renders without a window;
+`--display-width` scales the frame panel; `--native-lib` points at the C++ library if
+it is not found automatically (without it the NumPy runtime scores, tens of
+milliseconds, and the panel says so). Drawing costs matplotlib a few tens of
+milliseconds per frame; the latency numbers exclude it.
 
 ## Using fastdet inside a host that already runs imfeat (framegate)
 

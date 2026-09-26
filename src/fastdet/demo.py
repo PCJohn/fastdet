@@ -11,10 +11,12 @@ colormap, opacity following the probability).  Right panel: latency.  For an
 image, the two numbers; for a video or webcam, a live time series of (1) feature
 extraction (resize, colour conversion, imfeat, and the context banks and packing
 into the scorer's layout) and (2) the model (binning, coarse tier, fine trees, sigmoid).
-Frames are processed as they arrive; nothing is buffered ahead.
+Frames are scored as they arrive; nothing is buffered ahead.
 
-Keys: ``q``/``Esc`` quit, ``space`` pause, ``s`` save the composite to the working
-directory.  ``--headless --output out.png`` renders without a window (tests, servers).
+The window is matplotlib's, so it works with ``opencv-python-headless`` (OpenCV is
+used only for decoding, resizing and colouring).  Keys: ``q``/``Esc`` quit,
+``space`` pause, ``s`` save the figure to the working directory.  ``--headless
+--output out.png`` renders without a window (tests, servers).
 """
 
 from __future__ import annotations
@@ -24,29 +26,25 @@ import collections
 import sys
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import cv2
 import numpy as np
 
 from .detector import Detector
+from .features import GRID
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
     from numpy.typing import NDArray
 
-__all__ = ["main", "render_composite", "score_frame"]
+__all__ = ["LatencyView", "main", "overlay", "score_frame"]
 
-PANEL_WIDTH = 440
-MIN_HEIGHT = 420  # the latency panel needs room for its plot; small frames are letterboxed
 HISTORY = 240  # frames of latency history kept for the plot
-_MIN_POINTS = 2  # a line needs two points
-_FONT = cv2.FONT_HERSHEY_SIMPLEX
-_INK = (235, 235, 235)
-_MUTED = (140, 140, 140)
-_FEATURE_COLOUR = (80, 200, 255)  # BGR: amber
-_MODEL_COLOUR = (120, 220, 120)  # BGR: green
+_FEATURE_COLOUR = "#ffb347"  # amber
+_MODEL_COLOUR = "#78dc78"  # green
+_IMAGE_TYPES = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff"}
 
 
 def score_frame(
@@ -61,140 +59,183 @@ def score_frame(
     if det.runtime is None:
         msg = "detector is not fitted; call fit() or load()"
         raise RuntimeError(msg)
+    use_exit = det.config.model.use_exit
     t0 = time.perf_counter()
     level_maps, broadcast_vecs = det.extractor.extract(frame)
     if det.native is not None:
         native = det.extractor.native(level_maps, broadcast_vecs, det.col_keep)
         t1 = time.perf_counter()
-        probs = det.native.score(native, use_exit=det.config.model.use_exit)
+        probs = det.native.score(native, use_exit=use_exit)
     else:
-        from .features import GRID  # noqa: PLC0415
-
         design = det.extractor.gather(
             level_maps, broadcast_vecs, np.arange(GRID * GRID), col_keep=det.col_keep
         )
         t1 = time.perf_counter()
-        probs = det.runtime.predict_proba(design, use_exit=det.config.model.use_exit).astype(
-            np.float32
-        )
+        probs = det.runtime.predict_proba(design, use_exit=use_exit).astype(np.float32)
     t2 = time.perf_counter()
-    side = round(float(np.sqrt(probs.size)))
-    return probs.reshape(side, side).astype(np.float32), 1e3 * (t1 - t0), 1e3 * (t2 - t1)
+    return probs.reshape(GRID, GRID).astype(np.float32), 1e3 * (t1 - t0), 1e3 * (t2 - t1)
 
 
 def overlay(
     frame: NDArray[np.uint8], probs: NDArray[np.float32], alpha: float = 0.6
 ) -> NDArray[np.uint8]:
-    """The frame with the probability map blended over it (opacity follows the probability)."""
+    """The frame (BGR in) with the probability map blended over it, as RGB for matplotlib."""
     h, w = frame.shape[:2]
     heat = cv2.resize(probs, (w, h), interpolation=cv2.INTER_LINEAR)
     colour = cv2.applyColorMap((heat * 255).astype(np.uint8), cv2.COLORMAP_JET)
     weight = (alpha * heat)[..., None]
     blended = frame.astype(np.float32) * (1.0 - weight) + colour.astype(np.float32) * weight
-    return np.asarray(np.clip(blended, 0, 255), dtype=np.uint8)
+    rgb = cv2.cvtColor(np.clip(blended, 0, 255).astype(np.uint8), cv2.COLOR_BGR2RGB)
+    return np.asarray(rgb, dtype=np.uint8)
 
 
-def _plot(
-    panel: NDArray[np.uint8],
-    top: int,
-    bottom: int,
-    series: list[tuple[str, tuple[int, int, int], collections.deque[float]]],
-) -> None:
-    """Line plots of the latency series into ``panel[top:bottom]``, shared y axis."""
-    left, right = 44, panel.shape[1] - 12
-    values = [v for _, _, hist in series for v in hist]
-    y_max = max(1.0, float(np.percentile(values, 98)) * 1.15) if values else 1.0
-    cv2.rectangle(panel, (left, top), (right, bottom), (60, 60, 60), 1)
-    for k in range(1, 4):  # grid lines with labels
-        y = bottom - int((bottom - top) * k / 4)
-        cv2.line(panel, (left, y), (right, y), (50, 50, 50), 1)
-        cv2.putText(panel, f"{y_max * k / 4:.1f}", (2, y + 4), _FONT, 0.38, _MUTED, 1, cv2.LINE_AA)
-    cv2.putText(panel, "ms", (2, top + 10), _FONT, 0.38, _MUTED, 1, cv2.LINE_AA)
-    for _label, colour, hist in series:
-        if len(hist) < _MIN_POINTS:
-            continue
-        xs = np.linspace(left, right, HISTORY)[-len(hist) :]
-        ys = bottom - (np.clip(np.asarray(hist, dtype=np.float64), 0, y_max) / y_max) * (
-            bottom - top
-        )
-        pts = np.stack([xs, ys], axis=1).astype(np.int32).reshape(-1, 1, 2)
-        cv2.polylines(panel, [pts], isClosed=False, color=colour, thickness=2, lineType=cv2.LINE_AA)
+class LatencyView:
+    """The two-panel matplotlib figure, updated in place frame after frame."""
 
+    def __init__(self, *, target: str, live: bool, headless: bool) -> None:
+        """Build the figure; ``headless`` selects the Agg backend (no window)."""
+        import matplotlib as mpl  # noqa: PLC0415 -- optional dependency, backend chosen here
 
-def render_composite(  # noqa: PLR0913 -- one panel, all of its inputs
-    frame: NDArray[np.uint8],
-    probs: NDArray[np.float32],
-    feature_hist: collections.deque[float],
-    model_hist: collections.deque[float],
-    *,
-    target: str,
-    live: bool,
-    fps: float | None = None,
-) -> NDArray[np.uint8]:
-    """Overlay panel on the left, latency panel on the right, same height."""
-    view = overlay(frame, probs)
-    if view.shape[0] < MIN_HEIGHT:  # letterbox small frames so the panel keeps its layout
-        pad = MIN_HEIGHT - view.shape[0]
-        view = np.asarray(
-            cv2.copyMakeBorder(
-                view, pad // 2, pad - pad // 2, 0, 0, cv2.BORDER_CONSTANT, value=(24, 24, 24)
-            ),
-            dtype=np.uint8,
+        if headless:
+            mpl.use("Agg")
+        import matplotlib.pyplot as plt  # noqa: PLC0415
+
+        self.plt = plt
+        self.live = live
+        self.quit = False
+        self.paused = False
+        self.save_requested = False
+        self.fig = plt.figure(figsize=(14, 6.5), facecolor="#181818")
+        grid = self.fig.add_gridspec(
+            2, 2, width_ratios=[3, 1.6], height_ratios=[1, 2.6], hspace=0.05
         )
-    h = view.shape[0]
-    panel = np.full((h, PANEL_WIDTH, 3), 24, dtype=np.uint8)
-    y = 28
-    cv2.putText(panel, "fastdet latency", (12, y), _FONT, 0.6, _INK, 1, cv2.LINE_AA)
-    y += 22
-    cv2.putText(panel, f"scorer: {target}", (12, y), _FONT, 0.42, _MUTED, 1, cv2.LINE_AA)
-    y += 30
-    rows = [
-        ("feature extraction", _FEATURE_COLOUR, feature_hist),
-        ("model (bin + trees)", _MODEL_COLOUR, model_hist),
-    ]
-    for label, colour, hist in rows:
-        last = hist[-1] if hist else 0.0
-        med = float(np.median(hist)) if hist else 0.0
-        cv2.putText(panel, label, (12, y), _FONT, 0.48, colour, 1, cv2.LINE_AA)
-        text = f"{last:6.2f} ms" + (f"   median {med:6.2f}" if live and len(hist) > 1 else "")
-        cv2.putText(panel, text, (12, y + 20), _FONT, 0.48, _INK, 1, cv2.LINE_AA)
-        y += 48
-    total = (feature_hist[-1] if feature_hist else 0.0) + (model_hist[-1] if model_hist else 0.0)
-    cv2.putText(
-        panel,
-        f"total {total:6.2f} ms" + (f"   {fps:5.1f} fps" if fps else ""),
-        (12, y),
-        _FONT,
-        0.5,
-        _INK,
-        1,
-        cv2.LINE_AA,
-    )
-    y += 20
-    if live:
-        _plot(panel, y + 10, h - 30, rows)
-        cv2.putText(
-            panel, f"last {HISTORY} frames", (12, h - 10), _FONT, 0.38, _MUTED, 1, cv2.LINE_AA
+        self.ax_img = self.fig.add_subplot(grid[:, 0])
+        self.ax_text = self.fig.add_subplot(grid[0, 1])
+        self.ax_lat = self.fig.add_subplot(grid[1, 1])
+        self.ax_text.set_axis_off()
+        if self.fig.canvas.manager is not None:
+            self.fig.canvas.manager.set_window_title("fastdet")
+        self.ax_img.set_axis_off()
+        self.image_artist: Any = None
+        ax = self.ax_lat
+        ax.set_facecolor("#181818")
+        for spine in ax.spines.values():
+            spine.set_color("#444444")
+        ax.tick_params(colors="#bbbbbb", labelsize=8)
+        self.ax_text.set_title(
+            f"fastdet latency   [{target}]", color="#eeeeee", fontsize=11, loc="left"
         )
-    else:
-        cv2.putText(
-            panel, "single image: one measurement", (12, y + 20), _FONT, 0.4, _MUTED, 1, cv2.LINE_AA
+        ax.set_ylabel("ms", color="#bbbbbb", fontsize=8)
+        (self.feature_line,) = ax.plot(
+            [], [], color=_FEATURE_COLOUR, lw=1.8, label="feature extraction"
         )
-    return np.asarray(cv2.hconcat([view, panel]), dtype=np.uint8)
+        (self.model_line,) = ax.plot(
+            [], [], color=_MODEL_COLOUR, lw=1.8, label="model (bin + trees)"
+        )
+        ax.grid(alpha=0.25)
+        ax.set_xlim(0, HISTORY)
+        ax.set_xlabel(f"last {HISTORY} frames" if live else "", color="#bbbbbb", fontsize=8)
+        ax.legend(
+            loc="upper left",
+            fontsize=8,
+            facecolor="#242424",
+            edgecolor="#444444",
+            labelcolor="#eeeeee",
+        )
+        self.text = self.ax_text.text(
+            0.0,
+            0.5,
+            "",
+            transform=self.ax_text.transAxes,
+            color="#eeeeee",
+            fontsize=10,
+            family="monospace",
+            va="center",
+        )
+        if not live:
+            ax.set_xticks([])
+            ax.set_yticks([])
+        self.fig.tight_layout()
+        if not headless:
+            self.fig.canvas.mpl_connect("key_press_event", self._on_key)
+            self.fig.canvas.mpl_connect("close_event", lambda _event: setattr(self, "quit", True))
+            plt.ion()
+            plt.show(block=False)
+
+    def _on_key(self, event: Any) -> None:
+        if event.key in {"q", "escape"}:
+            self.quit = True
+        elif event.key == " ":
+            self.paused = not self.paused
+        elif event.key == "s":
+            self.save_requested = True
+
+    def update(
+        self,
+        rgb: NDArray[np.uint8],
+        feature_hist: collections.deque[float],
+        model_hist: collections.deque[float],
+        *,
+        fps: float | None,
+        frame_index: int,
+    ) -> None:
+        """Draw one frame: overlay left, numbers and series right."""
+        if self.image_artist is None:
+            self.image_artist = self.ax_img.imshow(rgb, interpolation="nearest")
+        else:
+            self.image_artist.set_data(rgb)
+            if self.image_artist.get_extent()[1] != rgb.shape[1]:
+                self.image_artist.set_extent((-0.5, rgb.shape[1] - 0.5, rgb.shape[0] - 0.5, -0.5))
+        feat, model = feature_hist[-1], model_hist[-1]
+        lines = [
+            f"feature extraction {feat:7.2f} ms",
+            f"model (bin+trees)  {model:7.2f} ms",
+            f"total              {feat + model:7.2f} ms",
+        ]
+        if self.live:
+            lines[0] += f"   median {np.median(feature_hist):6.2f}"
+            lines[1] += f"   median {np.median(model_hist):6.2f}"
+            if fps:
+                lines[2] += f"   {fps:5.1f} fps   frame {frame_index}"
+            x = np.arange(len(feature_hist))
+            self.feature_line.set_data(x, np.asarray(feature_hist))
+            self.model_line.set_data(x, np.asarray(model_hist))
+            top = max(float(np.percentile(list(feature_hist) + list(model_hist), 98)) * 1.2, 1.0)
+            self.ax_lat.set_ylim(0, top)
+        else:
+            lines.append("")
+            lines.append("single image: one measurement")
+        self.text.set_text("\n".join(lines))
+        self.fig.canvas.draw_idle()
+        self.fig.canvas.flush_events()
+
+    def pump(self, seconds: float = 0.001) -> None:
+        """Let the window process events (keys, close); blocks while paused."""
+        self.plt.pause(seconds)
+        while self.paused and not self.quit:
+            self.plt.pause(0.05)
+
+    def save(self, path: Path) -> None:
+        """Write the current figure as an image."""
+        self.fig.savefig(path, dpi=110, facecolor=self.fig.get_facecolor())
+
+    def block(self) -> None:
+        """Keep a single image on screen until the window is closed or ``q`` is pressed."""
+        while not self.quit and self.plt.fignum_exists(self.fig.number):
+            self.plt.pause(0.05)
+            if self.save_requested:
+                self.save_requested = False
+                self.save(Path("fastdet_image.png"))
+
+    def close(self) -> None:
+        """Close the window."""
+        self.plt.close(self.fig)
 
 
 def _frames(source: str) -> tuple[Iterator[NDArray[np.uint8]], bool]:
     """``(frames, live)``: one frame for an image, a stream for a video or a webcam index."""
     path = Path(source)
-    if path.is_file() and path.suffix.lower() in {
-        ".png",
-        ".jpg",
-        ".jpeg",
-        ".bmp",
-        ".webp",
-        ".tif",
-        ".tiff",
-    }:
+    if path.is_file() and path.suffix.lower() in _IMAGE_TYPES:
         image = cv2.imread(str(path))
         if image is None:
             msg = f"cannot read image {source}"
@@ -241,7 +282,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--display-width", type=int, default=960, help="scale the frame panel down to this width"
     )
     parser.add_argument("--headless", action="store_true", help="no window; use with --output")
-    parser.add_argument("--output", type=Path, default=None, help="write the (last) composite here")
+    parser.add_argument("--output", type=Path, default=None, help="write the (last) figure here")
     parser.add_argument(
         "--max-frames", type=int, default=None, help="stop after this many frames (tests)"
     )
@@ -265,52 +306,46 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901 -- the display loo
     target = (
         det.native.target
         if det.native is not None
-        else "NumPy runtime (build cpp/ for the C++ scorer)"
+        else "NumPy runtime: build cpp/ for the C++ scorer"
     )
     frames, live = _frames(args.source)
+    view = LatencyView(target=target, live=live, headless=args.headless)
     feature_hist: collections.deque[float] = collections.deque(maxlen=HISTORY)
     model_hist: collections.deque[float] = collections.deque(maxlen=HISTORY)
-    composite = None
-    paused = False
     last_tick = time.perf_counter()
     fps: float | None = None
+    n = 0
     for n, frame in enumerate(frames, 1):
         probs, feature_ms, model_ms = score_frame(det, frame)
         feature_hist.append(feature_ms)
         model_hist.append(model_ms)
         now = time.perf_counter()
         if live:
-            fps = (
-                0.9 * fps + 0.1 / max(now - last_tick, 1e-6)
-                if fps
-                else 1.0 / max(now - last_tick, 1e-6)
-            )
+            instant = 1.0 / max(now - last_tick, 1e-6)
+            fps = instant if fps is None else 0.9 * fps + 0.1 * instant
         last_tick = now
-        composite = render_composite(
-            _fit_width(frame, args.display_width),
-            probs,
+        view.update(
+            overlay(_fit_width(frame, args.display_width), probs),
             feature_hist,
             model_hist,
-            target=target,
-            live=live,
             fps=fps,
+            frame_index=n,
         )
         if not args.headless:
-            cv2.imshow("fastdet", composite)
-            key = cv2.waitKey(0 if not live or paused else 1) & 0xFF
-            if key in {ord("q"), 27}:
+            view.pump()
+            if view.save_requested:
+                view.save_requested = False
+                view.save(Path(f"fastdet_{n:05d}.png"))
+            if view.quit:
                 break
-            if key == ord(" "):
-                paused = not paused
-            if key == ord("s"):
-                cv2.imwrite(f"fastdet_{n:05d}.png", composite)
         if args.max_frames is not None and n >= args.max_frames:
             break
-    if composite is not None and args.output is not None:
-        cv2.imwrite(str(args.output), composite)
+    if args.output is not None and n:
+        view.save(args.output)
         print(f"[fastdet-demo] wrote {args.output}")
-    if not args.headless:
-        cv2.destroyAllWindows()
+    if not args.headless and not live and not view.quit:
+        view.block()
+    view.close()
     if feature_hist:
         print(
             f"[fastdet-demo] {len(feature_hist)} frame(s): feature extraction median {np.median(feature_hist):.2f} ms,"

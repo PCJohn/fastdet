@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-import collections
 from typing import TYPE_CHECKING
 
 import cv2
 import numpy as np
 
 from fastdet import Detector
-from fastdet.demo import main, render_composite, score_frame
+from fastdet.demo import main, overlay, score_frame
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -65,13 +64,6 @@ def test_demo_image_and_video_headless(
     assert probs.shape == (64, 64)
     assert feature_ms > 0
     assert model_ms > 0
-
-    panel = render_composite(
-        frame,
-        probs,
-        collections.deque([feature_ms]),
-        collections.deque([model_ms]),
-        target="test",
-        live=False,
-    )
-    assert panel.dtype == np.uint8
+    rgb = overlay(frame, probs)
+    assert rgb.shape == frame.shape
+    assert rgb.dtype == np.uint8

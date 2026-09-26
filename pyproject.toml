@@ -22,7 +22,7 @@ fastdet-demo = "fastdet.demo:main"
 
 [project.optional-dependencies]
 yaml = ["PyYAML"]
-tune = ["matplotlib"]  # charts for fastdet-tune
+tune = ["matplotlib"]  # charts for fastdet-tune, and the fastdet-demo window
 dev = [
     "pytest",
     "ruff",
