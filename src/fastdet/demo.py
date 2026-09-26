@@ -298,13 +298,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-frames", type=int, default=None, help="stop after this many frames (tests)"
     )
+    parser.add_argument(
+        "--threads",
+        type=int,
+        default=None,
+        help="imfeat threads for the front-end (default: cores, at most 8)",
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:  # noqa: C901 -- the display loop and its exits
     """Entry point of ``fastdet-demo``."""
     args = build_parser().parse_args(argv)
-    det = Detector.load(args.model)
+    det = Detector.load(args.model, threads=args.threads)
     target = det.native.target if det.native is not None else "unknown"
     frames, live = _frames(args.source)
     view = LatencyView(target=target, live=live, headless=args.headless)

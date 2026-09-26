@@ -70,11 +70,18 @@ class Detector:
         >>> prob = det.predict_proba("page.png")          # doctest: +SKIP
     """
 
-    def __init__(self, config: Config | ModelConfig | None = None, **model_overrides: Any) -> None:
+    def __init__(
+        self,
+        config: Config | ModelConfig | None = None,
+        threads: int | None = None,
+        **model_overrides: Any,
+    ) -> None:
         """Build a detector, optionally overriding individual model fields.
 
         ``config`` may be a full :class:`Config` or just a :class:`ModelConfig`;
-        ``**model_overrides`` (e.g. ``depth=7``) are applied on top of it.
+        ``**model_overrides`` (e.g. ``depth=7``) are applied on top of it.  ``threads``
+        is imfeat's thread count for the front-end (``None`` = the machine's cores, at
+        most 8); it changes speed only, the features are bit-identical at any count.
         """
         resolved = config or Config()
         # Accept a plain ModelConfig too, so Detector(ModelConfig(depth=7)) works.
@@ -84,6 +91,7 @@ class Detector:
             model = dataclasses.replace(resolved.model, **model_overrides)
             resolved = dataclasses.replace(resolved, model=model)
         self.config = resolved
+        self.threads = threads  # imfeat threads for the front-end (None = default_threads())
 
         self.booster: CatBoostClassifier | None = None  # when training in-process
         self.runtime: ImysModel | None = None  # scoring engine (fitted or loaded)
@@ -105,10 +113,13 @@ class Detector:
         return cls(config=Config.from_file(path))
 
     @classmethod
-    def load(cls, path: str | Path) -> Detector:
-        """Load a detector from a single-file artifact written by :meth:`export`."""
+    def load(cls, path: str | Path, threads: int | None = None) -> Detector:
+        """Load a detector from a single-file artifact written by :meth:`export`.
+
+        ``threads`` is imfeat's thread count for the front-end (see :meth:`__init__`).
+        """
         artifact = ModelArtifact.load(path)
-        det = cls(config=artifact.config)
+        det = cls(config=artifact.config, threads=threads)
         det.runtime = parse_blob(artifact.blob)
         det.feature_names = list(artifact.feature_names)
         det.base_names = det.extractor.base_names
@@ -122,7 +133,7 @@ class Detector:
     def extractor(self) -> FeatureExtractor:
         """The front-end extractor for this detector's config (built once)."""
         if self._extractor is None:
-            self._extractor = FeatureExtractor(self.config.train)
+            self._extractor = FeatureExtractor(self.config.train, self.threads)
         return self._extractor
 
     # -- feature selection --------------------------------------------------

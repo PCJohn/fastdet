@@ -29,6 +29,7 @@ inside imfeat's raw block, seven columns per channel.
 from __future__ import annotations
 
 import math
+import os
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -61,6 +62,7 @@ __all__ = [
     "parse_level_list",
 ]
 
+_MAX_DEFAULT_THREADS = 8  # imfeat threads by default; more buys little on a 1024-px pass
 Image = NDArray[np.uint8]
 FloatArray = NDArray[np.float32]
 
@@ -301,16 +303,28 @@ def compute_global_stats(global_raw: FloatArray, orig_h: int, orig_w: int) -> Fl
     ).astype(np.float32)
 
 
+def default_threads() -> int:
+    """Imfeat threads used when none are given: the machine's cores, at most 8."""
+    return max(1, min(_MAX_DEFAULT_THREADS, os.cpu_count() or 1))
+
+
 def make_feature_computer(
-    available_levels: tuple[int, ...], thumb: int = THUMB, stride: int = STRIDE
+    available_levels: tuple[int, ...],
+    thumb: int = THUMB,
+    stride: int = STRIDE,
+    threads: int | None = None,
 ) -> tuple[Any, int]:
-    """Build the single-threaded imfeat computer for ``available_levels``."""
+    """Build the imfeat computer for ``available_levels``.
+
+    imfeat partitions the work by cell, so its output is bit-identical for any thread
+    count; ``threads`` only sets how fast the pass runs (``None`` = :func:`default_threads`).
+    """
     exponents = [exponent_for_size(size) for size in available_levels]
     computer = imfeat.FeatureComputer(
         shape=(thumb, thumb, 3),
         grid=[(e, e) for e in exponents],
         stride=stride,
-        threads=1,  # single-threaded: keeps extraction deterministic and comparable
+        threads=threads if threads is not None else default_threads(),
     )
     return computer, len(exponents)
 
@@ -322,7 +336,7 @@ class FeatureExtractor:
     whole split (via :class:`FeatureCache`) or a single ``predict_proba`` call.
     """
 
-    def __init__(self, cfg: TrainConfig) -> None:
+    def __init__(self, cfg: TrainConfig, threads: int | None = None) -> None:
         """Configure the imfeat pyramid and the enabled feature banks."""
         self.cfg = cfg
         self.levels: tuple[int, ...] = tuple(sorted(cfg.levels, reverse=True))
@@ -347,10 +361,11 @@ class FeatureExtractor:
         self._plans: dict[bytes, tuple[int, list[_Copy]]] = {}
         self._all_cells = np.arange(GRID * GRID)
 
-        self.fc, self.n_levels = make_feature_computer(self.levels, cfg.thumb, cfg.stride)
+        self.threads = threads
+        self.fc, self.n_levels = make_feature_computer(self.levels, cfg.thumb, cfg.stride, threads)
         self.extra_computers: list[tuple[Any, int, str]] = []
         for scale in self.extra_scales:
-            computer, _ = make_feature_computer(self.levels, scale.thumb, scale.stride)
+            computer, _ = make_feature_computer(self.levels, scale.thumb, scale.stride, threads)
             self.extra_computers.append((computer, scale.thumb, scale.label))
 
         self.base_names = self._build_names()
