@@ -40,7 +40,7 @@ if TYPE_CHECKING:
 
     from numpy.typing import NDArray
 
-__all__ = ["LatencyView", "main", "overlay", "score_frame"]
+__all__ = ["LatencyView", "front_end_note", "main", "overlay", "score_frame"]
 
 HISTORY = 240  # frames of latency history kept for the plot
 # Redraw every N frames (--draw-every); scoring runs on every frame. A matplotlib redraw
@@ -49,6 +49,7 @@ HISTORY = 240  # frames of latency history kept for the plot
 # third one for the same reason, which is what makes the two demos' numbers comparable.
 DRAW_EVERY = 3
 GC_EVERY = 300  # frames between manual collections while the collector is off
+_COLOUR_NDIM = 3  # (H, W, C)
 _FEATURE_COLOUR = "#ffb347"  # amber
 _MODEL_COLOUR = "#78dc78"  # green
 _IMAGE_TYPES = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff"}
@@ -72,6 +73,26 @@ def score_frame(
     probs = det.native.score(native, use_exit=det.config.model.use_exit)
     t2 = time.perf_counter()
     return probs.reshape(GRID, GRID).astype(np.float32), 1e3 * (t1 - t0), 1e3 * (t2 - t1)
+
+
+def front_end_note(det: Detector, frame: NDArray[np.uint8]) -> str:
+    """One line on how this frame size reaches the model.
+
+    The source and thumbnail sizes, and whether imfeat makes the thumbnail inside its
+    pass or cv2 resizes first.
+    """
+    h, w = frame.shape[:2]
+    thumb = det.config.train.thumb
+    if det.extractor.fuses_resize(frame):
+        how = "made inside imfeat's pass"
+    elif frame.ndim == _COLOUR_NDIM and (h < thumb or w < thumb):
+        how = (
+            f"by cv2.resize, since the frame is smaller than {thumb} px in an axis"
+            f" (imfeat makes it inside its pass from {thumb}x{thumb} up)"
+        )
+    else:
+        how = "by cv2.resize"
+    return f"[fastdet-demo] {w}x{h} frames -> {thumb}x{thumb} thumbnail {how}"
 
 
 def overlay(
@@ -350,6 +371,8 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901, PLR0912, PLR0915 
     try:
         for n, frame in enumerate(frames, 1):
             probs, feature_ms, model_ms = score_frame(det, frame)
+            if n == 1:
+                print(front_end_note(det, frame))
             feature_hist.append(feature_ms)
             model_hist.append(model_ms)
             now = time.perf_counter()

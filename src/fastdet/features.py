@@ -424,12 +424,13 @@ class FeatureExtractor:
         """``(computer, thumb, label)`` per extra scale (built on first use)."""
         return self._imfeat()[1]
 
-    def _fuses(self, img_bgr: Image) -> bool:
-        """Whether ``img_bgr`` goes into imfeat whole.
+    def fuses_resize(self, img_bgr: Image) -> bool:
+        """Whether ``img_bgr`` goes into imfeat whole, which then makes the thumbnail.
 
         Fusing on, the colour conversion inside the pass (HSV), the box filter, and a BGR
         frame at least the thumbnail's size in both axes (an upscale is bilinear in OpenCV,
-        not ``INTER_AREA``).
+        not ``INTER_AREA``); otherwise cv2 resizes first, which for a frame smaller than
+        the thumbnail is the cheap bilinear path anyway.
         """
         cfg = self.cfg
         return (
@@ -637,14 +638,14 @@ class FeatureExtractor:
         """Resize and run imfeat: ``(result, extra_results)`` for :meth:`compose`.
 
         The thumbnail resize and the colour conversion happen inside imfeat's pass when
-        they can (see :meth:`_fuses`; the frame goes in whole and the pass makes the
+        they can (see :meth:`fuses_resize`; the frame goes in whole and the pass makes the
         thumbnail, ``cv2.resize``'s bytes exactly), or here first otherwise -- a frame
         smaller than the thumbnail, the nearest-neighbour filter, a colour space imfeat
         cannot convert to (see :class:`SpaceInfo`).  Same numbers either way.
         """
         cfg = self.cfg
         space = SPACE_INFO[cfg.imfeat_space]
-        if self._fuses(img_bgr):
+        if self.fuses_resize(img_bgr):
             fc = self._fused_computer(img_bgr.shape)
             if not self.extra_scales:
                 return fc.features(img_bgr), []

@@ -105,7 +105,7 @@ def test_fused_resize_matches_cv2_path(tiny_model: Path) -> None:
     plain = FeatureExtractor(cfg, threads=2, fuse_resize=False)
     for frame in frames:
         fused = det.extractor
-        assert fused._fuses(frame) == (frame.shape[0] >= cfg.thumb)
+        assert fused.fuses_resize(frame) == (frame.shape[0] >= cfg.thumb)
         a, b = fused.extract(frame), plain.extract(frame)
         for size in fused.levels:
             for x, y in zip(a[0][size], b[0][size], strict=True):

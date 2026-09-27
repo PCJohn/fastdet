@@ -187,7 +187,7 @@ def test_front_end_latency(size: int, stride: int) -> None:
     image = rng.integers(0, 256, (*SOURCE_HW, 3), dtype=np.uint8)
     thumb = cv2.resize(image, (size, size), interpolation=cv2.INTER_AREA)
     level_maps, broadcast = extractor.extract(image)
-    assert extractor._fuses(image)
+    assert extractor.fuses_resize(image)
 
     resize = lambda: cv2.resize(image, (size, size), interpolation=cv2.INTER_AREA)  # noqa: E731
     cv2_threads = cv2.getNumThreads()
