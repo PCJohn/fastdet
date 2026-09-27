@@ -55,23 +55,35 @@ _MODEL_COLOUR = "#78dc78"  # green
 _IMAGE_TYPES = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff"}
 
 
+STAGES = ("imfeat pass", "context banks", "packing")  # the front-end's parts, as timed
+
+
 def score_frame(
-    det: Detector, frame: NDArray[np.uint8]
+    det: Detector, frame: NDArray[np.uint8], stages: dict[str, list[float]] | None = None
 ) -> tuple[NDArray[np.float32], float, float]:
     """``(probability map, feature ms, model ms)`` for one BGR frame.
 
     Feature extraction is the front-end (resize, colour conversion, imfeat, context
-    banks, packing); the model is the C++ scorer on that input.
+    banks, packing); the model is the C++ scorer on that input.  With ``stages`` (lists
+    keyed by :data:`STAGES`) each part's milliseconds are appended to its list, so a run
+    can say where the front-end's time goes.
     """
     if det.native is None:
         msg = "detector is not fitted; call fit() or load()"
         raise RuntimeError(msg)
+    extractor = det.extractor
     t0 = time.perf_counter()
-    level_maps, broadcast_vecs = det.extractor.extract(frame)
+    result, extra = extractor.run_imfeat(frame)
+    ta = time.perf_counter()
+    level_maps, broadcast_vecs = extractor.compose(result, frame.shape[:2], extra)
+    tb = time.perf_counter()
     native = det.pack_native(level_maps, broadcast_vecs)  # one buffer, reused per frame
     t1 = time.perf_counter()
     probs = det.native.score(native, use_exit=det.config.model.use_exit)
     t2 = time.perf_counter()
+    if stages is not None:
+        for name, ms in zip(STAGES, (ta - t0, tb - ta, t1 - tb), strict=True):
+            stages[name].append(1e3 * ms)
     return probs.reshape(GRID, GRID).astype(np.float32), 1e3 * (t1 - t0), 1e3 * (t2 - t1)
 
 
@@ -354,6 +366,9 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901, PLR0912, PLR0915 
     view = LatencyView(target=target, live=live, headless=args.headless)
     feature_hist: collections.deque[float] = collections.deque(maxlen=HISTORY)
     model_hist: collections.deque[float] = collections.deque(maxlen=HISTORY)
+    stage_hist: dict[str, list[float]] = {
+        name: collections.deque(maxlen=HISTORY) for name in STAGES  # type: ignore[misc]
+    }
     draw_every = max(1, args.draw_every)
     last_tick = time.perf_counter()
     fps: float | None = None
@@ -373,7 +388,7 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901, PLR0912, PLR0915 
     gc.disable()
     try:
         for n, frame in enumerate(frames, 1):
-            probs, feature_ms, model_ms = score_frame(det, frame)
+            probs, feature_ms, model_ms = score_frame(det, frame, stage_hist)
             if n == 1:
                 print(front_end_note(det, frame))
             feature_hist.append(feature_ms)
@@ -421,6 +436,13 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901, PLR0912, PLR0915 
         print(
             f"[fastdet-demo] {scope}: feature extraction median {np.median(feature_hist):.2f} ms,"
             f" model median {np.median(model_hist):.2f} ms ({target}, {model_threads} thread(s))"
+        )
+        parts = {name: float(np.median(hist)) for name, hist in stage_hist.items()}
+        rest = float(np.median(feature_hist)) - sum(parts.values())
+        print(
+            "[fastdet-demo] feature extraction, medians of each part: "
+            + ", ".join(f"{name} {ms:.2f}" for name, ms in parts.items())
+            + f", the rest {rest:.2f} ms"
         )
     return 0
 
