@@ -229,7 +229,11 @@ original frame's height and width, which the global feature block records. A mod
 `spec["extra_scales"]` on downsized copies of the thumbnail and pass their results as
 `extra_results`. The map is the same as `predict_proba(frame)`, through the same C++
 scorer, and a detector used only this way never builds its own imfeat computers (they
-are made on the first `predict_proba`), so the host's pool is the only one.
+are made on the first `predict_proba`), so the host's pool is the only one. Both paths
+pack the scorer's input into one buffer the detector keeps (`Detector.pack_native`, a
+few megabytes written in place each frame rather than allocated and faulted in afresh;
+`native_matrix` hands out a fresh array for callers that keep it), as imfeat itself
+derives each frame's pyramid into a pooled block that the returned arrays hand back.
 `FeatureExtractor.run_imfeat` / `.compose` are the two halves fastdet itself uses, if a
 host wants to share at a different point. framegate does exactly this: a `text.fdt` in
 its `models/` folder (or `GateConfig(models={"text": path})`) replaces its heuristic

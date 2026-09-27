@@ -68,7 +68,7 @@ def score_frame(
         raise RuntimeError(msg)
     t0 = time.perf_counter()
     level_maps, broadcast_vecs = det.extractor.extract(frame)
-    native = det.extractor.native(level_maps, broadcast_vecs, det.col_keep)
+    native = det.pack_native(level_maps, broadcast_vecs)  # one buffer, reused per frame
     t1 = time.perf_counter()
     probs = det.native.score(native, use_exit=det.config.model.use_exit)
     t2 = time.perf_counter()

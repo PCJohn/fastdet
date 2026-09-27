@@ -106,6 +106,7 @@ class Detector:
         self.metrics: dict[str, Any] = {}
         self.val_ids: list[str] = []
         self._extractor: FeatureExtractor | None = None
+        self._native_buf: FloatArray | None = None  # pack_native's reused buffer
 
     # -- construction paths -------------------------------------------------
     @classmethod
@@ -362,6 +363,7 @@ class Detector:
             self._extractor.close()
             self._extractor = None
         self.native = None
+        self._native_buf = None
 
     @property
     def front_end_spec(self) -> dict[str, Any]:
@@ -396,8 +398,25 @@ class Detector:
         if self.native is None:
             msg = "detector is not fitted; call fit() or load()"
             raise RuntimeError(msg)
-        native = self.extractor.native(level_maps, broadcast_vecs, self.col_keep)
+        native = self.pack_native(level_maps, broadcast_vecs)
         return self.native.score(native, use_exit=self.config.model.use_exit).reshape(GRID, GRID)
+
+    def pack_native(
+        self, level_maps: dict[int, LevelBanks], broadcast_vecs: dict[int, FloatArray]
+    ) -> FloatArray:
+        """The scorer's input for these maps, in a buffer this detector reuses.
+
+        :meth:`FeatureExtractor.native` into one array kept across calls (a few megabytes,
+        allocated once, so a stream faults no fresh pages per frame): the result is valid
+        until the next call, which overwrites it.  :meth:`native_matrix` returns a fresh
+        array instead, for callers that keep it.
+        """
+        want = self.extractor.native_size(self.col_keep)
+        if self._native_buf is None or self._native_buf.shape[0] != want:
+            self._native_buf = np.empty(want, dtype=np.float32)
+        return self.extractor.native(
+            level_maps, broadcast_vecs, self.col_keep, out=self._native_buf
+        )
 
     def predict_proba(self, image: str | Path | UInt8Array) -> NDArray[np.floating[Any]]:
         """Per-cell positive probability for one image as a ``GRID x GRID`` map.

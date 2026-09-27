@@ -807,24 +807,44 @@ class FeatureExtractor:
                 out[:, copy.dst0 : copy.dst1] = bank[rows // factor, cols // factor]
         return out
 
+    def native_size(self, col_keep: NDArray[np.integer] | None = None) -> int:
+        """Floats in :meth:`native`'s output for ``col_keep``: what a reusable buffer holds."""
+        _width, copies = self._gather_plan(col_keep)
+        return sum((c.dst1 - c.dst0) * (1 if c.broadcast else c.size * c.size) for c in copies)
+
     def native(
         self,
         level_maps: dict[int, LevelBanks],
         broadcast_vecs: dict[int, FloatArray],
         col_keep: NDArray[np.integer] | None = None,
+        out: FloatArray | None = None,
     ) -> FloatArray:
         """Kept columns at native resolution, flat: the scorer's input, no dense table.
 
         Column ``j`` contributes its ``side x side`` values row-major, in column
         order, where ``side`` is the column's level (1 for globals); this is
         :meth:`gather` over the full grid with the repetition left out.
+
+        ``out`` is written and returned in place of a new array: a flat, C-contiguous
+        float32 array of :meth:`native_size` floats.  The packed features are a few
+        megabytes, and a fresh array per frame is a fresh set of pages to fault in, so a
+        stream reuses one buffer (:meth:`Detector.pack_native` keeps it); the bytes are the
+        same either way.
         """
         _width, copies = self._gather_plan(col_keep)
         sides = [1 if copy.broadcast else copy.size for copy in copies]
-        out = np.empty(
-            sum((c.dst1 - c.dst0) * side * side for c, side in zip(copies, sides, strict=True)),
-            dtype=np.float32,
-        )
+        size = sum((c.dst1 - c.dst0) * side * side for c, side in zip(copies, sides, strict=True))
+        if out is None:
+            out = np.empty(size, dtype=np.float32)
+        elif (
+            out.dtype != np.float32
+            or out.ndim != 1
+            or out.shape[0] != size
+            or not out.flags.c_contiguous
+            or not out.flags.writeable
+        ):
+            msg = f"out must be a writeable C-contiguous float32 array of {size} values"
+            raise ValueError(msg)
         pos = 0
         for copy, side in zip(copies, sides, strict=True):
             n_cols = copy.dst1 - copy.dst0

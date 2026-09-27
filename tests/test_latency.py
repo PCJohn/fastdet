@@ -203,6 +203,8 @@ def test_front_end_latency(size: int, stride: int) -> None:
     fused_ms, _ = _p50_min(lambda: extractor.run_imfeat(image))
     extract_ms, _ = _p50_min(lambda: extractor.extract(image))
     native_ms, _ = _p50_min(lambda: extractor.native(level_maps, broadcast))
+    buf = np.empty(extractor.native_size(), np.float32)  # what Detector.pack_native keeps
+    reused_ms, _ = _p50_min(lambda: extractor.native(level_maps, broadcast, out=buf))
     print(
         f"\n[fastdet-lat] FRONT-END -- {SOURCE_HW[1]}x{SOURCE_HW[0]} frame -> {size}x{size}x3"
         f" thumbnail, HSV, {len(cfg.train.levels)} pyramid levels, stride {cfg.train.stride}"
@@ -217,9 +219,11 @@ def test_front_end_latency(size: int, stride: int) -> None:
     )
     print(
         f"   context banks + level assembly {extract_ms - fused_ms:6.3f} ms | "
-        f"pack features for the scorer {native_ms:6.3f} ms"
+        f"pack features for the scorer {native_ms:6.3f} ms into a fresh array,"
+        f" {reused_ms:6.3f} into the reused buffer ({buf.nbytes / 1e6:.1f} MB)"
     )
     print(
-        f"   {'':<22s} front-end total (frame -> features ready to score) {extract_ms + native_ms:6.3f} ms"
+        f"   {'':<22s} front-end total (frame -> features ready to score)"
+        f" {extract_ms + reused_ms:6.3f} ms"
     )
     assert extract_ms > 0.0
