@@ -198,7 +198,8 @@ def test_front_end_latency(size: int, stride: int) -> None:
     finally:
         cv2.setNumThreads(cv2_threads)
     cvt_ms, _ = _p50_min(lambda: cv2.cvtColor(thumb, cv2.COLOR_BGR2HSV))
-    on_thumb_ms, _ = _p50_min(lambda: extractor.fc.features(thumb))
+    on_thumb = extractor.thumb_computer((size, size))
+    on_thumb_ms, _ = _p50_min(lambda: on_thumb.features(thumb))
     fused_ms, _ = _p50_min(lambda: extractor.run_imfeat(image))
     extract_ms, _ = _p50_min(lambda: extractor.extract(image))
     native_ms, _ = _p50_min(lambda: extractor.native(level_maps, broadcast))
@@ -206,7 +207,7 @@ def test_front_end_latency(size: int, stride: int) -> None:
         f"\n[fastdet-lat] FRONT-END -- {SOURCE_HW[1]}x{SOURCE_HW[0]} frame -> {size}x{size}x3"
         f" thumbnail, HSV, {len(cfg.train.levels)} pyramid levels, stride {cfg.train.stride}"
         f" ({(size // GRID) // cfg.train.stride} samples per cell per axis),"
-        f" {extractor.total_width()} feature columns, {extractor.fc.threads} imfeat thread(s):"
+        f" {extractor.total_width()} feature columns, {on_thumb.threads} imfeat thread(s):"
     )
     print(
         f"   imfeat pass on the frame, resize + BGR->HSV inside {fused_ms:6.3f} ms"

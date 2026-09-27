@@ -7,12 +7,13 @@ and a dependency-free C++ runtime read the same bytes and produce identical
 scores.
 
 The front-end matches [framegate](https://github.com/PCJohn/framegate)'s single
-imfeat pass (1024 px square, HSV, stride 1, 64×64 finest grid, six levels), so a
-framegate process can feed its own features to a fastdet model. **No model has
-been trained or measured on this front-end yet**: the quality and latency figures
-in [`research_report.md`](research_report.md) describe earlier front-ends
-(512 px, CIELAB, an extra 256 px scale) and do not transfer. Regenerate the
-feature ranking from a full-width fit before pruning (see *Pruning*).
+imfeat pass (a square thumbnail sized from the frame — `thumb="pow2"`, the largest power
+of two the shorter side holds: 720p → 512, 1080p → 1024, 4K → 2048 — HSV, stride 1,
+64×64 finest grid, six levels), so a framegate process can feed its own features to a
+fastdet model. **No model has been trained or measured on this front-end yet**: the
+quality and latency figures in [`research_report.md`](research_report.md) describe
+earlier front-ends (a fixed 512 px, CIELAB, an extra 256 px scale) and do not transfer.
+Regenerate the feature ranking from a full-width fit before pruning (see *Pruning*).
 
 ## Install
 
@@ -186,35 +187,41 @@ worker threads parked when the next measurement starts, so `--draw-every 1` read
 
 ## Using fastdet inside a host that already runs imfeat (framegate)
 
-framegate computes the same 1024-px thumbnail and imfeat pyramid for its own
-signals, so fastdet must not pay for a second pass. `Detector.front_end_spec` says
-exactly what the model was trained on, and `Detector.predict_from_imfeat` scores an
-imfeat result the host already has:
+framegate computes the same thumbnail and imfeat pyramid for its own signals, so
+fastdet must not pay for a second pass. `Detector.front_end_spec` says exactly what the
+model was trained on, and `Detector.predict_from_imfeat` scores an imfeat result the
+host already has:
 
 ```python
 det = Detector.load("model.fdt")
 spec = det.front_end_spec
-# {'thumb': 1024, 'stride': 1, 'resize_interp': 'area', 'space': 'hsv', 'input_space': 'bgr',
+# {'thumb': 'pow2', 'stride': 1, 'resize_interp': 'area', 'space': 'hsv', 'input_space': 'bgr',
 #  'levels': [64, 32, 16, 8, 4, 2], 'raw_channels_per_level': 162, 'extra_scales': []}
 
-# host side, once: the FeatureComputer for that spec (imfeat appends its whole-image level).
+# host side, once per frame size: the FeatureComputer for that spec (imfeat appends its
+# whole-image level). spec["thumb"] is a side in pixels or an imfeat policy name, which
+# imfeat resolves from the frame's shape ("pow2": 1080p -> 1024x1024, 720p -> 512x512).
 # The features are in spec["space"]; the computer is given spec["input_space"]: the BGR
 # frame itself for HSV, which imfeat thumbnails (thumb=, cv2.resize INTER_AREA's bytes) and
 # converts inside its pass (cv2.cvtColor's bytes), both at a fraction of OpenCV's cost;
 # otherwise the thumbnail converted with OpenCV, taken as it is.
-fc = imfeat.FeatureComputer(shape=frame.shape,          # a BGR frame >= thumb px in both axes
+rows, cols = imfeat.thumb_size(frame.shape, spec["thumb"])   # what the frame gets
+fc = imfeat.FeatureComputer(shape=frame.shape,          # a BGR frame >= (rows, cols)
                             grid=[(int(np.log2(n)),) * 2 for n in spec["levels"]],
-                            stride=spec["stride"], threads=1,
-                            feature_space=spec["space"], thumb=spec["thumb"])
-# per frame: imfeat on the frame (smaller frames: cv2.resize INTER_AREA to thumb x thumb
-# first, and a computer with shape=(thumb, thumb, 3) and no thumb=)
+                            stride=fastdet.features.stride_for(spec["stride"], (rows, cols)),
+                            threads=1, feature_space=spec["space"], thumb=spec["thumb"])
+# per frame: imfeat on the frame. Frames smaller than their thumbnail (below 64 px under a
+# policy, below the side under a fixed size): cv2.resize INTER_AREA to (cols, rows) first --
+# fastdet.features.thumb_hw(spec["thumb"], frame.shape) floors a policy's size at 64 --
+# and a computer with shape=(rows, cols, 3) and no thumb=.
 result = fc.features(frame)
 probabilities = det.predict_from_imfeat(result, image_hw=frame.shape[:2])   # (64, 64)
 ```
 
 The result must come from a thumbnail and computer matching the spec (size, filter,
-stride, colour spaces, levels; the map shapes are checked); `image_hw` is the original
-frame's height and width, which the global feature block records. A model trained with
+stride -- capped at the thumbnail's cell side, `stride_for`, so no cell of a small frame
+goes unsampled -- colour spaces, levels; the map shapes are checked); `image_hw` is the
+original frame's height and width, which the global feature block records. A model trained with
 `extra_scales` needs those passes too: run a computer per `(thumb, stride)` in
 `spec["extra_scales"]` on downsized copies of the thumbnail and pass their results as
 `extra_results`. The map is the same as `predict_proba(frame)`, through the same C++
@@ -229,16 +236,23 @@ text map with the model, on the pass it already makes.
 
 ### Features
 
-Each image is squashed to a 1024×1024 thumbnail (`INTER_AREA`; the aspect ratio
-is kept as a global feature instead) and passed to `imfeat` once at stride 1 with
-six pyramid levels (64/32/16/8/4/2 cells) — framegate's exact configuration. A frame
-at least 1024 px in both axes goes into imfeat whole: the pass makes the thumbnail
-itself (bit for bit what `cv2.resize` gives, at a fraction of its cost and with no
-thumbnail written and read back) and converts it to HSV (bit for bit `cv2.cvtColor`),
-so models trained when those steps were OpenCV's score identically; smaller frames are
-resized with cv2 first, since OpenCV upscales bilinearly. For every cell of the finest
-64×64 grid, the front-end concatenates the features of all levels into one row (1178
-columns):
+Each image is squashed to a square thumbnail (`INTER_AREA`; the aspect ratio is kept
+as a global feature instead) and passed to `imfeat` once at stride 1 with six pyramid
+levels (64/32/16/8/4/2 cells) — framegate's exact configuration. The thumbnail's side
+follows the frame: `thumb="pow2"` (the default) takes the largest power of two the
+shorter side holds, so a 720p frame becomes 512 px, 1080p and 1440p 1024, 4K 2048 —
+never an upscale, and the pass costs what the frame warrants (on the 22-thread laptop a
+720p frame took 2.2 ms on two threads at 512 px against 5.3 ms at a fixed 1024 px, cv2's
+bilinear upscale included; imfeat's `policy` benchmark); `thumb=1024` squashes every
+frame to that side instead, as older models did. Either way a cell is 1/64 of the frame; what changes with
+the size is the pixels a cell sees, so a model is trained for one rule. A frame at least
+its thumbnail's size in both axes (every frame of 64 px or more, under a policy) goes
+into imfeat whole: the pass makes the thumbnail itself (bit for bit what `cv2.resize`
+gives, at a fraction of its cost and with no thumbnail written and read back) and
+converts it to HSV (bit for bit `cv2.cvtColor`), so models trained when those steps
+were OpenCV's score identically; smaller frames are resized with cv2 first, since
+OpenCV upscales bilinearly. For every cell of the finest 64×64 grid, the front-end
+concatenates the features of all levels into one row (1178 columns):
 
 - `raw` — imfeat's per-channel block per cell, per scale. This includes the
   multi-lag bar detector (`bard_*`), which fires when a pixel is darker or
@@ -620,8 +634,8 @@ them with their current defaults). The ones worth sweeping:
 | `--exit-keep-prob` | 0.05 | cells ending at or above this probability are never stopped |
 | `--exit-margin` | 2.0 | raw-score safety margin under the calibrated thresholds |
 | `--exit-stage-fractions` | 0/0.125/0.25/0.5/0.75 | where in the fine tier the stages sit |
-| `--thumb` | 1024 | square resize target the feature pyramid is computed on (framegate's) |
-| `--stride` | 1 | imfeat sampling stride at that size: 1 = every pixel (16x16 samples per finest cell), 2, 4 |
+| `--thumb` | pow2 | the square thumbnail the feature pyramid is computed on (framegate's): a side in pixels (every frame resized to it, smaller ones upscaled) or an imfeat policy name -- `pow2` is the largest power of two the frame's shorter side holds, never an upscale (`pow2-cover` / `pow2-fit` keep the aspect ratio, see imfeat) |
+| `--stride` | 1 | imfeat sampling stride on the thumbnail: 1 = every pixel (16x16 samples per finest cell at 1024 px), 2, 4; capped at the cell side for small thumbnails |
 | `--extra-scales` | none | extra imfeat passes on downsized copies of the thumbnail, `thumb:stride` pairs separated by `;` (`--extra-scales "256:1"`, `--extra-scales "512:2;256:1"`; commas separate sweep values); each adds 162 raw columns per level measured at a coarser scale and one more imfeat pass of latency |
 | `--levels` | 64/32/16/8/4/2 | pyramid grids (finest must be 64) |
 | `--feature-mode`, `--imfeat-space` | raw_plus_global_context_ext, hsv | feature banks and colour space |

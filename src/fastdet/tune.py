@@ -14,7 +14,7 @@ early exit), and writes:
 
 Every field of :class:`~fastdet.config.ModelConfig` and
 :class:`~fastdet.config.TrainConfig` is a knob: ``--n-trees 1200,2400``,
-``--leaf-bits 4,8``, ``--thumb 256,512`` ... A knob left out keeps its default,
+``--leaf-bits 4,8``, ``--thumb 512,pow2`` ... A knob left out keeps its default,
 which is the tuned production value, so the sweep only grows with what you name.
 Run ``fastdet-tune --help`` for the list and each knob's current default.
 """
@@ -203,6 +203,7 @@ def _parse_value(text: str, annotation: str, default: Any) -> Any:
         return None
     parsers: dict[str, Any] = {
         "bool": lambda v: v.strip().lower() in {"1", "true", "yes", "on"},
+        "int|str": lambda v: int(v) if v.strip().lstrip("-").isdigit() else v.strip(),
         "int": int,
         "float": float,
         "tuple": lambda v: tuple(float(x) if "." in x else int(x) for x in v.split("/") if x),

@@ -82,17 +82,20 @@ def front_end_note(det: Detector, frame: NDArray[np.uint8]) -> str:
     pass or cv2 resizes first.
     """
     h, w = frame.shape[:2]
-    thumb = det.config.train.thumb
+    rows, cols = det.extractor.thumb_hw(frame.shape)
     if det.extractor.fuses_resize(frame):
         how = "made inside imfeat's pass"
-    elif frame.ndim == _COLOUR_NDIM and (h < thumb or w < thumb):
+    elif frame.ndim == _COLOUR_NDIM and (h < rows or w < cols):
         how = (
-            f"by cv2.resize, since the frame is smaller than {thumb} px in an axis"
-            f" (imfeat makes it inside its pass from {thumb}x{thumb} up)"
+            "by cv2.resize, since the frame is smaller than the thumbnail in an axis"
+            f" (imfeat makes it inside its pass from {cols}x{rows} up)"
         )
     else:
         how = "by cv2.resize"
-    return f"[fastdet-demo] {w}x{h} frames -> {thumb}x{thumb} thumbnail {how}"
+    return (
+        f"[fastdet-demo] {w}x{h} frames -> {cols}x{rows} thumbnail"
+        f" (thumb={det.config.train.thumb!r}) {how}"
+    )
 
 
 def overlay(

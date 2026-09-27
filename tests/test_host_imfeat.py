@@ -10,21 +10,31 @@ import numpy as np
 import pytest
 
 from fastdet import Detector
-from fastdet.features import FeatureExtractor, exponent_for_size
+from fastdet.features import FeatureExtractor, exponent_for_size, stride_for, thumb_hw
 
 if TYPE_CHECKING:
     from pathlib import Path
 
 
-def _host_computer(spec: dict[str, Any], threads: int = 1) -> imfeat.FeatureComputer:
-    """The computer a host builds from ``front_end_spec`` (what framegate does)."""
+def _host_computer(
+    spec: dict[str, Any], size: tuple[int, int], threads: int = 1
+) -> imfeat.FeatureComputer:
+    """The host's computer for a ready thumbnail of ``size``, from ``front_end_spec`` alone.
+
+    What framegate does for the frames cv2 resizes.
+    """
     return imfeat.FeatureComputer(
-        shape=(spec["thumb"], spec["thumb"], 3),
+        shape=(*size, 3),
         grid=[(exponent_for_size(n),) * 2 for n in spec["levels"]],
-        stride=spec["stride"],
+        stride=stride_for(spec["stride"], size),
         threads=threads,
         feature_space=spec["space"] if spec["input_space"] == "bgr" else None,
     )
+
+
+def _host_size(spec: dict[str, Any], frame: np.ndarray) -> tuple[int, int]:
+    """The thumbnail a host makes for ``frame`` under the spec (fastdet's rule)."""
+    return thumb_hw(spec["thumb"], frame.shape)
 
 
 def test_predict_from_imfeat_matches_predict_proba(
@@ -36,12 +46,13 @@ def test_predict_from_imfeat_matches_predict_proba(
     assert spec["thumb"] == det.config.train.thumb
     assert spec["levels"][0] == 64
     assert (spec["space"], spec["input_space"]) == ("hsv", "bgr")  # imfeat converts
-    assert det.extractor._computers is None  # no pass yet: no imfeat pool either
-    host = _host_computer(spec)
+    assert not det.extractor._computers  # no pass yet: no imfeat pool either
     for sample in sorted(images_dir.glob("*.png"))[:2]:
         frame = np.asarray(cv2.imread(str(sample)), dtype=np.uint8)
         # the host's pass, built from the spec alone, on its own BGR thumbnail
-        thumb = cv2.resize(frame, (spec["thumb"],) * 2, interpolation=cv2.INTER_AREA)
+        rows, cols = _host_size(spec, frame)
+        host = _host_computer(spec, (rows, cols))
+        thumb = cv2.resize(frame, (cols, rows), interpolation=cv2.INTER_AREA)
         from_host = det.predict_from_imfeat(host.features(thumb), frame.shape[:2])
         np.testing.assert_array_equal(from_host, det.predict_proba(frame))
         # and fastdet's own two halves
@@ -64,17 +75,18 @@ def test_fused_conversion_matches_cvtcolor(
     images_dir, _masks_dir = tiny_dataset
     det = Detector.load(tiny_model)
     spec = det.front_end_spec
-    fused = _host_computer(spec)
-    as_is = imfeat.FeatureComputer(
-        shape=(spec["thumb"], spec["thumb"], 3),
-        grid=[(exponent_for_size(n),) * 2 for n in spec["levels"]],
-        stride=spec["stride"],
-        threads=1,
-        feature_space=None,
-    )
     for sample in sorted(images_dir.glob("*.png"))[:2]:
         frame = np.asarray(cv2.imread(str(sample)), dtype=np.uint8)
-        thumb = cv2.resize(frame, (spec["thumb"],) * 2, interpolation=cv2.INTER_AREA)
+        rows, cols = _host_size(spec, frame)
+        fused = _host_computer(spec, (rows, cols))
+        as_is = imfeat.FeatureComputer(
+            shape=(rows, cols, 3),
+            grid=[(exponent_for_size(n),) * 2 for n in spec["levels"]],
+            stride=stride_for(spec["stride"], (rows, cols)),
+            threads=1,
+            feature_space=None,
+        )
+        thumb = cv2.resize(frame, (cols, rows), interpolation=cv2.INTER_AREA)
         got = fused.features(thumb)
         want = as_is.features(cv2.cvtColor(thumb, cv2.COLOR_BGR2HSV))
         for a, b in zip(got.maps, want.maps, strict=True):
@@ -96,16 +108,18 @@ def test_fused_resize_matches_cv2_path(tiny_model: Path) -> None:
     """
     det = Detector.load(tiny_model, threads=2)
     cfg = det.config.train
+    side = cfg.thumb
+    assert isinstance(side, int)  # this model's thumbnail is a fixed square
     rng = np.random.default_rng(2)
     frames = [
-        rng.integers(0, 256, (cfg.thumb + 120, cfg.thumb * 2, 3), np.uint8),  # fused
-        rng.integers(0, 256, (cfg.thumb, cfg.thumb + 1, 3), np.uint8),  # another size
-        rng.integers(0, 256, (cfg.thumb // 2, cfg.thumb * 2, 3), np.uint8),  # cv2: an upscale
+        rng.integers(0, 256, (side + 120, side * 2, 3), np.uint8),  # fused
+        rng.integers(0, 256, (side, side + 1, 3), np.uint8),  # another size
+        rng.integers(0, 256, (side // 2, side * 2, 3), np.uint8),  # cv2: an upscale
     ]
     plain = FeatureExtractor(cfg, threads=2, fuse_resize=False)
     for frame in frames:
         fused = det.extractor
-        assert fused.fuses_resize(frame) == (frame.shape[0] >= cfg.thumb)
+        assert fused.fuses_resize(frame) == (frame.shape[0] >= side)
         a, b = fused.extract(frame), plain.extract(frame)
         for size in fused.levels:
             for x, y in zip(a[0][size], b[0][size], strict=True):

@@ -141,12 +141,16 @@ class ModelConfig:
 class TrainConfig:
     """Front-end, sampling and pruning knobs (how features become a dataset)."""
 
-    # The front-end matches framegate's single imfeat pass (1024 px square, HSV,
-    # stride 4, 64x64 finest grid, six dyadic levels) so a framegate process can
+    # The front-end matches framegate's single imfeat pass (the "pow2" thumbnail, HSV,
+    # stride 1, 64x64 finest grid, six dyadic levels) so a framegate process can
     # hand its Pyramid straight to a fastdet model instead of running a second pass.
     levels: tuple[int, ...] = (64, 32, 16, 8, 4, 2)  # Grid sizes per level; finest must be 64.
     feature_mode: str = "raw_plus_global_context_ext"  # Which feature banks to build.
-    thumb: int = 1024  # Square resize target the feature pyramid is computed on.
+    # The thumbnail the feature pyramid is computed on: a side in pixels (square, any
+    # frame resized to it, smaller ones upscaled) or an imfeat policy name that sizes it
+    # from the frame ("pow2": the largest power of two the shorter side holds, square, so
+    # 720p -> 512, 1080p -> 1024, 4K -> 2048; never an upscale, floored at the 64 px grid).
+    thumb: int | str = "pow2"
     stride: int = 1  # imfeat sampling stride at the primary scale (1 = every pixel).
     extra_scales: str = ""  # Extra imfeat scales, 'thumb:stride;...' ('' disables).
     resize_interp: str = "area"  # Thumbnail resize kernel: 'area' or 'nearest'.
@@ -184,6 +188,15 @@ class TrainConfig:
             raise ValueError(msg)
         if self.resize_interp not in ("area", "nearest"):
             msg = "resize_interp must be 'area' or 'nearest'"
+            raise ValueError(msg)
+        if isinstance(self.thumb, str):
+            import imfeat  # noqa: PLC0415 -- the policy names are imfeat's; only needed here
+
+            if self.thumb not in imfeat.THUMB_POLICIES:
+                msg = f"thumb must be a side in pixels or one of {imfeat.THUMB_POLICIES}"
+                raise ValueError(msg)
+        elif isinstance(self.thumb, bool) or not isinstance(self.thumb, int) or self.thumb < 1:
+            msg = f"thumb must be a side in pixels or a policy name, not {self.thumb!r}"
             raise ValueError(msg)
         if not 0.0 < self.val_frac < 1.0:
             msg = "val_frac must be in (0, 1)"
