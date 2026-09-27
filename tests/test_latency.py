@@ -172,21 +172,21 @@ def _strides_for(size: int) -> tuple[int, ...]:
     ("size", "stride"), [(size, stride) for size in SIZES for stride in _strides_for(size)]
 )
 def test_front_end_latency(size: int, stride: int) -> None:
-    """Resize, colour conversion, imfeat and bank assembly at one resolution and stride."""
+    """Resize, imfeat and bank assembly at one resolution and stride.
+
+    The colour conversion is inside imfeat's pass; cvtColor is timed alongside for
+    reference only.
+    """
     cfg = _config(size, stride)
     extractor = FeatureExtractor(cfg.train)
     rng = np.random.default_rng(0)
     image = rng.integers(0, 256, (size, size, 3), dtype=np.uint8)
     thumb = cv2.resize(image, (size, size), interpolation=cv2.INTER_AREA)
-    hsv = cv2.cvtColor(thumb, cv2.COLOR_BGR2HSV)
     level_maps, broadcast = extractor.extract(image)
 
-    resize_ms, _ = _p50_min(
-        lambda: cv2.cvtColor(
-            cv2.resize(image, (size, size), interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2HSV
-        )
-    )
-    imfeat_ms, _ = _p50_min(lambda: extractor.fc.features(hsv))
+    resize_ms, _ = _p50_min(lambda: cv2.resize(image, (size, size), interpolation=cv2.INTER_AREA))
+    cvt_ms, _ = _p50_min(lambda: cv2.cvtColor(thumb, cv2.COLOR_BGR2HSV))
+    imfeat_ms, _ = _p50_min(lambda: extractor.fc.features(thumb))
     extract_ms, _ = _p50_min(lambda: extractor.extract(image))
     native_ms, _ = _p50_min(lambda: extractor.native(level_maps, broadcast))
     print(
@@ -196,7 +196,8 @@ def test_front_end_latency(size: int, stride: int) -> None:
         f" {extractor.total_width()} feature columns:"
     )
     print(
-        f"   resize + colour convert {resize_ms:6.3f} ms | imfeat pass {imfeat_ms:6.3f} ms | "
+        f"   resize {resize_ms:6.3f} ms | imfeat pass incl. BGR->HSV {imfeat_ms:6.3f} ms"
+        f" (a separate cv2.cvtColor would be {cvt_ms:6.3f} ms) | "
         f"context banks + level assembly {extract_ms - resize_ms - imfeat_ms:6.3f} ms | "
         f"pack features for the scorer {native_ms:6.3f} ms"
     )

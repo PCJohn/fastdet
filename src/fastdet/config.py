@@ -150,7 +150,9 @@ class TrainConfig:
     stride: int = 1  # imfeat sampling stride at the primary scale (1 = every pixel).
     extra_scales: str = ""  # Extra imfeat scales, 'thumb:stride;...' ('' disables).
     resize_interp: str = "area"  # Thumbnail resize kernel: 'area' or 'nearest'.
-    imfeat_space: str = "hsv"  # Color space fed to imfeat: hsv|lab|luv|yuv.
+    # Colour space of the features: hsv (imfeat converts the BGR thumbnail inside its
+    # pass), or lab|luv|yuv (converted with OpenCV first).
+    imfeat_space: str = "hsv"
     gt_cell_thresh: float = 0.10  # Cell coverage >= this is a positive training label.
     # 0 = keep every column.  The bundled ranking is keyed to the raw column names
     # of an older imfeat build; regenerate it from a full-width fit before pruning

@@ -182,7 +182,7 @@ milliseconds per frame; the latency numbers exclude it.
 
 ## Using fastdet inside a host that already runs imfeat (framegate)
 
-framegate computes the same 1024-px HSV thumbnail and imfeat pyramid for its own
+framegate computes the same 1024-px thumbnail and imfeat pyramid for its own
 signals, so fastdet must not pay for a second pass. `Detector.front_end_spec` says
 exactly what the model was trained on, and `Detector.predict_from_imfeat` scores an
 imfeat result the host already has:
@@ -190,20 +190,24 @@ imfeat result the host already has:
 ```python
 det = Detector.load("model.fdt")
 spec = det.front_end_spec
-# {'thumb': 1024, 'stride': 1, 'resize_interp': 'area', 'space': 'hsv',
+# {'thumb': 1024, 'stride': 1, 'resize_interp': 'area', 'space': 'hsv', 'input_space': 'bgr',
 #  'levels': [64, 32, 16, 8, 4, 2], 'raw_channels_per_level': 162, 'extra_scales': []}
 
-# host side, once: the FeatureComputer for that spec (imfeat appends its whole-image level)
+# host side, once: the FeatureComputer for that spec (imfeat appends its whole-image level).
+# The features are in spec["space"]; the computer is given spec["input_space"]: the BGR
+# thumbnail itself for HSV, which imfeat converts inside its pass (cv2.cvtColor's bytes,
+# at a fraction of its cost), otherwise the thumbnail converted with OpenCV, taken as it is.
 fc = imfeat.FeatureComputer(shape=(spec["thumb"], spec["thumb"], 3),
                             grid=[(int(np.log2(n)),) * 2 for n in spec["levels"]],
-                            stride=spec["stride"], threads=1)
-# per frame: the host's own resize (INTER_AREA to thumb x thumb), conversion to spec["space"], imfeat
-result = fc.features(hsv_thumbnail)
+                            stride=spec["stride"], threads=1,
+                            feature_space=spec["space"] if spec["input_space"] == "bgr" else None)
+# per frame: the host's own resize (INTER_AREA to thumb x thumb), then imfeat
+result = fc.features(bgr_thumbnail)
 probabilities = det.predict_from_imfeat(result, image_hw=frame.shape[:2])   # (64, 64)
 ```
 
 The result must come from a thumbnail and computer matching the spec (size, stride,
-colour space, levels; the map shapes are checked); `image_hw` is the original frame's
+colour spaces, levels; the map shapes are checked); `image_hw` is the original frame's
 height and width, which the global feature block records. A model trained with
 `extra_scales` needs those passes too: run a computer per `(thumb, stride)` in
 `spec["extra_scales"]` on downsized copies of the thumbnail and pass their results as
@@ -220,9 +224,10 @@ text map with the model, on the pass it already makes.
 ### Features
 
 Each image is squashed to a 1024×1024 thumbnail (`INTER_AREA`; the aspect ratio
-is kept as a global feature instead), converted to HSV, and passed to `imfeat`
-once at stride 1 with six pyramid levels (64/32/16/8/4/2 cells) — framegate's
-exact configuration. For every cell of the finest 64×64 grid, the front-end
+is kept as a global feature instead) and passed to `imfeat` once at stride 1 with
+six pyramid levels (64/32/16/8/4/2 cells) — framegate's exact configuration. imfeat
+converts it to HSV inside that pass (bit for bit what `cv2.cvtColor` gives, so
+models trained before the conversion moved score identically). For every cell of the finest 64×64 grid, the front-end
 concatenates the features of all levels into one row (1178 columns):
 
 - `raw` — imfeat's per-channel block per cell, per scale. This includes the

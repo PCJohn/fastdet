@@ -86,7 +86,11 @@ def image_hashes(
         except (OSError, ValueError):
             disk = {}
 
-    computer = imfeat.FeatureComputer(shape=(PHASH_SIZE, PHASH_SIZE, 3), grid=[(5, 5)], stride=2)
+    # the hash of V alone: imfeat takes the BGR thumbnail, and with only V selected its
+    # conversion is just the max of the three channels
+    computer = imfeat.FeatureComputer(
+        shape=(PHASH_SIZE, PHASH_SIZE, 3), grid=[(5, 5)], stride=2, channels=[2]
+    )
     hashes = np.zeros(len(pairs), dtype=np.uint64)
     ok = np.zeros(len(pairs), dtype=bool)
 
@@ -103,8 +107,7 @@ def image_hashes(
         if img is None:
             continue
         thumb = cv2.resize(img, (PHASH_SIZE, PHASH_SIZE), interpolation=cv2.INTER_AREA)
-        hsv = cv2.cvtColor(thumb, cv2.COLOR_BGR2HSV)
-        hashes[i] = np.uint64(computer.features(hsv).hashes[PHASH_ROW, 2])
+        hashes[i] = np.uint64(computer.features(thumb).hashes[PHASH_ROW, 0])
         ok[i] = True
         disk[key] = str(int(hashes[i]))
         if (i + 1) % 250 == 0:

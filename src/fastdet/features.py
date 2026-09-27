@@ -44,6 +44,17 @@ from .config import TrainConfig, iter_feature_mode_tags
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
+# The front-end hands imfeat the BGR thumbnail and lets it convert to HSV inside its pass
+# (FeatureComputer's input_space / feature_space, which came with imfeat.COLOR_SPACES). An
+# imfeat without that would take the thumbnail as HSV and every feature would be wrong, so
+# it is refused here rather than found in the maps.
+if not hasattr(imfeat, "COLOR_SPACES"):
+    _msg = (
+        "fastdet needs an imfeat that converts BGR to HSV inside its pass "
+        "(pip install git+https://github.com/PCJohn/imfeat)"
+    )
+    raise ImportError(_msg)
+
 __all__ = [
     "CONTEXT2_FEATURE_NAMES",
     "CONTEXT_FEATURE_NAMES",
@@ -84,20 +95,28 @@ _CTX2_MIN_GRID = 5  # Below this the 5x5 range kernel is undefined.
 
 @dataclass(frozen=True)
 class SpaceInfo:
-    """Color-space metadata the front-end needs to drive imfeat and the banks."""
+    """Color-space metadata the front-end needs to drive imfeat and the banks.
 
-    convert: int
+    ``fused`` names the space when imfeat converts the BGR thumbnail to it inside its
+    pass (``FeatureComputer(feature_space=fused)``: bit for bit ``cv2.cvtColor``'s
+    bytes, at a fraction of its cost and with no second image); otherwise ``convert``
+    is the OpenCV conversion the extractor runs first, and imfeat takes the channels as
+    they are.
+    """
+
+    convert: int | None
     letters: tuple[str, str, str]
     lum: int
     chr: int
+    fused: str | None = None
 
 
-# Color spaces the front-end can feed imfeat.  The raw block layout is
+# Color spaces the front-end can compute features in.  The raw block layout is
 # channel-agnostic; the global scalars and the bar/context banks assume specific
 # channel roles, hence `lum` (luminance-like) and `chr` (chroma used by the
 # S_mean_global proxy).
 SPACE_INFO: dict[str, SpaceInfo] = {
-    "hsv": SpaceInfo(cv2.COLOR_BGR2HSV, ("H", "S", "V"), lum=2, chr=1),
+    "hsv": SpaceInfo(None, ("H", "S", "V"), lum=2, chr=1, fused="hsv"),
     "lab": SpaceInfo(cv2.COLOR_BGR2LAB, ("L", "a", "b"), lum=0, chr=1),
     "luv": SpaceInfo(cv2.COLOR_BGR2LUV, ("L", "u", "v"), lum=0, chr=1),
     "yuv": SpaceInfo(cv2.COLOR_BGR2YUV, ("Y", "U", "V"), lum=0, chr=1),
@@ -315,11 +334,15 @@ def make_feature_computer(
     thumb: int = THUMB,
     stride: int = STRIDE,
     threads: int | None = None,
+    space: str = "hsv",
 ) -> tuple[Any, int]:
-    """Build the imfeat computer for ``available_levels``.
+    """Build the imfeat computer for ``available_levels``, with features in ``space``.
 
-    imfeat partitions the work by cell, so its output is bit-identical for any thread
-    count; ``threads`` only sets how fast the pass runs (``None`` = :func:`default_threads`).
+    The computer takes the BGR thumbnail when imfeat converts to ``space`` itself (HSV:
+    inside the pass, ``cv2.cvtColor``'s bytes exactly) and the converted thumbnail
+    otherwise (see :class:`SpaceInfo`).  imfeat partitions the work by cell, so its output
+    is bit-identical for any thread count; ``threads`` only sets how fast the pass runs
+    (``None`` = :func:`default_threads`).
     """
     exponents = [exponent_for_size(size) for size in available_levels]
     computer = imfeat.FeatureComputer(
@@ -327,6 +350,8 @@ def make_feature_computer(
         grid=[(e, e) for e in exponents],
         stride=stride,
         threads=threads if threads is not None else default_threads(),
+        input_space="bgr",
+        feature_space=SPACE_INFO[space].fused,
     )
     return computer, len(exponents)
 
@@ -384,10 +409,13 @@ class FeatureExtractor:
     def _imfeat(self) -> tuple[Any, list[tuple[Any, int, str]]]:
         if self._computers is None:
             cfg = self.cfg
-            fc, _ = make_feature_computer(self.levels, cfg.thumb, cfg.stride, self.threads)
+            space = cfg.imfeat_space
+            fc, _ = make_feature_computer(self.levels, cfg.thumb, cfg.stride, self.threads, space)
             extras = [
                 (
-                    make_feature_computer(self.levels, scale.thumb, scale.stride, self.threads)[0],
+                    make_feature_computer(
+                        self.levels, scale.thumb, scale.stride, self.threads, space
+                    )[0],
                     scale.thumb,
                     scale.label,
                 )
@@ -463,6 +491,9 @@ class FeatureExtractor:
         return np.asarray(resized, dtype=np.uint8)
 
     def _convert(self, thumb_bgr: Image, space: SpaceInfo) -> Image:
+        """What the computer is given: the BGR thumbnail itself when imfeat converts."""
+        if space.convert is None:
+            return thumb_bgr
         converted = cv2.cvtColor(thumb_bgr, space.convert)
         return np.asarray(converted, dtype=np.uint8)
 
@@ -526,23 +557,33 @@ class FeatureExtractor:
         checks its settings against this and feeds :meth:`compose` instead of paying
         for a second pass.  ``thumb`` is the square resize target, ``stride`` the
         imfeat sampling stride, ``levels`` the grid sizes requested (imfeat appends
-        its whole-image level), ``space`` the colour space of the array given to
-        imfeat; ``extra_scales`` are further ``(thumb, stride)`` passes on downsized
-        copies of the thumbnail, in the order :meth:`compose` expects them.
+        its whole-image level), ``space`` the colour space the features are computed
+        in and ``input_space`` that of the array the computer is given: ``"bgr"`` when
+        imfeat converts inside its pass (``FeatureComputer(feature_space=space)``, the
+        HSV default), otherwise ``space`` itself, converted with OpenCV first and taken
+        as it is (``feature_space=None``); ``extra_scales`` are further ``(thumb,
+        stride)`` passes on downsized copies of the thumbnail, in the order
+        :meth:`compose` expects them.
         """
         cfg = self.cfg
+        space = SPACE_INFO[cfg.imfeat_space]
         return {
             "thumb": cfg.thumb,
             "stride": cfg.stride,
             "resize_interp": cfg.resize_interp,
             "space": cfg.imfeat_space,
+            "input_space": "bgr" if space.fused is not None else cfg.imfeat_space,
             "levels": list(self.levels),
             "raw_channels_per_level": RAW_CHANNELS * RAW_PER_CHANNEL,
             "extra_scales": [(e.thumb, e.stride) for e in self.extra_scales],
         }
 
     def run_imfeat(self, img_bgr: Image) -> tuple[Any, list[Any]]:
-        """Resize, convert and run imfeat: ``(result, extra_results)`` for :meth:`compose`."""
+        """Resize and run imfeat: ``(result, extra_results)`` for :meth:`compose`.
+
+        The colour conversion happens inside imfeat's pass (HSV), or here first for the
+        spaces it cannot do (see :class:`SpaceInfo`).
+        """
         cfg = self.cfg
         interpolation = cv2.INTER_AREA if cfg.resize_interp == "area" else cv2.INTER_NEAREST
         thumb_bgr = self._resize_bgr(img_bgr, cfg.thumb, interpolation)
