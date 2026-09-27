@@ -43,6 +43,12 @@ if TYPE_CHECKING:
 __all__ = ["LatencyView", "main", "overlay", "score_frame"]
 
 HISTORY = 240  # frames of latency history kept for the plot
+# Redraw every N frames (--draw-every); scoring runs on every frame. A matplotlib redraw
+# takes tens of milliseconds, evicts the caches and parks the worker threads, so drawing
+# after every frame measures a cold start on every frame -- framegate's demo draws every
+# third one for the same reason, which is what makes the two demos' numbers comparable.
+DRAW_EVERY = 3
+GC_EVERY = 300  # frames between manual collections while the collector is off
 _FEATURE_COLOUR = "#ffb347"  # amber
 _MODEL_COLOUR = "#78dc78"  # green
 _IMAGE_TYPES = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff"}
@@ -300,6 +306,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-frames", type=int, default=None, help="stop after this many frames (tests)"
     )
     parser.add_argument(
+        "--draw-every",
+        type=int,
+        default=DRAW_EVERY,
+        help=f"redraw every N frames; scoring runs on every frame (default {DRAW_EVERY})",
+    )
+    parser.add_argument(
         "--threads",
         type=int,
         default=None,
@@ -308,7 +320,7 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: list[str] | None = None) -> int:  # noqa: C901 -- the display loop and its exits
+def main(argv: list[str] | None = None) -> int:  # noqa: C901, PLR0912, PLR0915 -- the loop
     """Entry point of ``fastdet-demo``."""
     args = build_parser().parse_args(argv)
     det = Detector.load(args.model, threads=args.threads)
@@ -318,9 +330,23 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901 -- the display loo
     view = LatencyView(target=target, live=live, headless=args.headless)
     feature_hist: collections.deque[float] = collections.deque(maxlen=HISTORY)
     model_hist: collections.deque[float] = collections.deque(maxlen=HISTORY)
+    draw_every = max(1, args.draw_every)
     last_tick = time.perf_counter()
     fps: float | None = None
-    n = 0
+    n = drawn = 0
+    pending: tuple[NDArray[np.uint8], NDArray[np.float32]] | None = None  # not yet drawn
+
+    def draw(frame: NDArray[np.uint8], probs: NDArray[np.float32], index: int) -> None:
+        view.update(
+            overlay(_fit_width(frame, args.display_width), probs),
+            feature_hist,
+            model_hist,
+            fps=fps,
+            frame_index=index,
+        )
+
+    # The collector's pauses are the main latency spike between frames; reap manually.
+    gc.disable()
     try:
         for n, frame in enumerate(frames, 1):
             probs, feature_ms, model_ms = score_frame(det, frame)
@@ -331,13 +357,11 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901 -- the display loo
                 instant = 1.0 / max(now - last_tick, 1e-6)
                 fps = instant if fps is None else 0.9 * fps + 0.1 * instant
             last_tick = now
-            view.update(
-                overlay(_fit_width(frame, args.display_width), probs),
-                feature_hist,
-                model_hist,
-                fps=fps,
-                frame_index=n,
-            )
+            if n % draw_every == 1 or draw_every == 1:
+                draw(frame, probs, n)
+                drawn, pending = n, None
+            else:
+                pending = (frame, probs)
             if not args.headless:
                 view.pump()
                 if view.save_requested:
@@ -345,11 +369,16 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901 -- the display loo
                     view.save(Path(f"fastdet_{n:05d}.png"))
                 if view.quit:  # window closed, or q / Esc
                     break
+            if n % GC_EVERY == 0:
+                gc.collect()
             if args.max_frames is not None and n >= args.max_frames:
                 break
     except KeyboardInterrupt:
         print("\n[fastdet-demo] interrupted")
     finally:
+        gc.enable()
+        if pending is not None and n > drawn and not view.closed:
+            draw(*pending, n)  # the last frame, for the window and --output
         if args.output is not None and n and not view.closed:
             view.save(args.output)
             print(f"[fastdet-demo] wrote {args.output}")

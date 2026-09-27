@@ -178,7 +178,11 @@ matplotlib's (`pip install -e ".[tune]"`), so it works with `opencv-python-headl
 OpenCV only decodes, resizes and colours. Keys: `q`/`Esc` quit, `space` pause, `s`
 save the figure. `--headless --output out.png` renders without a window;
 `--display-width` scales the frame panel. Drawing costs matplotlib a few tens of
-milliseconds per frame; the latency numbers exclude it.
+milliseconds, so the window is redrawn every third frame (`--draw-every`) while every
+frame is scored, and the collector is paused during the loop with a periodic manual
+collection -- as framegate's demo does, so the two report comparable numbers. The latency
+numbers exclude drawing, but a redraw after every frame leaves the caches cold and the
+worker threads parked when the next measurement starts, so `--draw-every 1` reads higher.
 
 ## Using fastdet inside a host that already runs imfeat (framegate)
 
