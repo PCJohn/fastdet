@@ -390,8 +390,10 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901, PLR0912, PLR0915 
         det.close()  # joins the worker threads now, not during interpreter shutdown
         gc.collect()
     if feature_hist:
+        # the histories hold the last HISTORY frames: the medians are over those
+        scope = f"{n} frame(s)" if n <= HISTORY else f"{n} frames, the last {HISTORY}"
         print(
-            f"[fastdet-demo] {len(feature_hist)} frame(s): feature extraction median {np.median(feature_hist):.2f} ms,"
+            f"[fastdet-demo] {scope}: feature extraction median {np.median(feature_hist):.2f} ms,"
             f" model median {np.median(model_hist):.2f} ms ({target}, {model_threads} thread(s))"
         )
     return 0
