@@ -26,7 +26,7 @@ The bar detector ("bard") used to live in this module in numpy; it now arrives
 inside imfeat's raw block, seven columns per channel. The thumbnail too is made
 inside that pass when the frame allows it (see :meth:`FeatureExtractor.run_imfeat`),
 and its size can follow the frame: ``TrainConfig.thumb`` is a side in pixels or an
-imfeat policy name (see :meth:`FeatureExtractor.thumb_hw`).
+imfeat policy name (see :func:`thumb_hw`; the thumbnail need not be square).
 """
 
 from __future__ import annotations
@@ -87,7 +87,7 @@ FloatArray = NDArray[np.float32]
 GRID = 64  # Finest/output grid resolution; fixed regardless of the feature levels.
 RAW_CHANNELS = 3  # imfeat is always fed a 3-channel image.
 _COLOUR_NDIM = 3  # (H, W, C): what a colour frame looks like
-THUMB: int | str = "pow2"  # Default thumbnail: imfeat's policy, sized from the frame.
+THUMB: int | str = "pow2-fit"  # Default thumbnail: imfeat's policy, sized from the frame.
 STRIDE = 1  # Default imfeat sampling stride at the primary scale.
 
 _EPS = 1e-9  # Guard for the pooled ratios below (never a real denominator).
@@ -340,9 +340,11 @@ def thumb_hw(thumb: int | str, shape: tuple[int, ...]) -> tuple[int, int]:
 
     A side in pixels is a square of that size whatever the frame (smaller frames are
     upscaled to it); a policy name is imfeat's rule on the frame's shape
-    (``imfeat.thumb_size``: ``"pow2"`` is the largest power of two the shorter side holds,
-    square, never an upscale), floored at the ``GRID`` px the grid needs, so a frame
-    smaller than that is upscaled to 64 px as a fixed size would upscale it.
+    (``imfeat.thumb_size``: ``"pow2"`` is the square of the shorter side's power of two,
+    ``"pow2-fit"`` keeps the frame's shape inside that square, as closely as the grid's 64
+    px rounding allows, ``"pow2-cover"`` around it; never an upscale), floored at the
+    ``GRID`` px the grid needs, so a frame smaller than that is upscaled to 64 px as a
+    fixed size would upscale it.
     """
     rows, cols = imfeat.thumb_size(shape[:2], thumb)
     if isinstance(thumb, str):
@@ -668,9 +670,9 @@ class FeatureExtractor:
         A host (framegate) that computes the same thumbnail and ``FeatureComputer``
         checks its settings against this and feeds :meth:`compose` instead of paying
         for a second pass.  ``thumb`` is the thumbnail's side in pixels (square) or the
-        imfeat policy that sizes it from the frame (``"pow2"`` by default; a host resolves
-        it with ``imfeat.thumb_size(frame.shape, spec["thumb"])``, floored at 64 px as
-        :func:`thumb_hw` does), ``stride`` the imfeat sampling stride (capped at the
+        imfeat policy that sizes it from the frame (``"pow2-fit"`` by default; a host
+        resolves it with ``imfeat.thumb_size(frame.shape, spec["thumb"])``, floored at 64 px
+        as :func:`thumb_hw` does), ``stride`` the imfeat sampling stride (capped at the
         thumbnail's cell side, :func:`stride_for`), ``levels`` the grid sizes requested
         (imfeat appends its whole-image level), ``space`` the colour space the features
         are computed in and ``input_space`` that of the array the computer is given:

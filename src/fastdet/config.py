@@ -141,16 +141,23 @@ class ModelConfig:
 class TrainConfig:
     """Front-end, sampling and pruning knobs (how features become a dataset)."""
 
-    # The front-end matches framegate's single imfeat pass (the "pow2" thumbnail, HSV,
-    # stride 1, 64x64 finest grid, six dyadic levels) so a framegate process can
+    # The front-end matches framegate's single imfeat pass (the "pow2-fit" thumbnail,
+    # HSV, stride 1, 64x64 finest grid, six dyadic levels) so a framegate process can
     # hand its Pyramid straight to a fastdet model instead of running a second pass.
     levels: tuple[int, ...] = (64, 32, 16, 8, 4, 2)  # Grid sizes per level; finest must be 64.
     feature_mode: str = "raw_plus_global_context_ext"  # Which feature banks to build.
     # The thumbnail the feature pyramid is computed on: a side in pixels (square, any
     # frame resized to it, smaller ones upscaled) or an imfeat policy name that sizes it
-    # from the frame ("pow2": the largest power of two the shorter side holds, square, so
-    # 720p -> 512, 1080p -> 1024, 4K -> 2048; never an upscale, floored at the 64 px grid).
-    thumb: int | str = "pow2"
+    # from the frame, never an upscale, floored at the 64 px grid. All start from the
+    # square of the shorter side's power of two: "pow2" is that square (720p -> 512,
+    # 1080p -> 1024, 4K -> 2048); "pow2-fit" keeps the frame's shape inside it, the longer
+    # side the power of two (720p -> 512x320, 1080p -> 1024x576, 4K -> 2048x1152), so it
+    # never has more pixels than the square and its cells are a power of two wide, which
+    # imfeat's pass is fastest at -- the cheapest rule; "pow2-cover" keeps the shape
+    # around the square (720p -> 896x512), the dearest. The aspect policies keep the shape
+    # only as closely as the grid allows: the scaled side is rounded to a multiple of 64,
+    # so 16:9 is exact at widths 1024 and 2048 but 1.6:1 at 512 (see imfeat).
+    thumb: int | str = "pow2-fit"
     stride: int = 1  # imfeat sampling stride at the primary scale (1 = every pixel).
     extra_scales: str = ""  # Extra imfeat scales, 'thumb:stride;...' ('' disables).
     resize_interp: str = "area"  # Thumbnail resize kernel: 'area' or 'nearest'.

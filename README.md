@@ -7,10 +7,11 @@ and a dependency-free C++ runtime read the same bytes and produce identical
 scores.
 
 The front-end matches [framegate](https://github.com/PCJohn/framegate)'s single
-imfeat pass (a square thumbnail sized from the frame — `thumb="pow2"`, the largest power
-of two the shorter side holds: 720p → 512, 1080p → 1024, 4K → 2048 — HSV, stride 1,
-64×64 finest grid, six levels), so a framegate process can feed its own features to a
-fastdet model. **No model has been trained or measured on this front-end yet**: the
+imfeat pass (a thumbnail sized from the frame — `thumb="pow2-fit"`, the frame's shape
+fitted inside the square of its shorter side's power of two: 720p → 512×320, 1080p →
+1024×576, 4K → 2048×1152 — HSV, stride 1, 64×64 finest grid, six levels), so a framegate process
+can feed its own features to a fastdet model. **No model has been trained or measured on
+this front-end yet**: the
 quality and latency figures in [`research_report.md`](research_report.md) describe
 earlier front-ends (a fixed 512 px, CIELAB, an extra 256 px scale) and do not transfer.
 Regenerate the feature ranking from a full-width fit before pruning (see *Pruning*).
@@ -195,12 +196,14 @@ host already has:
 ```python
 det = Detector.load("model.fdt")
 spec = det.front_end_spec
-# {'thumb': 'pow2', 'stride': 1, 'resize_interp': 'area', 'space': 'hsv', 'input_space': 'bgr',
-#  'levels': [64, 32, 16, 8, 4, 2], 'raw_channels_per_level': 162, 'extra_scales': []}
+# {'thumb': 'pow2-fit', 'stride': 1, 'resize_interp': 'area', 'space': 'hsv',
+#  'input_space': 'bgr', 'levels': [64, 32, 16, 8, 4, 2], 'raw_channels_per_level': 162,
+#  'extra_scales': []}
 
 # host side, once per frame size: the FeatureComputer for that spec (imfeat appends its
 # whole-image level). spec["thumb"] is a side in pixels or an imfeat policy name, which
-# imfeat resolves from the frame's shape ("pow2": 1080p -> 1024x1024, 720p -> 512x512).
+# imfeat resolves from the frame's shape ("pow2-fit": 1080p -> 1024x576 (cols x rows),
+# 720p -> 512x320, 4K -> 2048x1152; "pow2": the squares 1024x1024, 512x512, 2048x2048).
 # The features are in spec["space"]; the computer is given spec["input_space"]: the BGR
 # frame itself for HSV, which imfeat thumbnails (thumb=, cv2.resize INTER_AREA's bytes) and
 # converts inside its pass (cv2.cvtColor's bytes), both at a fraction of OpenCV's cost;
@@ -236,16 +239,23 @@ text map with the model, on the pass it already makes.
 
 ### Features
 
-Each image is squashed to a square thumbnail (`INTER_AREA`; the aspect ratio is kept
-as a global feature instead) and passed to `imfeat` once at stride 1 with six pyramid
-levels (64/32/16/8/4/2 cells) — framegate's exact configuration. The thumbnail's side
-follows the frame: `thumb="pow2"` (the default) takes the largest power of two the
-shorter side holds, so a 720p frame becomes 512 px, 1080p and 1440p 1024, 4K 2048 —
-never an upscale, and the pass costs what the frame warrants (on the 22-thread laptop a
-720p frame took 2.2 ms on two threads at 512 px against 5.3 ms at a fixed 1024 px, cv2's
-bilinear upscale included; imfeat's `policy` benchmark); `thumb=1024` squashes every
-frame to that side instead, as older models did. Either way a cell is 1/64 of the frame; what changes with
-the size is the pixels a cell sees, so a model is trained for one rule. A frame at least
+Each image is resized to a thumbnail (`INTER_AREA`) and passed to `imfeat` once at
+stride 1 with six pyramid levels (64/32/16/8/4/2 cells) — framegate's exact
+configuration. The thumbnail's size follows the frame. Every rule starts from the square
+of the shorter side's power of two: `thumb="pow2"` is that square (720p → 512, 1080p →
+1024, 4K → 2048), `thumb="pow2-fit"` (the default) keeps the frame's shape inside it, the
+longer side the power of two (720p → 512×320, 1080p and 1440p → 1024×576, 4K →
+2048×1152), and `thumb="pow2-cover"` keeps the shape around it (720p → 896×512). None
+upscales. `pow2-fit` never has more pixels than the square and its cells are a power of
+two wide, which imfeat's pass is fastest at, so it is the cheapest rule everywhere: on
+the 22-thread laptop a 1080p frame took 4.0 ms on two threads at 1024×576 against 5.7 ms
+at the 1024 square (imfeat's `policy` benchmark). It keeps the shape only as closely as
+the grid allows: the scaled side is rounded to a multiple of 64, so 16:9 is exact at
+widths 1024 and 2048 but a 1.6:1 picture at 512 (a 10% squash, against the square's
+78%), and a banner too thin for that rounding gets the square. `thumb=1024` squashes
+every frame to that side, as older models did. Whatever the rule, a cell is 1/64 of the
+frame; what changes with the size is the pixels a cell sees (16×9 at 1024×576, 16×5 at
+512×320, 16×16 at 1024×1024), so a model is trained for one rule. A frame at least
 its thumbnail's size in both axes (every frame of 64 px or more, under a policy) goes
 into imfeat whole: the pass makes the thumbnail itself (bit for bit what `cv2.resize`
 gives, at a fraction of its cost and with no thumbnail written and read back) and
@@ -634,7 +644,7 @@ them with their current defaults). The ones worth sweeping:
 | `--exit-keep-prob` | 0.05 | cells ending at or above this probability are never stopped |
 | `--exit-margin` | 2.0 | raw-score safety margin under the calibrated thresholds |
 | `--exit-stage-fractions` | 0/0.125/0.25/0.5/0.75 | where in the fine tier the stages sit |
-| `--thumb` | pow2 | the square thumbnail the feature pyramid is computed on (framegate's): a side in pixels (every frame resized to it, smaller ones upscaled) or an imfeat policy name -- `pow2` is the largest power of two the frame's shorter side holds, never an upscale (`pow2-cover` / `pow2-fit` keep the aspect ratio, see imfeat) |
+| `--thumb` | pow2-fit | the thumbnail the feature pyramid is computed on (framegate's): a side in pixels (a square every frame is resized to, smaller ones upscaled) or an imfeat policy name, never an upscale -- `pow2` is the square of the shorter side's power of two (1080p → 1024×1024), `pow2-fit` keeps the frame's shape inside that square (1080p → 1024×576, 720p → 512×320; as closely as the grid's 64 px rounding allows), `pow2-cover` around it (see imfeat) |
 | `--stride` | 1 | imfeat sampling stride on the thumbnail: 1 = every pixel (16x16 samples per finest cell at 1024 px), 2, 4; capped at the cell side for small thumbnails |
 | `--extra-scales` | none | extra imfeat passes on downsized copies of the thumbnail, `thumb:stride` pairs separated by `;` (`--extra-scales "256:1"`, `--extra-scales "512:2;256:1"`; commas separate sweep values); each adds 162 raw columns per level measured at a coarser scale and one more imfeat pass of latency |
 | `--levels` | 64/32/16/8/4/2 | pyramid grids (finest must be 64) |
