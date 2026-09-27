@@ -23,7 +23,8 @@ Banks, in the order :meth:`FeatureExtractor.gather` emits them per level:
 fastdet computes no image features of its own: everything per-pixel comes from
 imfeat in a single pass, and the banks here are cheap reductions of its output.
 The bar detector ("bard") used to live in this module in numpy; it now arrives
-inside imfeat's raw block, seven columns per channel.
+inside imfeat's raw block, seven columns per channel. The thumbnail too is made
+inside that pass when the frame allows it (see :meth:`FeatureExtractor.run_imfeat`).
 """
 
 from __future__ import annotations
@@ -81,6 +82,7 @@ FloatArray = NDArray[np.float32]
 
 GRID = 64  # Finest/output grid resolution; fixed regardless of the feature levels.
 RAW_CHANNELS = 3  # imfeat is always fed a 3-channel image.
+_COLOUR_NDIM = 3  # (H, W, C): what a colour frame looks like
 THUMB = 512  # Default square resize target for the feature pyramid.
 STRIDE = 2  # Default imfeat sampling stride at the primary scale.
 
@@ -329,29 +331,34 @@ def default_threads() -> int:
     return max(1, min(_MAX_DEFAULT_THREADS, os.cpu_count() or 1))
 
 
-def make_feature_computer(
+def make_feature_computer(  # noqa: PLR0913 -- the front-end's knobs, all explicit
     available_levels: tuple[int, ...],
     thumb: int = THUMB,
     stride: int = STRIDE,
     threads: int | None = None,
     space: str = "hsv",
+    *,
+    frame_shape: tuple[int, ...] | None = None,
 ) -> tuple[Any, int]:
     """Build the imfeat computer for ``available_levels``, with features in ``space``.
 
     The computer takes the BGR thumbnail when imfeat converts to ``space`` itself (HSV:
     inside the pass, ``cv2.cvtColor``'s bytes exactly) and the converted thumbnail
-    otherwise (see :class:`SpaceInfo`).  imfeat partitions the work by cell, so its output
-    is bit-identical for any thread count; ``threads`` only sets how fast the pass runs
-    (``None`` = :func:`default_threads`).
+    otherwise (see :class:`SpaceInfo`).  With ``frame_shape`` it takes the frame itself and
+    makes the ``thumb x thumb`` thumbnail inside the pass (``cv2.resize``'s ``INTER_AREA``
+    bytes exactly; the frame must be at least that size in both axes).  imfeat partitions
+    the work by cell, so its output is bit-identical for any thread count; ``threads``
+    only sets how fast the pass runs (``None`` = :func:`default_threads`).
     """
     exponents = [exponent_for_size(size) for size in available_levels]
     computer = imfeat.FeatureComputer(
-        shape=(thumb, thumb, 3),
+        shape=(thumb, thumb, 3) if frame_shape is None else frame_shape,
         grid=[(e, e) for e in exponents],
         stride=stride,
         threads=threads if threads is not None else default_threads(),
         input_space="bgr",
         feature_space=SPACE_INFO[space].fused,
+        thumb=None if frame_shape is None else (thumb, thumb),
     )
     return computer, len(exponents)
 
@@ -363,9 +370,19 @@ class FeatureExtractor:
     whole split (via :class:`FeatureCache`) or a single ``predict_proba`` call.
     """
 
-    def __init__(self, cfg: TrainConfig, threads: int | None = None) -> None:
-        """Configure the imfeat pyramid and the enabled feature banks."""
+    def __init__(
+        self, cfg: TrainConfig, threads: int | None = None, *, fuse_resize: bool = True
+    ) -> None:
+        """Configure the imfeat pyramid and the enabled feature banks.
+
+        With ``fuse_resize`` (the default) a frame at least ``cfg.thumb`` px in both axes
+        is handed to imfeat whole and thumbnailed inside its pass, by a computer built for
+        that frame size and rebuilt when the size changes -- right for a stream, wasteful
+        for a set of images of many sizes (:class:`FeatureCache` turns it off).  The
+        numbers are the same either way.
+        """
         self.cfg = cfg
+        self.fuse_resize = fuse_resize
         self.levels: tuple[int, ...] = tuple(sorted(cfg.levels, reverse=True))
         self.extra_scales: list[ExtraScale] = parse_extra_scales(cfg.extra_scales)
         self.extra_labels: tuple[str, ...] = tuple(scale.label for scale in self.extra_scales)
@@ -393,6 +410,7 @@ class FeatureExtractor:
         # The imfeat computers (and their worker pools) are built on the first pass, so a
         # host that runs imfeat itself and feeds compose() never spawns them.
         self._computers: tuple[Any, list[tuple[Any, int, str]]] | None = None
+        self._fused: tuple[tuple[int, ...], Any] | None = None  # (frame shape, computer)
 
         self.base_names = self._build_names()
 
@@ -405,6 +423,39 @@ class FeatureExtractor:
     def extra_computers(self) -> list[tuple[Any, int, str]]:
         """``(computer, thumb, label)`` per extra scale (built on first use)."""
         return self._imfeat()[1]
+
+    def _fuses(self, img_bgr: Image) -> bool:
+        """Whether ``img_bgr`` goes into imfeat whole.
+
+        Fusing on, the colour conversion inside the pass (HSV), the box filter, and a BGR
+        frame at least the thumbnail's size in both axes (an upscale is bilinear in OpenCV,
+        not ``INTER_AREA``).
+        """
+        cfg = self.cfg
+        return (
+            self.fuse_resize
+            and SPACE_INFO[cfg.imfeat_space].fused is not None
+            and cfg.resize_interp == "area"
+            and img_bgr.ndim == _COLOUR_NDIM
+            and img_bgr.shape[2] == RAW_CHANNELS
+            and img_bgr.shape[0] >= cfg.thumb
+            and img_bgr.shape[1] >= cfg.thumb
+        )
+
+    def _fused_computer(self, shape: tuple[int, ...]) -> Any:
+        """The computer that takes frames of ``shape``, kept until the shape changes."""
+        if self._fused is None or self._fused[0] != shape:
+            cfg = self.cfg
+            fc, _ = make_feature_computer(
+                self.levels,
+                cfg.thumb,
+                cfg.stride,
+                self.threads,
+                cfg.imfeat_space,
+                frame_shape=shape,
+            )
+            self._fused = (shape, fc)
+        return self._fused[1]
 
     def _imfeat(self) -> tuple[Any, list[tuple[Any, int, str]]]:
         if self._computers is None:
@@ -548,6 +599,7 @@ class FeatureExtractor:
         The next pass builds them again; a host feeding :meth:`compose` never needs them.
         """
         self._computers = None
+        self._fused = None
 
     @property
     def front_end_spec(self) -> dict[str, Any]:
@@ -563,7 +615,10 @@ class FeatureExtractor:
         HSV default), otherwise ``space`` itself, converted with OpenCV first and taken
         as it is (``feature_space=None``); ``extra_scales`` are further ``(thumb,
         stride)`` passes on downsized copies of the thumbnail, in the order
-        :meth:`compose` expects them.
+        :meth:`compose` expects them.  A host with BGR frames at least ``thumb`` px in
+        both axes can let imfeat make the thumbnail too
+        (``FeatureComputer(shape=frame.shape, thumb=thumb, ...)`` on the frame): the
+        bytes are ``cv2.resize``'s ``INTER_AREA`` ones, so the result is the same.
         """
         cfg = self.cfg
         space = SPACE_INFO[cfg.imfeat_space]
@@ -581,14 +636,25 @@ class FeatureExtractor:
     def run_imfeat(self, img_bgr: Image) -> tuple[Any, list[Any]]:
         """Resize and run imfeat: ``(result, extra_results)`` for :meth:`compose`.
 
-        The colour conversion happens inside imfeat's pass (HSV), or here first for the
-        spaces it cannot do (see :class:`SpaceInfo`).
+        The thumbnail resize and the colour conversion happen inside imfeat's pass when
+        they can (see :meth:`_fuses`; the frame goes in whole and the pass makes the
+        thumbnail, ``cv2.resize``'s bytes exactly), or here first otherwise -- a frame
+        smaller than the thumbnail, the nearest-neighbour filter, a colour space imfeat
+        cannot convert to (see :class:`SpaceInfo`).  Same numbers either way.
         """
         cfg = self.cfg
-        interpolation = cv2.INTER_AREA if cfg.resize_interp == "area" else cv2.INTER_NEAREST
-        thumb_bgr = self._resize_bgr(img_bgr, cfg.thumb, interpolation)
         space = SPACE_INFO[cfg.imfeat_space]
-        result = self.fc.features(self._convert(thumb_bgr, space))
+        if self._fuses(img_bgr):
+            fc = self._fused_computer(img_bgr.shape)
+            if not self.extra_scales:
+                return fc.features(img_bgr), []
+            # the extra scales are made from the thumbnail: have the pass write it out
+            thumb_bgr = np.empty((cfg.thumb, cfg.thumb, 3), np.uint8)
+            result = fc.features(img_bgr, thumb_out=thumb_bgr)
+        else:
+            interpolation = cv2.INTER_AREA if cfg.resize_interp == "area" else cv2.INTER_NEAREST
+            thumb_bgr = self._resize_bgr(img_bgr, cfg.thumb, interpolation)
+            result = self.fc.features(self._convert(thumb_bgr, space))
         extra_results = []
         for computer, extra_thumb, _label in self.extra_computers:
             extra_bgr = self._resize_bgr(thumb_bgr, extra_thumb)
@@ -789,7 +855,8 @@ class FeatureCache:
         )
 
         self.cfg = cfg
-        self.extractor = FeatureExtractor(cfg)
+        # images of many sizes: a computer per frame size would be rebuilt for each
+        self.extractor = FeatureExtractor(cfg, fuse_resize=False)
         self.base_names = self.extractor.base_names
         self.levels = self.extractor.levels
 

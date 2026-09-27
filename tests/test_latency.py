@@ -47,6 +47,7 @@ if TYPE_CHECKING:
 # framegate's pass: HSV, 64x64 finest grid, six levels, ~4 samples per cell per axis.
 FRAMEGATE_LEVELS = (64, 32, 16, 8, 4, 2)
 SIZES = (256, 512, 1024)
+SOURCE_HW = (1080, 1920)  # the frame the front-end thumbnails: 1080p, the target source
 KEPT_COLUMNS = (512, 1178)
 _ITERS = 10
 _REPS = 15
@@ -172,36 +173,52 @@ def _strides_for(size: int) -> tuple[int, ...]:
     ("size", "stride"), [(size, stride) for size in SIZES for stride in _strides_for(size)]
 )
 def test_front_end_latency(size: int, stride: int) -> None:
-    """Resize, imfeat and bank assembly at one resolution and stride.
+    """Resize, imfeat and bank assembly at one thumbnail size and stride, from a 1080p frame.
 
-    The colour conversion is inside imfeat's pass; cvtColor is timed alongside for
-    reference only.
+    The frame goes into imfeat whole and is thumbnailed inside its pass (``INTER_AREA``,
+    cv2.resize's bytes), so the pass is timed on the frame and on a ready thumbnail: the
+    difference is what the resize costs inside it.  cv2.resize is timed alongside, on
+    cv2's default thread count and on one, as what a host that resizes itself would pay;
+    the colour conversion is inside the pass too, cvtColor likewise for reference only.
     """
     cfg = _config(size, stride)
     extractor = FeatureExtractor(cfg.train)
     rng = np.random.default_rng(0)
-    image = rng.integers(0, 256, (size, size, 3), dtype=np.uint8)
+    image = rng.integers(0, 256, (*SOURCE_HW, 3), dtype=np.uint8)
     thumb = cv2.resize(image, (size, size), interpolation=cv2.INTER_AREA)
     level_maps, broadcast = extractor.extract(image)
+    assert extractor._fuses(image)
 
-    resize_ms, _ = _p50_min(lambda: cv2.resize(image, (size, size), interpolation=cv2.INTER_AREA))
+    resize = lambda: cv2.resize(image, (size, size), interpolation=cv2.INTER_AREA)  # noqa: E731
+    cv2_threads = cv2.getNumThreads()
+    resize_ms, _ = _p50_min(resize)
+    cv2.setNumThreads(1)
+    try:
+        resize_1_ms, _ = _p50_min(resize)
+    finally:
+        cv2.setNumThreads(cv2_threads)
     cvt_ms, _ = _p50_min(lambda: cv2.cvtColor(thumb, cv2.COLOR_BGR2HSV))
-    imfeat_ms, _ = _p50_min(lambda: extractor.fc.features(thumb))
+    on_thumb_ms, _ = _p50_min(lambda: extractor.fc.features(thumb))
+    fused_ms, _ = _p50_min(lambda: extractor.run_imfeat(image))
     extract_ms, _ = _p50_min(lambda: extractor.extract(image))
     native_ms, _ = _p50_min(lambda: extractor.native(level_maps, broadcast))
     print(
-        f"\n[fastdet-lat] FRONT-END -- {size}x{size}x3 image, HSV, {len(cfg.train.levels)} pyramid"
-        f" levels, stride {cfg.train.stride}"
+        f"\n[fastdet-lat] FRONT-END -- {SOURCE_HW[1]}x{SOURCE_HW[0]} frame -> {size}x{size}x3"
+        f" thumbnail, HSV, {len(cfg.train.levels)} pyramid levels, stride {cfg.train.stride}"
         f" ({(size // GRID) // cfg.train.stride} samples per cell per axis),"
-        f" {extractor.total_width()} feature columns:"
+        f" {extractor.total_width()} feature columns, {extractor.fc.threads} imfeat thread(s):"
     )
     print(
-        f"   resize {resize_ms:6.3f} ms | imfeat pass incl. BGR->HSV {imfeat_ms:6.3f} ms"
-        f" (a separate cv2.cvtColor would be {cvt_ms:6.3f} ms) | "
-        f"context banks + level assembly {extract_ms - resize_ms - imfeat_ms:6.3f} ms | "
+        f"   imfeat pass on the frame, resize + BGR->HSV inside {fused_ms:6.3f} ms"
+        f" (on a ready thumbnail {on_thumb_ms:6.3f}: the resize inside costs"
+        f" {fused_ms - on_thumb_ms:6.3f}; cv2.resize would be {resize_ms:6.3f} on cv2's"
+        f" {cv2_threads} thread(s), {resize_1_ms:6.3f} on one; a separate cvtColor {cvt_ms:6.3f})"
+    )
+    print(
+        f"   context banks + level assembly {extract_ms - fused_ms:6.3f} ms | "
         f"pack features for the scorer {native_ms:6.3f} ms"
     )
     print(
-        f"   {'':<22s} front-end total (image -> features ready to score) {extract_ms + native_ms:6.3f} ms"
+        f"   {'':<22s} front-end total (frame -> features ready to score) {extract_ms + native_ms:6.3f} ms"
     )
     assert extract_ms > 0.0

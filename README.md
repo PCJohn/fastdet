@@ -132,13 +132,13 @@ creation, and idle detectors use no CPU. `Detector.close()` joins both pools; ca
 in long-running hosts and before interpreter shutdown on Windows, where joining threads
 during DLL unload can stall the process (the demo does).
 
-What to expect: at 1024 px and stride 1 the imfeat pass is ~9 ms single-threaded; on a
-22-thread laptop two threads took a frame's feature extraction from 17 to 10 ms and
-eight to 9, so the default stops at four and `--threads` is the knob to check on a
-given machine. The scorer's pass is ~0.5 ms, so its gain flattens sooner: for the
-benchmark's random 1178-column model (`pytest -s tests/test_latency.py` prints the
-one-thread and threaded rows), an AVX2 build on a 2-core VM went from 0.45 ms to
-0.35 ms on two threads. Training extraction uses the same setting.
+What to expect: on a 22-thread laptop, a 1080p frame to HSV features on the 1024 px
+thumbnail (resize and conversion inside imfeat's pass, stride 1) took 11.1 ms on one
+thread, 5.6 on two and 3.4 on four, so the default stops at four and `--threads` is the
+knob to check on a given machine. The scorer's pass is ~0.5 ms, so its gain flattens
+sooner: for the benchmark's random 1178-column model (`pytest -s tests/test_latency.py`
+prints the one-thread and threaded rows), an AVX2 build on a 2-core VM went from 0.45 ms
+to 0.35 ms on two threads. Training extraction uses the same setting.
 
 How the scorer splits a pass, in three phases separated by barriers, with no thread
 reading what another writes inside a phase:
@@ -199,20 +199,22 @@ spec = det.front_end_spec
 
 # host side, once: the FeatureComputer for that spec (imfeat appends its whole-image level).
 # The features are in spec["space"]; the computer is given spec["input_space"]: the BGR
-# thumbnail itself for HSV, which imfeat converts inside its pass (cv2.cvtColor's bytes,
-# at a fraction of its cost), otherwise the thumbnail converted with OpenCV, taken as it is.
-fc = imfeat.FeatureComputer(shape=(spec["thumb"], spec["thumb"], 3),
+# frame itself for HSV, which imfeat thumbnails (thumb=, cv2.resize INTER_AREA's bytes) and
+# converts inside its pass (cv2.cvtColor's bytes), both at a fraction of OpenCV's cost;
+# otherwise the thumbnail converted with OpenCV, taken as it is.
+fc = imfeat.FeatureComputer(shape=frame.shape,          # a BGR frame >= thumb px in both axes
                             grid=[(int(np.log2(n)),) * 2 for n in spec["levels"]],
                             stride=spec["stride"], threads=1,
-                            feature_space=spec["space"] if spec["input_space"] == "bgr" else None)
-# per frame: the host's own resize (INTER_AREA to thumb x thumb), then imfeat
-result = fc.features(bgr_thumbnail)
+                            feature_space=spec["space"], thumb=spec["thumb"])
+# per frame: imfeat on the frame (smaller frames: cv2.resize INTER_AREA to thumb x thumb
+# first, and a computer with shape=(thumb, thumb, 3) and no thumb=)
+result = fc.features(frame)
 probabilities = det.predict_from_imfeat(result, image_hw=frame.shape[:2])   # (64, 64)
 ```
 
-The result must come from a thumbnail and computer matching the spec (size, stride,
-colour spaces, levels; the map shapes are checked); `image_hw` is the original frame's
-height and width, which the global feature block records. A model trained with
+The result must come from a thumbnail and computer matching the spec (size, filter,
+stride, colour spaces, levels; the map shapes are checked); `image_hw` is the original
+frame's height and width, which the global feature block records. A model trained with
 `extra_scales` needs those passes too: run a computer per `(thumb, stride)` in
 `spec["extra_scales"]` on downsized copies of the thumbnail and pass their results as
 `extra_results`. The map is the same as `predict_proba(frame)`, through the same C++
@@ -229,10 +231,14 @@ text map with the model, on the pass it already makes.
 
 Each image is squashed to a 1024×1024 thumbnail (`INTER_AREA`; the aspect ratio
 is kept as a global feature instead) and passed to `imfeat` once at stride 1 with
-six pyramid levels (64/32/16/8/4/2 cells) — framegate's exact configuration. imfeat
-converts it to HSV inside that pass (bit for bit what `cv2.cvtColor` gives, so
-models trained before the conversion moved score identically). For every cell of the finest 64×64 grid, the front-end
-concatenates the features of all levels into one row (1178 columns):
+six pyramid levels (64/32/16/8/4/2 cells) — framegate's exact configuration. A frame
+at least 1024 px in both axes goes into imfeat whole: the pass makes the thumbnail
+itself (bit for bit what `cv2.resize` gives, at a fraction of its cost and with no
+thumbnail written and read back) and converts it to HSV (bit for bit `cv2.cvtColor`),
+so models trained when those steps were OpenCV's score identically; smaller frames are
+resized with cv2 first, since OpenCV upscales bilinearly. For every cell of the finest
+64×64 grid, the front-end concatenates the features of all levels into one row (1178
+columns):
 
 - `raw` — imfeat's per-channel block per cell, per scale. This includes the
   multi-lag bar detector (`bard_*`), which fires when a pixel is darker or
