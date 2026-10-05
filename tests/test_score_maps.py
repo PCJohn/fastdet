@@ -119,24 +119,35 @@ def test_map_sources_name_the_values_native_packs(tiny_model: Path) -> None:
     frame = rng.integers(0, 256, (240, 320, 3), dtype=np.uint8)
     level_maps, broadcast = ex.extract(frame)
     total = ex.total_width()
+    n_raw = 1 + len(ex.extra_scales)
     for keep in (None, np.sort(rng.choice(total, 200, replace=False))):
-        sources = ex.map_sources(keep)
-        arrays = sources.arrays(level_maps, broadcast)
-        n = total if keep is None else len(keep)
-        assert sources.feature_slot.shape == sources.feature_index.shape == (n,)
-        packed = ex.native(level_maps, broadcast, keep)
-        pos = 0
-        for f in range(n):
-            arr = arrays[sources.feature_slot[f]]
-            side = sources.slot_side[sources.feature_slot[f]]
-            values = (
-                arr[sources.feature_index[f]]
-                if arr.ndim == 1
-                else arr[..., sources.feature_index[f]]
-            )
-            np.testing.assert_array_equal(np.ravel(values), packed[pos : pos + side * side])
-            pos += side * side
-        assert pos == packed.shape[0]
+        for in_scorer in (False, True):
+            sources = ex.map_sources(keep, banks_in_scorer=in_scorer)
+            arrays = sources.arrays(level_maps, broadcast)
+            n = total if keep is None else len(keep)
+            assert sources.feature_slot.shape == sources.feature_index.shape == (n,)
+            assert bool(sources.bank_slots) == in_scorer
+            computed = {slot: raw for slot, raw, _col in sources.bank_slots}
+            packed = ex.native(level_maps, broadcast, keep)
+            pos = 0
+            for f in range(n):
+                slot = int(sources.feature_slot[f])
+                side = int(sources.slot_side[slot])
+                index = int(sources.feature_index[f])
+                if slot in computed:  # a plane of the level's bank buffer: compose's, here
+                    size = sources.slots[slot][0]
+                    assert arrays[slot] is None
+                    assert sources.slots[computed[slot]] == (size, 0)  # its raw map's slot
+                    planes = level_maps[size][n_raw].base  # the (7, side, side) buffer
+                    assert planes is not None
+                    values = planes[index]
+                else:
+                    arr = arrays[slot]
+                    assert arr is not None
+                    values = arr[index] if arr.ndim == 1 else arr[..., index]
+                np.testing.assert_array_equal(np.ravel(values), packed[pos : pos + side * side])
+                pos += side * side
+            assert pos == packed.shape[0]
     det.close()
 
 
@@ -241,3 +252,101 @@ def test_concurrent_callers_do_not_disturb_each_other() -> None:
     for i in (0, 1):
         for out in got[i]:
             np.testing.assert_array_equal(out, want[i])
+
+
+def test_raw_path_computes_the_banks_in_the_scorer(
+    tiny_dataset: tuple[Path, Path], tiny_model: Path
+) -> None:
+    """``score_raw`` (no compose) == ``score_maps(compose)`` == the packed matrix scored.
+
+    The scorer makes the context banks itself, on the calling thread while the others bin,
+    and bins them from its own buffers: the same bytes on every thread count, with and
+    without the exit, and the buffers hold what compose computes.
+    """
+    images_dir, _masks_dir = tiny_dataset
+    frames = [
+        np.asarray(cv2.imread(str(p)), dtype=np.uint8) for p in sorted(images_dir.glob("*.png"))[:3]
+    ]
+    reference = Detector.load(tiny_model, threads=1)
+    assert reference.native is not None
+    want = []
+    for frame in frames:
+        level_maps, broadcast = reference.extractor.extract(frame)
+        packed = reference.pack_native(level_maps, broadcast)
+        want.append(
+            {
+                use_exit: reference.native.score(packed, use_exit=use_exit)
+                for use_exit in (False, True)
+            }
+        )
+    for threads in (1, 2, 3, 16):
+        det = Detector.load(tiny_model, threads=threads)
+        assert det.native is not None
+        for frame, expect in zip(frames, want, strict=True):
+            result, extra = det.extractor.run_imfeat(frame)
+            np.testing.assert_array_equal(
+                det.score_raw(result, frame.shape[:2], extra), expect[det.config.model.use_exit]
+            )
+            sources = det.native.sources
+            assert sources is not None
+            assert sources.bank_slots  # the banks are the scorer's
+            raw = det.extractor.raw_maps(result, frame.shape[:2], extra)
+            for use_exit in (False, True):
+                got = det.native.score_maps(sources.raw_arrays(raw), use_exit=use_exit)
+                np.testing.assert_array_equal(got, expect[use_exit], err_msg=f"{threads} threads")
+            # the scorer's buffers hold compose's banks, coordinates included
+            level_maps, broadcast = det.extractor.compose(result, frame.shape[:2], extra)
+            n_raw = 1 + len(det.extractor.extra_scales)
+            for slot, _raw_slot, _column in sources.bank_slots:
+                size = sources.slots[slot][0]
+                np.testing.assert_array_equal(
+                    det.native.bank_buffers[slot], level_maps[size][n_raw].base
+                )
+            # and the composed maps score the same through the same scorer
+            np.testing.assert_array_equal(
+                det.score_maps(level_maps, broadcast), expect[det.config.model.use_exit]
+            )
+            np.testing.assert_array_equal(
+                det.predict_proba(frame).reshape(-1), expect[det.config.model.use_exit]
+            )
+        det.close()
+    reference.close()
+
+
+def test_bank_slots_are_checked(tiny_model: Path) -> None:
+    det = Detector.load(tiny_model)
+    scorer, sources = det.scorer_layout()
+    assert sources.bank_slots
+    slot, raw_slot, column = sources.bank_slots[0]
+    side = int(sources.slot_side[slot])
+    rng = np.random.default_rng(0)
+    frame = rng.integers(0, 256, (200, 200, 3), dtype=np.uint8)
+    level_maps, broadcast = det.extractor.extract(frame)
+    arrays = sources.arrays(level_maps, broadcast)
+    assert arrays[slot] is None
+    with_array: list[Any] = list(arrays)
+    with_array[slot] = np.zeros((side, side, 7), np.float32)
+    with pytest.raises(ValueError, match="pass None"):
+        scorer.score_maps(with_array)
+    native = scorer._scorer
+    good = np.zeros((7, side, side), np.float32)
+    with pytest.raises(ValueError, match="distinct"):
+        native.set_bank_slot(slot, slot, column, good)
+    other = next(i for i, s in enumerate(sources.slot_side) if s not in (side, 1))
+    with pytest.raises(ValueError, match="same side"):
+        native.set_bank_slot(slot, other, column, good)
+    with pytest.raises(ValueError, match=r"\(7, side, side\)"):
+        native.set_bank_slot(slot, raw_slot, column, np.zeros((7, side + 1, side), np.float32))
+    with pytest.raises(TypeError):  # no implicit conversion of the buffer the scorer keeps
+        native.set_bank_slot(slot, raw_slot, column, np.zeros((7, side, side), np.float64))
+    # the raw map must be wide enough for the column the banks read
+    narrow: list[Any] = list(arrays)
+    raw = arrays[raw_slot]
+    assert raw is not None
+    narrow[raw_slot] = raw[..., :column]
+    with pytest.raises(ValueError, match="reads index"):
+        scorer.score_maps(narrow)
+    np.testing.assert_array_equal(  # intact after the refusals
+        scorer.score_maps(arrays), det.score_maps(level_maps, broadcast)
+    )
+    det.close()

@@ -36,7 +36,7 @@ set(HWY_ENABLE_CONTRIB OFF CACHE BOOL "" FORCE)
 set(HWY_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(highway)
 
-add_executable(fastdet_score fastdet_score.cpp)
+add_executable(fastdet_score fastdet_score.cpp context_banks.cpp)
 target_link_libraries(fastdet_score PRIVATE hwy)
 
 # The Python extension (fastdet._native_ext), built when scikit-build-core drives CMake during

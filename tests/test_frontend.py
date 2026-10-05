@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 import pytest
 
-from fastdet.features import FeatureCache, FeatureExtractor
+from fastdet.features import FeatureCache, FeatureExtractor, compute_global_stats
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -58,3 +58,24 @@ def test_cache_does_not_hold_imfeat_views(
     for banks in cache.level_maps_list[0].values():
         for bank in banks:
             assert bank.base is None, "cached bank is a view into a larger buffer"
+
+
+def test_global_stats_vector_is_the_numpy_formula() -> None:
+    """The extension's vector == the NumPy formula it replaces, NaN and inf zeroed."""
+    rng = np.random.default_rng(0)
+    block = (rng.standard_normal(135) * 300).astype(np.float32)
+    block[[3, 17, 40]] = [np.nan, np.inf, -np.inf]
+    for h, w in ((1080, 1920), (0, 7), (3, 3), (4096, 1)):
+        want = np.concatenate(
+            [
+                np.nan_to_num(block, nan=0.0, posinf=0.0, neginf=0.0),
+                np.asarray([float(w / max(h, 1)), float(np.log1p(h * w))]),
+            ]
+        ).astype(np.float32)
+        got = compute_global_stats(block, h, w)
+        assert got.dtype == np.float32
+        np.testing.assert_array_equal(got, want)
+    # a strided block is read where it lies
+    np.testing.assert_array_equal(
+        compute_global_stats(block[::3], 9, 16), compute_global_stats(block[::3].copy(), 9, 16)
+    )

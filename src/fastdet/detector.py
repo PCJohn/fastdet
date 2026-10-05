@@ -28,6 +28,7 @@ from .features import (
     FeatureExtractor,
     FloatArray,
     LevelBanks,
+    MapSources,
     feature_level_bits,
 )
 from .images import read_image
@@ -386,24 +387,18 @@ class Detector:
         if self.runtime is None:
             msg = "detector is not fitted; call fit() or load()"
             raise RuntimeError(msg)
-        level_maps, broadcast_vecs = self.extractor.compose(result, image_hw, extra_results)
-        return self._predict_from_maps(level_maps, broadcast_vecs)
+        return self.score_raw(result, image_hw, extra_results).reshape(GRID, GRID)
 
     def _predict_from_maps(
         self, level_maps: dict[int, LevelBanks], broadcast_vecs: dict[int, FloatArray]
     ) -> NDArray[np.floating[Any]]:
         return self.score_maps(level_maps, broadcast_vecs).reshape(GRID, GRID)
 
-    def score_maps(
-        self, level_maps: dict[int, LevelBanks], broadcast_vecs: dict[int, FloatArray]
-    ) -> NDArray[np.float32]:
-        """The scorer on these maps, read where they lie: the live path.
+    def scorer_layout(self) -> tuple[NativeScorer, MapSources]:
+        """The C++ scorer and the layout it reads the maps by, set on it the first time.
 
-        The kept columns are binned straight from the level maps (imfeat's cell-major
-        maps, the context banks' planes, the broadcast vector), so no packed copy of the
-        features is made per frame; :meth:`NativeScorer.score_maps`, with the layout set on
-        the scorer the first time.  Returns the ``GRID * GRID`` probabilities, row-major --
-        the same bytes as :meth:`pack_native` followed by :meth:`NativeScorer.score`.
+        For a host that drives the scorer itself: ``layout.raw_arrays`` /
+        ``layout.arrays`` pick a frame's arrays, ``scorer.score_maps`` scores them.
         """
         if self.native is None:
             msg = "detector is not fitted; call fit() or load()"
@@ -413,6 +408,40 @@ class Detector:
         if sources is None:
             sources = self.extractor.map_sources(self.col_keep)
             scorer.set_sources(sources)
+        return scorer, sources
+
+    def score_raw(
+        self,
+        result: Any,
+        image_hw: tuple[int, int],
+        extra_results: Sequence[Any] = (),
+    ) -> NDArray[np.float32]:
+        """The scorer on an imfeat result, with nothing composed first: the live path.
+
+        The raw maps go to the scorer as they are (:meth:`FeatureExtractor.raw_maps` checks
+        them and makes the global vector); it computes the context banks itself, on the
+        calling thread while its other threads bin the raw features, and bins every kept
+        column where it lies.  Returns the ``GRID * GRID`` probabilities, row-major -- the
+        same bytes as :meth:`FeatureExtractor.compose` followed by :meth:`score_maps`, and
+        as the packed matrix scored.
+        """
+        scorer, sources = self.scorer_layout()
+        raw = self.extractor.raw_maps(result, image_hw, extra_results)
+        return scorer.score_maps(sources.raw_arrays(raw), use_exit=self.config.model.use_exit)
+
+    def score_maps(
+        self, level_maps: dict[int, LevelBanks], broadcast_vecs: dict[int, FloatArray]
+    ) -> NDArray[np.float32]:
+        """The scorer on composed maps, read where they lie.
+
+        The kept columns are binned straight from the level maps (imfeat's cell-major
+        maps, the broadcast vector; the context banks the scorer recomputes from the raw
+        map, the same bytes), so no packed copy of the features is made;
+        :meth:`NativeScorer.score_maps`, with the layout set on the scorer the first time.
+        Returns the ``GRID * GRID`` probabilities, row-major -- the same bytes as
+        :meth:`pack_native` followed by :meth:`NativeScorer.score`.
+        """
+        scorer, sources = self.scorer_layout()
         arrays = sources.arrays(level_maps, broadcast_vecs)
         return scorer.score_maps(arrays, use_exit=self.config.model.use_exit)
 
@@ -444,8 +473,9 @@ class Detector:
         if self.runtime is None:
             msg = "detector is not fitted; call fit() or load()"
             raise RuntimeError(msg)
-        level_maps, broadcast_vecs = self.extractor.extract(self._decode(image))
-        return self._predict_from_maps(level_maps, broadcast_vecs)
+        frame = self._decode(image)
+        result, extra_results = self.extractor.run_imfeat(frame)
+        return self.score_raw(result, frame.shape[:2], extra_results).reshape(GRID, GRID)
 
     # -- persistence --------------------------------------------------------
     def export(self, path: str | Path) -> Path:

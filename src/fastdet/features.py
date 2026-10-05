@@ -201,15 +201,50 @@ class MapSources:
     slot_side: NDArray[np.int32]
     feature_slot: NDArray[np.int32]
     feature_index: NDArray[np.int32]
+    # the slots the scorer computes itself -- a level's context banks, both of them, as the
+    # 7 planes of one buffer -- as (slot, the slot of the level's primary raw map, the
+    # luminance-mean column of that map); their features index the planes
+    bank_slots: tuple[tuple[int, int, int], ...] = ()
+    # per slot, where :meth:`raw_arrays` picks its array: (level index, scale) for a raw
+    # map, (-1, 0) for the global vector, None for a slot the scorer computes
+    picks: tuple[tuple[int, int] | None, ...] = ()
 
     def arrays(
         self, level_maps: dict[int, LevelBanks], broadcast_vecs: dict[int, FloatArray]
-    ) -> list[FloatArray]:
-        """The frame's arrays in slot order: what ``score_maps`` is given."""
+    ) -> list[FloatArray | None]:
+        """The frame's arrays in slot order: what ``score_maps`` is given.
+
+        ``None`` for a slot the scorer computes (its banks in ``level_maps`` go unused:
+        the scorer makes the same bytes from the raw map).
+        """
         return [
-            broadcast_vecs[size] if bank < 0 else level_maps[size][bank]
-            for size, bank in self.slots
+            None if pick is None else broadcast_vecs[size] if bank < 0 else level_maps[size][bank]
+            for (size, bank), pick in zip(self.slots, self.picks, strict=True)
         ]
+
+    def raw_arrays(self, raw: RawMaps) -> list[FloatArray | None]:
+        """The arrays in slot order from the raw maps alone (:meth:`FeatureExtractor.raw_maps`).
+
+        The banks the scorer computes are ``None``.
+        """
+        levels, extra, global_vec = raw
+        return [
+            (
+                None
+                if pick is None
+                else (
+                    global_vec
+                    if pick[0] < 0
+                    else levels[pick[0]] if pick[1] == 0 else extra[pick[1] - 1][pick[0]]
+                )
+            )
+            for pick in self.picks
+        ]
+
+
+# What the scorer's raw path takes (:meth:`FeatureExtractor.raw_maps`): the primary imfeat
+# map of every level, the extra scales' maps (per scale, per level), the global vector.
+RawMaps = tuple[list["FloatArray"], list[list["FloatArray"]], "FloatArray"]
 
 
 @dataclass(frozen=True)
@@ -355,6 +390,7 @@ def compute_context2_values(pooled: FloatArray, grid_size: int) -> FloatArray:
 
 N_BANK_PLANES = len(CONTEXT_FEATURE_NAMES) + len(CONTEXT2_FEATURE_NAMES)  # 7
 _N_CTX = len(CONTEXT_FEATURE_NAMES)
+_NO_BROADCAST = np.zeros(0, dtype=np.float32)  # the broadcast vector of a level with none
 
 
 def _refs_when_idle() -> int:
@@ -372,6 +408,15 @@ def _refs_when_idle() -> int:
 _IDLE_REFS = _refs_when_idle()
 
 
+def _write_coords(out: FloatArray) -> None:
+    """Planes 0 and 1 of a ``(7, grid, grid)`` bank buffer: the cell coordinates, constants."""
+    grid_size = out.shape[1]
+    if grid_size < _CTX1_MIN_GRID:
+        out[:2] = 0.0
+    else:
+        out[0], out[1] = _coord_planes(grid_size)
+
+
 def context_banks(pooled: FloatArray, out: FloatArray, *, coords: bool = True) -> FloatArray:
     """Both context banks of one level into ``out``, a ``(7, grid, grid)`` float32 array.
 
@@ -381,14 +426,12 @@ def context_banks(pooled: FloatArray, out: FloatArray, *, coords: bool = True) -
     :func:`compute_context_values` and :func:`compute_context2_values` give through their
     7 OpenCV calls (the tests pin it).  ``out[:5].transpose(1, 2, 0)`` and
     ``out[5:].transpose(1, 2, 0)`` are the two banks in the ``(grid, grid, n)`` shape the
-    levels carry, each column a contiguous plane.
+    levels carry, each column a contiguous plane.  The extractor itself does every level
+    in one call (:meth:`FeatureExtractor._context_banks`); this is the one-level entry,
+    for a caller with the means in hand.
     """
     if coords:
-        grid_size = out.shape[1]
-        if grid_size < _CTX1_MIN_GRID:
-            out[:2] = 0.0
-        else:
-            out[0], out[1] = _coord_planes(grid_size)
+        _write_coords(out)
     _banks_extension().context_banks(pooled, out)
     return out
 
@@ -409,17 +452,14 @@ def _banks_extension() -> Any:
 def compute_global_stats(global_raw: FloatArray, orig_h: int, orig_w: int) -> FloatArray:
     """Whole-image block from imfeat, plus the original frame's shape.
 
-    Written into one float32 array: the block's values as they are (non-finite ones
-    zeroed), then the aspect ratio and the log area rounded to float32 once.
+    One float32 array: the block's values as they are (non-finite ones zeroed), then the
+    aspect ratio and the log area, each rounded to float32 once.  The extension writes
+    it in one call; the two scalars are computed here (``np.log1p`` for the area, so the
+    value is NumPy's), as doubles, and rounded as an assignment into the array would be.
     """
-    n = global_raw.shape[0]
-    out = np.empty(n + 2, dtype=np.float32)
-    out[:n] = global_raw
-    finite = np.isfinite(out[:n])
-    if not finite.all():  # NaN and +-inf to zero, as nan_to_num would
-        out[:n][~finite] = 0.0
-    out[n] = orig_w / max(orig_h, 1)
-    out[n + 1] = np.log1p(orig_h * orig_w)
+    aspect = orig_w / max(orig_h, 1)
+    log_area = float(np.log1p(orig_h * orig_w))
+    out: FloatArray = _banks_extension().global_stats(global_raw, aspect, log_area)
     return out
 
 
@@ -558,6 +598,11 @@ class FeatureExtractor:
         # the context banks' buffers, one per level, reused while nothing else holds them
         self._bank_scratch: dict[int, FloatArray] = {}
         self._level_plans: dict[int, tuple[bool, bool, bool, int, int, int]] = {}
+        # the levels with context banks, as (index, size, has ctx, has ctx2), settled once
+        self._bank_levels: list[tuple[int, int, bool, bool]] | None = None
+        self._lum_column = self.space.lum * RAW_PER_CHANNEL + _MEAN_IDX
+        self._map_shapes = [(size, size, FEATURE_CHANNELS) for size in self.levels]
+        self._log_areas: dict[tuple[int, int], float] = {}  # log1p(area) per frame size
 
         self.base_names = self._build_names()
 
@@ -705,25 +750,75 @@ class FeatureExtractor:
         converted = cv2.cvtColor(thumb_bgr, space.convert)
         return np.asarray(converted, dtype=np.uint8)
 
-    def _load_level_maps(self, result: Any, source: str) -> list[FloatArray]:
-        # imfeat's result.maps appends a trailing whole-image "global" entry
-        # beyond the requested levels, hence the slice to n_levels.
-        maps = list(result.maps)[: self.n_levels]
-        if len(maps) != len(self.levels):
-            msg = f"{source} returned {len(maps)} levels, expected {len(self.levels)}"
+    def _load_maps(self, result: Any, source: str) -> tuple[list[FloatArray], FloatArray]:
+        """``result.maps`` as float32 arrays: the level maps, and the whole-image map.
+
+        imfeat's ``result.maps`` appends a trailing whole-image "global" entry (the same
+        raw block, one cell) beyond the requested levels; it is read once here, as the
+        access builds the array objects.
+        """
+        maps = list(result.maps)
+        if len(maps) != self.n_levels + 1:
+            msg = f"{source} returned {len(maps) - 1} levels, expected {len(self.levels)}"
             raise RuntimeError(msg)
-        return [np.asarray(m, dtype=np.float32) for m in maps]
+        levels = [np.asarray(m, dtype=np.float32) for m in maps[:-1]]
+        return levels, np.asarray(maps[-1], dtype=np.float32)
+
+    def _load_level_maps(self, result: Any, source: str) -> list[FloatArray]:
+        """The level maps of ``result`` (see :meth:`_load_maps`)."""
+        return self._load_maps(result, source)[0]
 
     def _lum_cell_mean(self, primary_raw: FloatArray) -> FloatArray:
         """Per-cell mean of the luminance channel of one level's map, from imfeat.
 
-        A contiguous copy of the one column of the map's per-cell feature vector.
+        A contiguous copy of the one column of the map's per-cell feature vector: what
+        the reference banks (:func:`compute_context_values`) take.  The extractor's own
+        banks read the column where it lies (:meth:`_context_banks`).
         """
-        column = primary_raw[..., self.space.lum * RAW_PER_CHANNEL + _MEAN_IDX]
-        return np.ascontiguousarray(column, dtype=np.float32)
+        return np.ascontiguousarray(primary_raw[..., self._lum_column], dtype=np.float32)
+
+    def _context_banks(self, maps: list[FloatArray]) -> dict[int, tuple[FloatArray, ...]]:
+        """The context banks of every level that has them, in one call of the extension.
+
+        ``maps`` are imfeat's primary maps in level order.  Per level with banks, the
+        luminance-mean column of its map is read where it lies and planes 2..6 of the
+        level's buffer (:meth:`_bank_planes`) are written; the result maps the level's
+        size to its ``context`` and ``ctx2`` banks (those it has), each a view of the
+        buffer with every column a contiguous plane.  Same bytes as :func:`context_banks`
+        on a copy of the column, level by level.
+        """
+        levels = self._bank_levels
+        if levels is None:
+            levels = self._bank_levels = [
+                (i, size, plan[0], plan[1])
+                for i, size in enumerate(self.levels)
+                for plan in (self._level_plan(size),)
+                if plan[0] or plan[1]
+            ]
+        if not levels:
+            return {}
+        outs: list[FloatArray] = []
+        banks: dict[int, tuple[FloatArray, ...]] = {}
+        for _i, size, has_ctx, has_ctx2 in levels:
+            planes, fresh = self._bank_planes(size)
+            if fresh:
+                _write_coords(planes)
+            outs.append(planes)
+            views = []
+            if has_ctx:
+                views.append(planes[:_N_CTX].transpose(1, 2, 0))
+            if has_ctx2:
+                views.append(planes[_N_CTX:].transpose(1, 2, 0))
+            banks[size] = tuple(views)
+        _banks_extension().context_banks_all([maps[i] for i, *_ in levels], self._lum_column, outs)
+        return banks
 
     def _compose_level(
-        self, size: int, raw_arrays: list[FloatArray], global_vec: FloatArray
+        self,
+        size: int,
+        raw_arrays: list[FloatArray],
+        global_vec: FloatArray,
+        context: tuple[FloatArray, ...] = (),
     ) -> tuple[LevelBanks, FloatArray]:
         """One level's banks and broadcast vector.
 
@@ -731,27 +826,18 @@ class FeatureExtractor:
         sanitising: they are always finite (every ratio is guarded; the tests pin
         it on degenerate frames).  They are views of imfeat's pooled block, which
         is released when the caller drops them; :class:`FeatureCache` copies.
+        ``context`` is the level's context banks from :meth:`_context_banks`.
         """
-        expected = (size, size, FEATURE_CHANNELS)
-        for arr in raw_arrays:
-            if arr.shape != expected:
-                msg = f"unexpected map shape for level {size}: {arr.shape}"
-                raise RuntimeError(msg)
-        banks: list[FloatArray] = list(raw_arrays)
-        has_ctx, has_ctx2, whole_global, broadcast_total, low, high = self._level_plan(size)
-        if has_ctx or has_ctx2:
-            planes, fresh = self._bank_planes(size)
-            context_banks(self._lum_cell_mean(raw_arrays[0]), planes, coords=fresh)
-            if has_ctx:
-                banks.append(planes[:_N_CTX].transpose(1, 2, 0))
-            if has_ctx2:
-                banks.append(planes[_N_CTX:].transpose(1, 2, 0))
+        banks = (*raw_arrays, *context)
+        _has_ctx, _has_ctx2, whole_global, broadcast_total, low, high = self._level_plan(size)
         if whole_global:  # the global block is the whole broadcast vector: no copy
-            return tuple(banks), global_vec[:broadcast_total]
+            return banks, global_vec[:broadcast_total]
+        if broadcast_total == 0:  # nothing broadcast at this level
+            return banks, _NO_BROADCAST
         bvec = np.zeros(broadcast_total, dtype=np.float32)
         if high > low:
             bvec[low:high] = global_vec[low:high]
-        return tuple(banks), bvec
+        return banks, bvec
 
     def _level_plan(self, size: int) -> tuple[bool, bool, bool, int, int, int]:
         """What :meth:`_compose_level` does at ``size``, settled once per level.
@@ -883,30 +969,55 @@ class FeatureExtractor:
         ``extra_results`` the extra scales' results in spec order.  This is the second
         half of :meth:`extract`; a host with its own imfeat pass calls it directly.
         """
-        maps = self._load_level_maps(result, "imfeat")
+        levels, extra, global_vec = self.raw_maps(result, image_hw, extra_results)
+        context = self._context_banks(levels)
+        level_maps: dict[int, LevelBanks] = {}
+        broadcast_vecs: dict[int, FloatArray] = {}
+        for i, size in enumerate(self.levels):
+            raw_arrays = [levels[i], *(scale[i] for scale in extra)]
+            out, bvec = self._compose_level(size, raw_arrays, global_vec, context.get(size, ()))
+            level_maps[size] = out
+            broadcast_vecs[size] = bvec
+        return level_maps, broadcast_vecs
+
+    def raw_maps(
+        self,
+        result: Any,
+        image_hw: tuple[int, int],
+        extra_results: Sequence[Any] = (),
+    ) -> RawMaps:
+        """Imfeat results -> ``(levels, extra, global_vec)``: the first half of :meth:`compose`.
+
+        ``levels`` are the primary imfeat maps as they are, in level order, ``extra`` the
+        extra scales' maps (per scale, in level order), their shapes checked;
+        ``global_vec`` the broadcast global vector.  What the scorer's raw path takes
+        (:meth:`Detector.score_raw`): it makes the context banks itself.
+        """
+        maps, global_map = self._load_maps(result, "imfeat")
         if len(extra_results) != len(self.extra_scales):
             msg = f"expected {len(self.extra_scales)} extra-scale results, got {len(extra_results)}"
             raise ValueError(msg)
         extra_maps = [self._load_level_maps(r, "extra scale") for r in extra_results]
         for level_maps_of_scale in (maps, *extra_maps):
-            for size, arr in zip(self.levels, level_maps_of_scale, strict=True):
-                want = (size, size, RAW_CHANNELS * RAW_PER_CHANNEL)
-                if tuple(arr.shape) != want:
+            for want, arr in zip(self._map_shapes, level_maps_of_scale, strict=True):
+                if arr.shape != want:
                     msg = f"imfeat map has shape {tuple(arr.shape)}, this model expects {want}"
                     raise ValueError(msg)
         orig_h, orig_w = image_hw
-        # result.maps[-1] is imfeat's whole-image level: the same raw block, one cell.
-        global_vec = compute_global_stats(
-            np.asarray(result.maps[-1], dtype=np.float32).ravel(), orig_h, orig_w
-        )
-        level_maps: dict[int, LevelBanks] = {}
-        broadcast_vecs: dict[int, FloatArray] = {}
-        for i, size in enumerate(self.levels):
-            raw_arrays = [maps[i], *(scale_maps[i] for scale_maps in extra_maps)]
-            out, bvec = self._compose_level(size, raw_arrays, global_vec)
-            level_maps[size] = out
-            broadcast_vecs[size] = bvec
-        return level_maps, broadcast_vecs
+        return maps, extra_maps, self._global_stats(global_map, orig_h, orig_w)
+
+    def _global_stats(self, global_map: FloatArray, orig_h: int, orig_w: int) -> FloatArray:
+        """:func:`compute_global_stats`, the log area kept per frame size.
+
+        The area's logarithm is NumPy's (``np.log1p``); a stream has one frame size, so it
+        is computed once per size rather than paying a ufunc call every frame.
+        """
+        log_area = self._log_areas.get((orig_h, orig_w))
+        if log_area is None:
+            log_area = self._log_areas[orig_h, orig_w] = float(np.log1p(orig_h * orig_w))
+        aspect = orig_w / max(orig_h, 1)
+        out: FloatArray = _banks_extension().global_stats(global_map.ravel(), aspect, log_area)
+        return out
 
     def extract(self, img_bgr: Image) -> tuple[dict[int, LevelBanks], dict[int, FloatArray]]:
         """Image -> ``(level_maps, broadcast_vecs)`` (see module docstring)."""
@@ -1015,36 +1126,69 @@ class FeatureExtractor:
             pos += run.size
         return out
 
-    def map_sources(self, col_keep: NDArray[np.integer] | None = None) -> MapSources:
+    def map_sources(
+        self, col_keep: NDArray[np.integer] | None = None, *, banks_in_scorer: bool = True
+    ) -> MapSources:
         """Where the scorer finds each kept column in the level maps (see :class:`MapSources`).
 
         One slot per bank the kept columns touch, in :meth:`native`'s order, and per kept
         column its slot and its index along the bank's last axis -- the same
         ``(level, bank, column)`` :meth:`native` copies from, so the scorer reads the same
-        values it would be given packed.
+        values it would be given packed.  With ``banks_in_scorer`` (the default) a level's
+        ``context`` and ``ctx2`` banks are one slot the scorer computes itself from the
+        level's primary raw map (which then has a slot even when no raw column is kept);
+        the kept columns of both banks index the planes of that one buffer.
         """
         _width, copies = self._gather_plan(col_keep)
+        n_raw = 1 + len(self.extra_scales)  # the raw banks of a level: one per scale
         slots: list[tuple[int, int]] = []
         slot_side: list[int] = []
         feature_slot: list[NDArray[np.int32]] = []
         feature_index: list[NDArray[np.int32]] = []
+        bank_slot_of: dict[int, int] = {}  # per level with banks in the scorer: its slot
         for copy in copies:
             n_cols = copy.dst1 - copy.dst0
-            slots.append((copy.size, -1 if copy.broadcast else copy.bank))
-            slot_side.append(1 if copy.broadcast else copy.size)
-            feature_slot.append(np.full(n_cols, len(slots) - 1, dtype=np.int32))
             index = (
                 np.arange(copy.src.start, copy.src.stop)
                 if isinstance(copy.src, slice)
                 else np.asarray(copy.src)
             )
+            if banks_in_scorer and not copy.broadcast and copy.bank >= n_raw:
+                # a context bank: the planes of the level's bank slot, ctx2's after ctx's
+                has_ctx = self._level_plan(copy.size)[0]
+                is_ctx2 = copy.bank == n_raw + 1 or not has_ctx
+                if copy.size not in bank_slot_of:
+                    bank_slot_of[copy.size] = len(slots)
+                    slots.append((copy.size, n_raw))
+                    slot_side.append(copy.size)
+                slot = bank_slot_of[copy.size]
+                if is_ctx2:
+                    index = index + _N_CTX
+            else:
+                slots.append((copy.size, -1 if copy.broadcast else copy.bank))
+                slot_side.append(1 if copy.broadcast else copy.size)
+                slot = len(slots) - 1
+            feature_slot.append(np.full(n_cols, slot, dtype=np.int32))
             feature_index.append(index.astype(np.int32))
+        bank_slots: list[tuple[int, int, int]] = []
+        for size, slot in bank_slot_of.items():
+            if (size, 0) not in slots:  # no raw column kept at this level: the map is still needed
+                slots.append((size, 0))
+                slot_side.append(size)
+            bank_slots.append((slot, slots.index((size, 0)), self._lum_column))
+        computed = {slot for slot, _raw, _column in bank_slots}
+        picks = [
+            None if i in computed else (-1, 0) if bank < 0 else (self.levels.index(size), bank)
+            for i, (size, bank) in enumerate(slots)
+        ]
         empty = np.zeros(0, dtype=np.int32)
         return MapSources(
             slots=tuple(slots),
             slot_side=np.asarray(slot_side, dtype=np.int32),
             feature_slot=np.concatenate(feature_slot) if feature_slot else empty,
             feature_index=np.concatenate(feature_index) if feature_index else empty,
+            bank_slots=tuple(bank_slots),
+            picks=tuple(picks),
         )
 
     def _segments(self) -> list[tuple[int, bool, int, int, int]]:

@@ -145,11 +145,16 @@ to 0.35 ms on two threads. Training extraction uses the same setting.
 How the scorer splits a pass, in three phases separated by barriers, with no thread
 reading what another writes inside a phase:
 
-1. **Binning by feature.** The threads take the features round robin and bin whole
-   planes (side-32 and coarse features; side-64 features wait for the exit), reading
-   each feature where the front-end left it -- a column of imfeat's cell-major map, a
-   context plane, an entry of the broadcast vector -- through a base pointer and two
-   strides, so no packed copy of the features is made.
+1. **Binning by feature.** The calling thread first computes the context banks of
+   every level (the same C++ as `context_banks_all`, from the raw maps' luminance-mean
+   column, into buffers the scorer keeps) and bins the features that read them; every
+   thread meanwhile takes the other features from a shared pool, a few at a time, and
+   bins whole planes (side-32 and coarse features; side-64 features wait for the
+   exit), reading each feature where the front-end left it -- a column of imfeat's
+   cell-major map, a bank plane, an entry of the broadcast vector -- through a base
+   pointer and two strides, so no packed copy of the features is made. The banks thus
+   overlap the binning instead of preceding it, and the threads finish together
+   whatever the banks cost.
 2. **Coarse tier by unit.** A unit is one vector of tiles (32 with 256-bit vectors,
    64 with 512-bit); each thread runs the tile-constant trees on its own units,
    applies the coarse tier's exit stage to its packs and writes the probabilities of
@@ -176,9 +181,9 @@ fastdet-demo --model model.fdt --source 0              # webcam 0, live
 Left: the frame with the cell probabilities blended over it (JET colormap, opacity
 following the probability). Right: latency -- for an image the two numbers, for a
 video or webcam a live time series over the last 240 frames of (1) feature
-extraction (resize, colour conversion, imfeat, context banks) and (2) the model
-(binning straight from the maps, coarse tier, fine trees, sigmoid), plus the total and
-the frame rate.
+extraction (resize, colour conversion, imfeat, the handover of its maps) and (2) the
+model (context banks and binning straight from the maps, coarse tier, fine trees,
+sigmoid), plus the total and the frame rate.
 Frames are scored as they arrive; nothing is buffered ahead. The window is
 matplotlib's (`pip install -e ".[tune]"`), so it works with `opencv-python-headless`;
 OpenCV only decodes, resizes and colours. Keys: `q`/`Esc` quit, `space` pause, `s`
@@ -234,11 +239,13 @@ original frame's height and width, which the global feature block records. A mod
 `extra_results`. The map is the same as `predict_proba(frame)`, through the same C++
 scorer, and a detector used only this way never builds its own imfeat computers (they
 are made on the first `predict_proba`), so the host's pool is the only one. Both paths
-hand the scorer the level maps as they are (`Detector.score_maps`): it bins each kept
-column where it lies, in imfeat's cell-major maps, the context banks' planes and the
-broadcast vector, so nothing is packed per frame (`Detector.pack_native` /
+hand the scorer imfeat's maps as they are (`Detector.score_raw`): it computes the
+context banks itself, on the calling thread while its other threads bin, and bins each
+kept column where it lies -- in the cell-major maps, its own bank planes and the
+broadcast vector -- so nothing is composed or packed per frame (`FeatureExtractor.compose`
+remains for training and for `Detector.score_maps` on composed maps; `pack_native` /
 `native_matrix` still build the packed matrix, for the C++ harness's fixtures and for
-callers that want the features as one array; the scores are the same bytes either way).
+callers that want the features as one array; the scores are the same bytes every way).
 `FeatureExtractor.run_imfeat` / `.compose` are the two halves fastdet itself uses, if a
 host wants to share at a different point. framegate does exactly this: a `text.fdt` in
 its `models/` folder (or `GateConfig(models={"text": path})`) replaces its heuristic
@@ -283,7 +290,8 @@ concatenates the features of all levels into one row (1178 columns):
 - `context`, `ctx2` — small- and large-scale surround, ring, and range of
   imfeat's per-cell luminance mean: 3×3, 5×5 and 9×9 box means and 3×3 and 5×5
   max-minus-min over the 64×64 (and coarser) grids of cell means. They are computed by
-  the C++ extension in one call per level, into a `(7, grid, grid)` buffer the extractor
+  the C++ extension in one call for every level (`context_banks_all`: the mean column
+  is read where it lies in each map), into a `(7, grid, grid)` buffer the extractor
   keeps per level (the banks are views of it; a frame whose banks a caller still holds
   gets a fresh one), bit for bit what the OpenCV calls they were first written as give —
   `cv2.boxFilter`'s double sums and single rounding, `cv2.dilate` / `erode`'s max and min

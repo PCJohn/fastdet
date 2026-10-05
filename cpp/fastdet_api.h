@@ -46,8 +46,31 @@ int fastdet_score(void* handle, const float* native, float* out, int use_exit);
 // values.
 int fastdet_score_sources(void* handle, const struct fastdet_source* sources, float* out, int use_exit);
 
-// The context banks of one level (context_banks.cpp).
+// A level's context banks the pass computes itself before binning the features that read
+// them: fastdet_context_banks_from(base, row_stride, col_stride, side, out), run on the calling
+// thread at the start of the pass while the other threads bin the rest.
+struct fastdet_bank_job {
+  const float* base;
+  ptrdiff_t row_stride;
+  ptrdiff_t col_stride;
+  int side;
+  float* out;
+};
+
+// fastdet_score_sources with `n_jobs` bank jobs done first on the calling thread; a feature
+// whose after_jobs[f] is nonzero reads what a job writes and is binned by that thread once
+// the jobs are done (after_jobs may be NULL when n_jobs is 0).  The other features are dealt
+// out to every thread as they come free.  Same bytes as fastdet_score_sources on the sources
+// with the banks already in place.
+int fastdet_score_sources_banks(void* handle, const struct fastdet_source* sources, const struct fastdet_bank_job* jobs,
+                                size_t n_jobs, const uint8_t* after_jobs, float* out, int use_exit);
+
+// The context banks of one level (context_banks.cpp): planes 2..6 of out, 7 planes of g x g
+// floats, from the g x g pooled luminance means -- contiguous, or where they lie in a
+// cell-major map (value (r, c) at base[r * row_stride + c * col_stride], strides in floats).
+// Returns 0, or 1 for a grid it cannot take (g < 1 or g > 64).
 int fastdet_context_banks(const float* pooled, int g, float* out);
+int fastdet_context_banks_from(const float* base, ptrdiff_t row_stride, ptrdiff_t col_stride, int g, float* out);
 
 #ifdef __cplusplus
 }  // extern "C"

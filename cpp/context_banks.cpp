@@ -24,6 +24,7 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "fastdet_api.h"
 #include "hwy/highway.h"
 
 namespace fastdet_banks {
@@ -49,12 +50,14 @@ static int reflect(int p, int len) {
 struct Scratch {
   // the reflected index of every padded position; the padded rows of the source, as doubles;
   // the row sums of every padded row; the running column sums; three g x g maps for the
-  // morphology (a slack vector past each, for the vector loops' last store)
+  // morphology (a slack vector past each, for the vector loops' last store); the pooled
+  // means gathered from a strided source
   int at[kMaxW];
   double pads[kMaxW * kMaxW];
   double rows[kMaxW * kMaxGrid];
   double acc[kMaxGrid + 8];
   float a[kMaxGrid * kMaxGrid + 16], b[kMaxGrid * kMaxGrid + 16], t[kMaxGrid * kMaxGrid + 16];
+  float pooled[kMaxGrid * kMaxGrid];
 };
 
 using DD = hn::ScalableTag<double>;
@@ -246,13 +249,16 @@ static void subtract(const float* HWY_RESTRICT a, const float* HWY_RESTRICT b, s
 
 }  // namespace fastdet_banks
 
-extern "C" {
+namespace fastdet_banks {
 
-// pooled: g x g float32 (g <= 64); out: 7 planes of g x g float32, planes 2..6 written (see
-// above). ctx (planes 2..4) needs g >= 3 and ctx2 (5..6) g >= 5; below that the planes are
-// zero, as the NumPy route leaves them. Returns 0, or 1 for a grid it cannot take.
-int fastdet_context_banks(const float* pooled, int g, float* out) {
-  using namespace fastdet_banks;
+// The scratch of the calling thread: ~150 KB, sized for the largest grid, no allocation per
+// call.
+static Scratch& scratch() {
+  thread_local Scratch sc;
+  return sc;
+}
+
+static int banks(const float* pooled, int g, float* out, Scratch& sc) {
   if (g < 1 || g > kMaxGrid) return 1;
   const size_t n = static_cast<size_t>(g) * g;
   float* surr3 = out + 2 * n;
@@ -264,7 +270,6 @@ int fastdet_context_banks(const float* pooled, int g, float* out) {
     for (size_t i = 0; i < 5 * n; ++i) surr3[i] = 0.0f;
     return 0;
   }
-  thread_local Scratch sc;  // ~130 KB, sized for the largest grid: no allocation per call
   box_filter(pooled, g, 3, sc.a, sc);
   subtract(pooled, sc.a, n, surr3);
   box_filter(pooled, g, 5, sc.b, sc);
@@ -282,5 +287,31 @@ int fastdet_context_banks(const float* pooled, int g, float* out) {
   morph<false>(pooled, g, 5, sc.b, sc.t);
   subtract(sc.a, sc.b, n, range5);
   return 0;
+}
+
+}  // namespace fastdet_banks
+
+extern "C" {
+
+// pooled: g x g float32 (g <= 64); out: 7 planes of g x g float32, planes 2..6 written (see
+// above). ctx (planes 2..4) needs g >= 3 and ctx2 (5..6) g >= 5; below that the planes are
+// zero, as the NumPy route leaves them. Returns 0, or 1 for a grid it cannot take.
+int fastdet_context_banks(const float* pooled, int g, float* out) {
+  using namespace fastdet_banks;
+  return banks(pooled, g, out, scratch());
+}
+
+// The same from the means where they lie: value (r, c) at base[r * row_stride + c * col_stride]
+// (strides in floats) -- one column of imfeat's cell-major map, gathered here, so the caller
+// makes no contiguous copy.  The bytes are those of fastdet_context_banks on that copy.
+int fastdet_context_banks_from(const float* base, ptrdiff_t row_stride, ptrdiff_t col_stride, int g, float* out) {
+  using namespace fastdet_banks;
+  if (g < 1 || g > kMaxGrid) return 1;
+  Scratch& sc = scratch();
+  for (int r = 0; r < g; ++r) {
+    const float* row = base + static_cast<ptrdiff_t>(r) * row_stride;
+    for (int c = 0; c < g; ++c) sc.pooled[static_cast<size_t>(r) * g + c] = row[static_cast<ptrdiff_t>(c) * col_stride];
+  }
+  return banks(sc.pooled, g, out, sc);
 }
 }

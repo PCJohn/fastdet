@@ -520,22 +520,30 @@ const float* feature_values(const fastdet_source& s, uint32_t side, float* tmp) 
   return tmp;
 }
 
-// Bins the used features f0, f0 + fstep, ... into the planes: fine planes tile-major (16 bytes
-// per tile), coarse planes one byte per tile.  Each feature is binned in one run over its native
-// values (gathered into tmp when its source is not contiguous); threads take features round
-// robin, so no two write the same plane.
-void bin_tiles(const ImysModel& m, const TiledModel& tm, const fastdet_source* sources, uint8_t* fine, uint8_t* coarse,
-               size_t f0, size_t fstep, bool skip_side64, float* tmp) {
-  uint8_t binned[kCells + 16];  // one feature's bins, native order (16 readable bytes past every row)
+// What a thread bins with: one feature's bins in native order (16 readable bytes past every
+// row), two doubled rows, and the gather buffer for a strided source (kCells floats).
+struct BinScratch {
+  uint8_t binned[kCells + 16];
   uint8_t rows[2][kGrid];
-  for (size_t f = f0; f < m.n_features; f += fstep) {
-    const uint32_t side = native_side(m, static_cast<uint32_t>(f));
+  float* tmp;
+};
+
+// Bins feature f into the planes: its fine plane tile-major (16 bytes per tile), its coarse
+// plane one byte per tile, in one run over its native values (gathered into the scratch when
+// its source is not contiguous).  Nothing when the feature is unused, or a side-64 feature left
+// to the lazy binner.  Each feature's planes are its own, so any thread may bin any feature.
+void bin_feature(const ImysModel& m, const TiledModel& tm, const fastdet_source* sources, uint32_t f, uint8_t* fine,
+                 uint8_t* coarse, bool skip_side64, BinScratch& bs) {
+  uint8_t* const binned = bs.binned;
+  uint8_t(*const rows)[kGrid] = bs.rows;
+  {
+    const uint32_t side = native_side(m, f);
     const bool to_fine = tm.fine_slot[f] >= 0 && !(skip_side64 && side == kGrid);
     const bool to_coarse = tm.coarse_slot[f] >= 0;
-    if (!to_fine && !to_coarse) continue;  // unused, or left to the lazy binner: never read
+    if (!to_fine && !to_coarse) return;  // unused, or left to the lazy binner: never read
     const uint32_t k = m.n_borders[f];
     const float* cuts = m.borders.data() + m.border_offset[f];
-    const float* xf = feature_values(sources[f], side, tmp);
+    const float* xf = feature_values(sources[f], side, bs.tmp);
     if (to_fine) {
       // Four 64-cell rows hold 16 tiles; tile j is column group j of each row, so a block of
       // four tiles is a 4 x 4 transpose of 32-bit lanes.  A side-32 feature is first doubled
@@ -579,7 +587,7 @@ void bin_tiles(const ImysModel& m, const TiledModel& tm, const fastdet_source* s
         uint8_t one = 0;
         bin_run(xf, 1, cuts, k, &one);
         std::memset(dst, one, kTiles);
-        continue;
+        return;
       }
       uint32_t shift = 0;  // log2(tiles per native value, per side)
       while ((side << shift) < kTileGrid) ++shift;
@@ -591,6 +599,14 @@ void bin_tiles(const ImysModel& m, const TiledModel& tm, const fastdet_source* s
                    dst + static_cast<size_t>(r) * kTileGrid);
     }
   }
+}
+
+// Every feature, on one thread (the harness's timing of the binner).
+void bin_all(const ImysModel& m, const TiledModel& tm, const fastdet_source* sources, uint8_t* fine, uint8_t* coarse,
+             bool skip_side64, float* tmp) {
+  BinScratch bs;
+  bs.tmp = tmp;
+  for (uint32_t f = 0; f < m.n_features; ++f) bin_feature(m, tm, sources, f, fine, coarse, skip_side64, bs);
 }
 
 // One tree's view of a tile pass: everything the inner loop touches, resolved to pointers.
@@ -919,12 +935,19 @@ struct Scratch {
 // What the threads of one pass share: the input, and outputs of which no two threads write the
 // same cache line.
 struct PassShared {
-  const fastdet_source* src = nullptr;  // per feature: where its native values are
-  int64_t* total = nullptr;             // kCells, tile-major: the integer score of every cell
-  float* prob = nullptr;                // kCells, tile-major: its probability, once final
-  uint16_t* alive = nullptr;            // kPacks slots: after phase A, each thread's alive packs at its units' slots
-  uint32_t* n_alive = nullptr;          // per thread
-  uint32_t split_chunk = 0;             // the fine tier's first chunk: where phase B starts
+  const fastdet_source* src = nullptr;     // per feature: where its native values are
+  const fastdet_bank_job* jobs = nullptr;  // the banks the calling thread computes first
+  size_t n_jobs = 0;
+  const uint32_t* after_jobs = nullptr;  // the features that read them, binned by that thread after
+  size_t n_after_jobs = 0;
+  const uint32_t* pool = nullptr;  // every other used feature, dealt out to all threads ...
+  size_t n_pool = 0;
+  std::atomic<size_t> next{0};  // ... from here, in chunks
+  int64_t* total = nullptr;     // kCells, tile-major: the integer score of every cell
+  float* prob = nullptr;        // kCells, tile-major: its probability, once final
+  uint16_t* alive = nullptr;    // kPacks slots: after phase A, each thread's alive packs at its units' slots
+  uint32_t* n_alive = nullptr;  // per thread
+  uint32_t split_chunk = 0;     // the fine tier's first chunk: where phase B starts
   bool lazy = false;
   bool prebinned = false;
   const std::vector<Stage>* stages = nullptr;
@@ -946,9 +969,25 @@ class Pass {
   }
 
   void run(size_t t, size_t n_threads, Pool& pool) {
-    // -- phase A: bin (features round robin), then the coarse tier on this thread's units ------
+    // -- phase A: bin, then the coarse tier on this thread's units -----------------------------
+    // The calling thread computes the bank jobs and bins the features that read them; every
+    // thread then takes the remaining features from the shared pool, a chunk at a time, so the
+    // banks overlap the binning and the threads finish together whatever the banks cost.
     if (!sh_.prebinned) {
-      bin_tiles(m_, tm_, sh_.src, fine_, coarse_, t, n_threads, /*skip_side64=*/sh_.lazy, s_.vals.get());
+      BinScratch bs;
+      bs.tmp = s_.vals.get();
+      if (t == 0) {
+        for (size_t j = 0; j < sh_.n_jobs; ++j) {
+          const fastdet_bank_job& job = sh_.jobs[j];
+          fastdet_context_banks_from(job.base, job.row_stride, job.col_stride, job.side, job.out);
+        }
+        for (size_t i = 0; i < sh_.n_after_jobs; ++i)
+          bin_feature(m_, tm_, sh_.src, sh_.after_jobs[i], fine_, coarse_, /*skip_side64=*/sh_.lazy, bs);
+      }
+      constexpr size_t kChunk = 8;
+      for (size_t i = sh_.next.fetch_add(kChunk); i < sh_.n_pool; i = sh_.next.fetch_add(kChunk))
+        for (size_t k = i; k < std::min(i + kChunk, sh_.n_pool); ++k)
+          bin_feature(m_, tm_, sh_.src, sh_.pool[k], fine_, coarse_, /*skip_side64=*/sh_.lazy, bs);
       pool.barrier();
     }
     const size_t lo = t * kUnits / n_threads * kUnit, hi = (t + 1) * kUnits / n_threads * kUnit;
@@ -1140,7 +1179,8 @@ struct FastdetHandle {
   ImysModel model;
   TiledModel tiled;
   std::vector<size_t> offset;
-  std::vector<fastdet_source> packed;  // the sources of the packed fixture being scored
+  std::vector<fastdet_source> packed;                   // the sources of the packed fixture being scored
+  std::vector<uint32_t> pool_features, after_features;  // the pass's feature lists (see Pass::run)
   hwy::AlignedFreeUniquePtr<uint8_t[]> fine, coarse;
   hwy::AlignedFreeUniquePtr<int64_t[]> total;
   hwy::AlignedFreeUniquePtr<float[]> prob;
@@ -1178,19 +1218,36 @@ struct FastdetHandle {
   void score(const float* xn, float* out, const ScoreOptions& opt) {
     const std::lock_guard<std::mutex> lk(busy);
     fill_packed(xn);
-    score_sources(packed.data(), out, opt);
+    score_sources(packed.data(), out, opt, nullptr, 0, nullptr);
   }
 
-  // Scores one image read through src (one source per feature) into out.
-  void score(const fastdet_source* src, float* out, const ScoreOptions& opt) {
+  // Scores one image read through src (one source per feature) into out, the bank jobs (if
+  // any) computed first on the calling thread (see fastdet_score_sources_banks).
+  void score(const fastdet_source* src, float* out, const ScoreOptions& opt, const fastdet_bank_job* jobs = nullptr,
+             size_t n_jobs = 0, const uint8_t* after_jobs = nullptr) {
     const std::lock_guard<std::mutex> lk(busy);
-    score_sources(src, out, opt);
+    score_sources(src, out, opt, jobs, n_jobs, after_jobs);
   }
 
  private:
-  void score_sources(const fastdet_source* src, float* out, const ScoreOptions& opt) {
+  void score_sources(const fastdet_source* src, float* out, const ScoreOptions& opt, const fastdet_bank_job* jobs,
+                     size_t n_jobs, const uint8_t* after_jobs) {
     PassShared sh;
     sh.src = src;
+    sh.jobs = jobs;
+    sh.n_jobs = n_jobs;
+    // the used features: those a bank job writes go to the calling thread after its jobs, the
+    // rest to the shared pool, in index order (a level's features together)
+    pool_features.clear();
+    after_features.clear();
+    for (uint32_t f = 0; f < model.n_features; ++f) {
+      if (tiled.fine_slot[f] < 0 && tiled.coarse_slot[f] < 0) continue;
+      (n_jobs && after_jobs && after_jobs[f] ? after_features : pool_features).push_back(f);
+    }
+    sh.after_jobs = after_features.data();
+    sh.n_after_jobs = after_features.size();
+    sh.pool = pool_features.data();
+    sh.n_pool = pool_features.size();
     sh.total = total.get();
     sh.prob = prob.get();
     sh.alive = alive.data();
@@ -1315,6 +1372,15 @@ extern "C" int fastdet_score(void* handle, const float* native, float* out, int 
 extern "C" int fastdet_score_sources(void* handle, const fastdet_source* sources, float* out, int use_exit) {
   auto* h = static_cast<FastdetHandle*>(handle);
   h->score(sources, out, shipped_options(*h, use_exit));
+  return 0;
+}
+
+extern "C" int fastdet_score_sources_banks(void* handle, const fastdet_source* sources, const fastdet_bank_job* jobs,
+                                           size_t n_jobs, const uint8_t* after_jobs, float* out, int use_exit) {
+  auto* h = static_cast<FastdetHandle*>(handle);
+  for (size_t j = 0; j < n_jobs; ++j)
+    if (jobs[j].side < 1 || jobs[j].side > static_cast<int>(kGrid)) return 1;
+  h->score(sources, out, shipped_options(*h, use_exit), jobs, n_jobs, after_jobs);
   return 0;
 }
 
@@ -1515,13 +1581,10 @@ int main(int argc, char** argv) {
   std::vector<float> tmp(kCells);
   single.fill_packed(xn.data());
   const double ms_bin = time_it(
-      [&] {
-        bin_tiles(model, tiled, single.packed.data(), single.fine.get(), single.coarse.get(), 0, 1, false, tmp.data());
-      },
+      [&] { bin_all(model, tiled, single.packed.data(), single.fine.get(), single.coarse.get(), false, tmp.data()); },
       iters);
   const double ms_bin_maps = time_it(
-      [&] { bin_tiles(model, tiled, sources.data(), single.fine.get(), single.coarse.get(), 0, 1, false, tmp.data()); },
-      iters);
+      [&] { bin_all(model, tiled, sources.data(), single.fine.get(), single.coarse.get(), false, tmp.data()); }, iters);
   const double ms_scalar =
       time_it([&] { score_cells_scalar(model, full_bins.data(), kCells, scalar_out.data()); }, iters);
   const double ms_full = time_it([&] { single.score(xn.data(), simd_out.data(), plain); }, iters);
