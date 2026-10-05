@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import math
 import os
+import sys
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -70,6 +71,8 @@ __all__ = [
     "THUMB",
     "FeatureCache",
     "FeatureExtractor",
+    "MapSources",
+    "context_banks",
     "exponent_for_size",
     "feature_level_bits",
     "parse_extra_scales",
@@ -182,6 +185,34 @@ LevelBanks = tuple["FloatArray", ...]
 
 
 @dataclass(frozen=True)
+class MapSources:
+    """Where the scorer reads each kept column, straight from the level maps.
+
+    The scorer's map-reading path (``Scorer.score_maps``) takes one array per *slot*: a
+    level's bank -- imfeat's ``(side, side, n)`` map or a context bank, any strides -- or
+    the finest level's broadcast vector.  Column ``f`` of the model is index
+    ``feature_index[f]`` along the last axis of the array in slot ``feature_slot[f]``; a
+    slot's ``slot_side`` is its grid side (1 for the broadcast vector).  Built once per
+    kept-column set by :meth:`FeatureExtractor.map_sources`; :meth:`arrays` picks a frame's
+    arrays in slot order.
+    """
+
+    slots: tuple[tuple[int, int], ...]  # per slot: (level size, bank index; -1 = broadcast)
+    slot_side: NDArray[np.int32]
+    feature_slot: NDArray[np.int32]
+    feature_index: NDArray[np.int32]
+
+    def arrays(
+        self, level_maps: dict[int, LevelBanks], broadcast_vecs: dict[int, FloatArray]
+    ) -> list[FloatArray]:
+        """The frame's arrays in slot order: what ``score_maps`` is given."""
+        return [
+            broadcast_vecs[size] if bank < 0 else level_maps[size][bank]
+            for size, bank in self.slots
+        ]
+
+
+@dataclass(frozen=True)
 class _Copy:
     """One contiguous run of output columns, copied from one bank of one level.
 
@@ -285,9 +316,8 @@ def compute_context_values(pooled: FloatArray, grid_size: int) -> FloatArray:
     ``ctx_x``/``ctx_y`` are normalized cell coordinates in [-0.5, 0.5];
     ``ctx_surr3`` is a Laplacian (cell minus 3x3 mean), ``ctx_ring35`` the
     difference between the 5x5 and 3x3 means and ``ctx_range3`` the 3x3
-    max-minus-min.  Written straight into one ``(grid, grid, 5)`` block: these
-    arrays are tiny, so the cost is per-call overhead, and every avoided
-    intermediate is a measurable share of the front-end.
+    max-minus-min.  This is the reference, in OpenCV calls; the extractor computes
+    the same bytes in one C++ call per level (:func:`context_banks`).
     """
     channels = len(CONTEXT_FEATURE_NAMES)
     out = np.empty((grid_size, grid_size, channels), dtype=np.float32)
@@ -309,7 +339,8 @@ def compute_context2_values(pooled: FloatArray, grid_size: int) -> FloatArray:
     """Large-scale context from imfeat's per-cell luminance mean: ``(grid, grid, 2)``.
 
     ``ctx_surr9`` is the cell mean minus the 9x9 mean, ``ctx_range5`` the 5x5
-    max-minus-min; together they cover wider surroundings than ``context``.
+    max-minus-min; together they cover wider surroundings than ``context``.  The
+    reference, as :func:`compute_context_values`.
     """
     channels = len(CONTEXT2_FEATURE_NAMES)
     out = np.empty((grid_size, grid_size, channels), dtype=np.float32)
@@ -322,12 +353,74 @@ def compute_context2_values(pooled: FloatArray, grid_size: int) -> FloatArray:
     return out
 
 
+N_BANK_PLANES = len(CONTEXT_FEATURE_NAMES) + len(CONTEXT2_FEATURE_NAMES)  # 7
+_N_CTX = len(CONTEXT_FEATURE_NAMES)
+
+
+def _refs_when_idle() -> int:
+    """What ``sys.getrefcount`` reports for a bank buffer nobody but its owner holds.
+
+    Measured the way :meth:`FeatureExtractor._bank_planes` asks -- the owner's dict entry,
+    a local, and the call's own argument -- so the guard does not depend on how many of
+    those a given interpreter counts.
+    """
+    scratch = {0: np.zeros(1, dtype=np.float32)}
+    buf = scratch.get(0)
+    return sys.getrefcount(buf)
+
+
+_IDLE_REFS = _refs_when_idle()
+
+
+def context_banks(pooled: FloatArray, out: FloatArray, *, coords: bool = True) -> FloatArray:
+    """Both context banks of one level into ``out``, a ``(7, grid, grid)`` float32 array.
+
+    Planes 0 and 1 are the cell coordinates, constants written when ``coords`` is set
+    (a caller reusing ``out`` across frames writes them once and passes ``False`` after);
+    planes 2..6 are computed by the C++ extension in one call, bit for bit what
+    :func:`compute_context_values` and :func:`compute_context2_values` give through their
+    7 OpenCV calls (the tests pin it).  ``out[:5].transpose(1, 2, 0)`` and
+    ``out[5:].transpose(1, 2, 0)`` are the two banks in the ``(grid, grid, n)`` shape the
+    levels carry, each column a contiguous plane.
+    """
+    if coords:
+        grid_size = out.shape[1]
+        if grid_size < _CTX1_MIN_GRID:
+            out[:2] = 0.0
+        else:
+            out[0], out[1] = _coord_planes(grid_size)
+    _banks_extension().context_banks(pooled, out)
+    return out
+
+
+_BANKS_EXTENSION: Any = None
+
+
+def _banks_extension() -> Any:
+    """The C++ extension, resolved once (``native`` imports this module, hence lazily)."""
+    global _BANKS_EXTENSION  # noqa: PLW0603 -- a module-level cache
+    if _BANKS_EXTENSION is None:
+        from .native import _extension  # noqa: PLC0415 -- see above
+
+        _BANKS_EXTENSION = _extension()
+    return _BANKS_EXTENSION
+
+
 def compute_global_stats(global_raw: FloatArray, orig_h: int, orig_w: int) -> FloatArray:
-    """Whole-image block from imfeat, plus the original frame's shape."""
-    shape_stats = (float(orig_w / max(orig_h, 1)), float(np.log1p(orig_h * orig_w)))
-    return np.concatenate(
-        [np.nan_to_num(global_raw, nan=0.0, posinf=0.0, neginf=0.0), np.asarray(shape_stats)]
-    ).astype(np.float32)
+    """Whole-image block from imfeat, plus the original frame's shape.
+
+    Written into one float32 array: the block's values as they are (non-finite ones
+    zeroed), then the aspect ratio and the log area rounded to float32 once.
+    """
+    n = global_raw.shape[0]
+    out = np.empty(n + 2, dtype=np.float32)
+    out[:n] = global_raw
+    finite = np.isfinite(out[:n])
+    if not finite.all():  # NaN and +-inf to zero, as nan_to_num would
+        out[:n][~finite] = 0.0
+    out[n] = orig_w / max(orig_h, 1)
+    out[n + 1] = np.log1p(orig_h * orig_w)
+    return out
 
 
 def default_threads() -> int:
@@ -462,6 +555,9 @@ class FeatureExtractor:
         self._computers: dict[tuple[int, int], Any] = {}
         self._extra: list[tuple[Any, int, str]] | None = None
         self._fused: tuple[tuple[int, ...], Any] | None = None  # (frame shape, computer)
+        # the context banks' buffers, one per level, reused while nothing else holds them
+        self._bank_scratch: dict[int, FloatArray] = {}
+        self._level_plans: dict[int, tuple[bool, bool, bool, int, int, int]] = {}
 
         self.base_names = self._build_names()
 
@@ -618,10 +714,13 @@ class FeatureExtractor:
             raise RuntimeError(msg)
         return [np.asarray(m, dtype=np.float32) for m in maps]
 
-    def _lum_cell_mean(self, primary_raw: FloatArray, size: int) -> FloatArray:
-        """Per-cell mean of the luminance channel at level ``size``, from imfeat."""
-        full = primary_raw.reshape(size, size, RAW_CHANNELS, RAW_PER_CHANNEL)
-        return np.ascontiguousarray(full[:, :, self.space.lum, _MEAN_IDX], dtype=np.float32)
+    def _lum_cell_mean(self, primary_raw: FloatArray) -> FloatArray:
+        """Per-cell mean of the luminance channel of one level's map, from imfeat.
+
+        A contiguous copy of the one column of the map's per-cell feature vector.
+        """
+        column = primary_raw[..., self.space.lum * RAW_PER_CHANNEL + _MEAN_IDX]
+        return np.ascontiguousarray(column, dtype=np.float32)
 
     def _compose_level(
         self, size: int, raw_arrays: list[FloatArray], global_vec: FloatArray
@@ -639,20 +738,62 @@ class FeatureExtractor:
                 msg = f"unexpected map shape for level {size}: {arr.shape}"
                 raise RuntimeError(msg)
         banks: list[FloatArray] = list(raw_arrays)
-        pooled = self._lum_cell_mean(raw_arrays[0], size)
-        ranges = self.block_ranges[size]
-        if ranges.get("context", (0, 0))[1] > ranges.get("context", (0, 0))[0]:
-            banks.append(compute_context_values(pooled, size))
-        if ranges.get("ctx2", (0, 0))[1] > ranges.get("ctx2", (0, 0))[0]:
-            banks.append(compute_context2_values(pooled, size))
-
-        broadcast_ranges = self.broadcast_ranges[size]
-        broadcast_total = max((high for (_, high) in broadcast_ranges.values()), default=0)
+        has_ctx, has_ctx2, whole_global, broadcast_total, low, high = self._level_plan(size)
+        if has_ctx or has_ctx2:
+            planes, fresh = self._bank_planes(size)
+            context_banks(self._lum_cell_mean(raw_arrays[0]), planes, coords=fresh)
+            if has_ctx:
+                banks.append(planes[:_N_CTX].transpose(1, 2, 0))
+            if has_ctx2:
+                banks.append(planes[_N_CTX:].transpose(1, 2, 0))
+        if whole_global:  # the global block is the whole broadcast vector: no copy
+            return tuple(banks), global_vec[:broadcast_total]
         bvec = np.zeros(broadcast_total, dtype=np.float32)
-        low, high = broadcast_ranges.get("global", (0, 0))
         if high > low:
             bvec[low:high] = global_vec[low:high]
         return tuple(banks), bvec
+
+    def _level_plan(self, size: int) -> tuple[bool, bool, bool, int, int, int]:
+        """What :meth:`_compose_level` does at ``size``, settled once per level.
+
+        Whether the level has the ``context`` and ``ctx2`` banks, whether its broadcast
+        vector is the global block whole, and that vector's width and the block's range.
+        """
+        plan = self._level_plans.get(size)
+        if plan is None:
+            ranges = self.block_ranges[size]
+            ctx = ranges.get("context", (0, 0))
+            ctx2 = ranges.get("ctx2", (0, 0))
+            broadcast_ranges = self.broadcast_ranges[size]
+            total = max((hi for (_, hi) in broadcast_ranges.values()), default=0)
+            low, high = broadcast_ranges.get("global", (0, 0))
+            plan = (
+                ctx[1] > ctx[0],
+                ctx2[1] > ctx2[0],
+                low == 0 and high == total,
+                total,
+                low,
+                high,
+            )
+            self._level_plans[size] = plan
+        return plan
+
+    def _bank_planes(self, size: int) -> tuple[FloatArray, bool]:
+        """The ``(7, size, size)`` buffer the level's context banks are written into.
+
+        Kept per level and reused frame after frame -- unless something still holds the
+        last frame's banks (they are views of it, and a view holds a reference), in which
+        case a fresh one is made, so results a caller keeps are never overwritten.  The
+        reference count of a buffer nobody else holds was measured at import, by the same
+        statements (``_IDLE_REFS``).  The flag says the buffer is new (its constant planes
+        are not written yet).
+        """
+        buf = self._bank_scratch.get(size)
+        if buf is None or sys.getrefcount(buf) > _IDLE_REFS:
+            buf = np.zeros((N_BANK_PLANES, size, size), dtype=np.float32)
+            self._bank_scratch[size] = buf
+            return buf, True
+        return buf, False
 
     def close(self) -> None:
         """Drop the imfeat computers (their worker threads are joined by the destructor).
@@ -662,6 +803,7 @@ class FeatureExtractor:
         self._computers = {}
         self._extra = None
         self._fused = None
+        self._bank_scratch = {}
 
     @property
     def front_end_spec(self) -> dict[str, Any]:
@@ -853,7 +995,16 @@ class FeatureExtractor:
                 run[:] = broadcast_vecs[copy.size][copy.src]
             else:
                 whole = level_maps[copy.size][copy.bank]
-                if isinstance(copy.src, slice) and copy.src == slice(0, whole.shape[-1]):
+                planes = whole.transpose(2, 0, 1)  # (n, side, side): the bank column-major
+                if planes.flags.c_contiguous:
+                    # each column already a contiguous plane (the context banks): a straight
+                    # copy of the kept planes, no transpose and no temporary
+                    dst = run.reshape(n_cols, side, side)
+                    if isinstance(copy.src, slice):
+                        dst[...] = planes[copy.src]
+                    else:
+                        np.take(planes, copy.src, axis=0, out=dst)
+                elif isinstance(copy.src, slice) and copy.src == slice(0, whole.shape[-1]):
                     # the whole bank: one 2-D transpose in OpenCV (blocked; ~1.5x NumPy's)
                     cv2.transpose(
                         whole.reshape(-1, whole.shape[-1]), run.reshape(n_cols, side * side)
@@ -863,6 +1014,38 @@ class FeatureExtractor:
                     run.reshape(n_cols, side, side)[...] = bank.transpose(2, 0, 1)
             pos += run.size
         return out
+
+    def map_sources(self, col_keep: NDArray[np.integer] | None = None) -> MapSources:
+        """Where the scorer finds each kept column in the level maps (see :class:`MapSources`).
+
+        One slot per bank the kept columns touch, in :meth:`native`'s order, and per kept
+        column its slot and its index along the bank's last axis -- the same
+        ``(level, bank, column)`` :meth:`native` copies from, so the scorer reads the same
+        values it would be given packed.
+        """
+        _width, copies = self._gather_plan(col_keep)
+        slots: list[tuple[int, int]] = []
+        slot_side: list[int] = []
+        feature_slot: list[NDArray[np.int32]] = []
+        feature_index: list[NDArray[np.int32]] = []
+        for copy in copies:
+            n_cols = copy.dst1 - copy.dst0
+            slots.append((copy.size, -1 if copy.broadcast else copy.bank))
+            slot_side.append(1 if copy.broadcast else copy.size)
+            feature_slot.append(np.full(n_cols, len(slots) - 1, dtype=np.int32))
+            index = (
+                np.arange(copy.src.start, copy.src.stop)
+                if isinstance(copy.src, slice)
+                else np.asarray(copy.src)
+            )
+            feature_index.append(index.astype(np.int32))
+        empty = np.zeros(0, dtype=np.int32)
+        return MapSources(
+            slots=tuple(slots),
+            slot_side=np.asarray(slot_side, dtype=np.int32),
+            feature_slot=np.concatenate(feature_slot) if feature_slot else empty,
+            feature_index=np.concatenate(feature_index) if feature_index else empty,
+        )
 
     def _segments(self) -> list[tuple[int, bool, int, int, int]]:
         """Canonical column layout: ``(size, broadcast, bank, base, width)`` runs.

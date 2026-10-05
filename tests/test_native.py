@@ -134,14 +134,15 @@ def test_native_scorer_latency(tiny_dataset: tuple[Path, Path], tiny_model: Path
     reps = 10
     t0 = time.perf_counter()
     for _ in range(reps):
-        native = det.native_matrix(image)
+        level_maps, broadcast = det.extractor.extract(image)
     t1 = time.perf_counter()
     for _ in range(reps):
-        det.native.score(native)
+        det.score_maps(level_maps, broadcast)
     t2 = time.perf_counter()
     print(
         f"\n[fastdet-lat] IN-PROCESS ({det.native.target}, {det.native.threads} thread(s)):"
         f" front-end {1e3 * (t1 - t0) / reps:.3f} ms"
-        f" + C++ model {1e3 * (t2 - t1) / reps:.3f} ms per image (tiny test model: {det.runtime.n_trees} trees)"
+        f" + C++ model on the maps {1e3 * (t2 - t1) / reps:.3f} ms per image"
+        f" (tiny test model: {det.runtime.n_trees} trees)"
     )
     det.close()

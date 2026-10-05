@@ -7,7 +7,7 @@ same as a fresh array's, so every score is unchanged.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import cv2
 import numpy as np
@@ -25,6 +25,7 @@ def test_native_into_a_buffer_is_the_same_bytes(
 ) -> None:
     images_dir, _masks_dir = tiny_dataset
     det = Detector.load(tiny_model)
+    assert det.native is not None
     ex = det.extractor
     frame = np.asarray(cv2.imread(str(min(images_dir.glob("*.png")))), dtype=np.uint8)
     level_maps, broadcast = ex.extract(frame)
@@ -34,12 +35,13 @@ def test_native_into_a_buffer_is_the_same_bytes(
     out = ex.native(level_maps, broadcast, det.col_keep, out=buf)
     assert out is buf
     np.testing.assert_array_equal(out, fresh)
-    for bad in (
+    bad_buffers: list[Any] = [  # the wrong size, dtype, rank and stride, each refused
         np.empty(fresh.shape[0] + 1, np.float32),
         np.empty(fresh.shape[0], np.float64),
         np.empty((fresh.shape[0], 1), np.float32),
         np.empty(2 * fresh.shape[0], np.float32)[::2],
-    ):
+    ]
+    for bad in bad_buffers:
         with pytest.raises(ValueError, match="out must be"):
             ex.native(level_maps, broadcast, det.col_keep, out=bad)
     # the detector's own buffer: one array, written in place, the same scores as a fresh one

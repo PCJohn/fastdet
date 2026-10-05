@@ -21,7 +21,10 @@
 // order: feature f is constant on blocks of a side x side grid (side = 64 >>
 // level_shift[f] / 2; 1 for image-wide features) and stores side * side
 // row-major float32 values.  This is Detector.native_matrix(image); no dense
-// 4096 x n_features table is ever built on this path.
+// 4096 x n_features table is ever built on this path.  In process the features
+// need not be packed at all: a pass reads each feature through a fastdet_source
+// (fastdet_api.h), a base pointer and two strides, so a host's cell-major maps
+// are binned where they lie (the gate below scores the fixture both ways).
 //
 // There are exactly two scoring paths:
 //   * score_cells_scalar -- straightforward reference, one cell at a time, on the
@@ -54,6 +57,7 @@
 #include <thread>
 #include <vector>
 
+#include "fastdet_api.h"
 #include "hwy/aligned_allocator.h"
 #include "hwy/highway.h"
 // after highway.h: the vector exp for the logistic function
@@ -502,19 +506,37 @@ constexpr uint8_t kExpand[4][16] = {{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 1
                                     {0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3},
                                     {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1}};
 
+// A feature's side x side values, contiguous and row-major: the source itself when it lies
+// that way (a packed fixture, a context plane), else gathered into tmp (side * side floats).
+// A cell-major map puts one cell's features side by side, so the gather reads one float per
+// cache line; the lazy binner below skips it for the side-64 features, which are read per tile.
+const float* feature_values(const fastdet_source& s, uint32_t side, float* tmp) {
+  if (side == 1 || (s.col_stride == 1 && s.row_stride == static_cast<ptrdiff_t>(side))) return s.base;
+  for (uint32_t r = 0; r < side; ++r) {
+    const float* row = s.base + static_cast<ptrdiff_t>(r) * s.row_stride;
+    float* out = tmp + static_cast<size_t>(r) * side;
+    for (uint32_t c = 0; c < side; ++c) out[c] = row[static_cast<ptrdiff_t>(c) * s.col_stride];
+  }
+  return tmp;
+}
+
 // Bins the used features f0, f0 + fstep, ... into the planes: fine planes tile-major (16 bytes
 // per tile), coarse planes one byte per tile.  Each feature is binned in one run over its native
-// values; threads take features round robin, so no two write the same plane.
-void bin_tiles(const ImysModel& m, const TiledModel& tm, const float* xn, const std::vector<size_t>& offset,
-               uint8_t* fine, uint8_t* coarse, size_t f0, size_t fstep, bool skip_side64) {
+// values (gathered into tmp when its source is not contiguous); threads take features round
+// robin, so no two write the same plane.
+void bin_tiles(const ImysModel& m, const TiledModel& tm, const fastdet_source* sources, uint8_t* fine, uint8_t* coarse,
+               size_t f0, size_t fstep, bool skip_side64, float* tmp) {
   uint8_t binned[kCells + 16];  // one feature's bins, native order (16 readable bytes past every row)
   uint8_t rows[2][kGrid];
   for (size_t f = f0; f < m.n_features; f += fstep) {
+    const uint32_t side = native_side(m, static_cast<uint32_t>(f));
+    const bool to_fine = tm.fine_slot[f] >= 0 && !(skip_side64 && side == kGrid);
+    const bool to_coarse = tm.coarse_slot[f] >= 0;
+    if (!to_fine && !to_coarse) continue;  // unused, or left to the lazy binner: never read
     const uint32_t k = m.n_borders[f];
     const float* cuts = m.borders.data() + m.border_offset[f];
-    const float* xf = xn + offset[f];
-    const uint32_t side = native_side(m, static_cast<uint32_t>(f));
-    if (tm.fine_slot[f] >= 0 && !(skip_side64 && side == kGrid)) {
+    const float* xf = feature_values(sources[f], side, tmp);
+    if (to_fine) {
       // Four 64-cell rows hold 16 tiles; tile j is column group j of each row, so a block of
       // four tiles is a 4 x 4 transpose of 32-bit lanes.  A side-32 feature is first doubled
       // along the row, and each of its rows serves two cell rows.
@@ -551,7 +573,7 @@ void bin_tiles(const ImysModel& m, const TiledModel& tm, const float* xn, const 
         }
       }
     }
-    if (tm.coarse_slot[f] >= 0) {
+    if (to_coarse) {
       uint8_t* dst = coarse + static_cast<size_t>(tm.coarse_slot[f]) * kTiles;
       if (side == 1) {
         uint8_t one = 0;
@@ -737,22 +759,31 @@ void run_tree(const TiledTree& tr, const uint16_t* active, size_t n_active, uint
   }
 }
 
-// Lazy binning: the side-64 features for the packs still alive, straight from the native fixture.
+// Lazy binning: the side-64 features for the packs still alive, straight from their sources.
 // Per feature, the packs' values are gathered tile-major into one buffer (4 rows x 4 floats per
-// tile), binned in one run, and the bins land in the packs' slots of the plane.
+// tile), binned in one run, and the bins land in the packs' slots of the plane.  From a
+// cell-major map a tile's 16 cells are four runs of four records, which stay in L1 from one
+// feature to the next: the map is read once, and only where the coarse tier left work.
 constexpr size_t kPackCells = kPack * kTileCells;
 
-void bin_side64_lazy(const ImysModel& m, const TiledModel& tm, const float* xn, const std::vector<size_t>& offset,
-                     const uint16_t* active, size_t n_active, uint8_t* fine, float* vals, uint8_t* bins) {
+void bin_side64_lazy(const ImysModel& m, const TiledModel& tm, const fastdet_source* sources, const uint16_t* active,
+                     size_t n_active, uint8_t* fine, float* vals, uint8_t* bins) {
   for (uint32_t f = 0; f < m.n_features; ++f) {
     if (tm.fine_slot[f] < 0 || native_side(m, f) != kGrid) continue;
-    const float* xf = xn + offset[f];
+    const fastdet_source& s = sources[f];
     for (size_t i = 0; i < n_active; ++i) {
       const size_t tile = active[i], tr = tile / kTileGrid, tc = tile % kTileGrid;
       for (size_t p = 0; p < kPack; ++p)
-        for (size_t r = 0; r < kTile; ++r)
-          std::memcpy(vals + i * kPackCells + p * kTileCells + r * kTile,
-                      xf + (kTile * tr + r) * kGrid + kTile * (tc + p), kTile * sizeof(float));
+        for (size_t r = 0; r < kTile; ++r) {
+          float* out = vals + i * kPackCells + p * kTileCells + r * kTile;
+          const float* row = s.base + static_cast<ptrdiff_t>(kTile * tr + r) * s.row_stride +
+                             static_cast<ptrdiff_t>(kTile * (tc + p)) * s.col_stride;
+          if (s.col_stride == 1) {
+            std::memcpy(out, row, kTile * sizeof(float));
+          } else {
+            for (size_t c = 0; c < kTile; ++c) out[c] = row[static_cast<ptrdiff_t>(c) * s.col_stride];
+          }
+        }
     }
     bin_run(vals, static_cast<uint32_t>(n_active * kPackCells), m.borders.data() + m.border_offset[f], m.n_borders[f],
             bins);
@@ -888,12 +919,12 @@ struct Scratch {
 // What the threads of one pass share: the input, and outputs of which no two threads write the
 // same cache line.
 struct PassShared {
-  const float* xn = nullptr;
-  int64_t* total = nullptr;     // kCells, tile-major: the integer score of every cell
-  float* prob = nullptr;        // kCells, tile-major: its probability, once final
-  uint16_t* alive = nullptr;    // kPacks slots: after phase A, each thread's alive packs at its units' slots
-  uint32_t* n_alive = nullptr;  // per thread
-  uint32_t split_chunk = 0;     // the fine tier's first chunk: where phase B starts
+  const fastdet_source* src = nullptr;  // per feature: where its native values are
+  int64_t* total = nullptr;             // kCells, tile-major: the integer score of every cell
+  float* prob = nullptr;                // kCells, tile-major: its probability, once final
+  uint16_t* alive = nullptr;            // kPacks slots: after phase A, each thread's alive packs at its units' slots
+  uint32_t* n_alive = nullptr;          // per thread
+  uint32_t split_chunk = 0;             // the fine tier's first chunk: where phase B starts
   bool lazy = false;
   bool prebinned = false;
   const std::vector<Stage>* stages = nullptr;
@@ -907,9 +938,8 @@ struct PassShared {
 template <uint32_t NP>
 class Pass {
  public:
-  Pass(const ImysModel& m, const TiledModel& tm, const std::vector<size_t>& offset, uint8_t* fine, uint8_t* coarse,
-       PassShared& sh, Scratch& s)
-      : m_(m), tm_(tm), offset_(offset), fine_(fine), coarse_(coarse), sh_(sh), s_(s), active_(s.active) {
+  Pass(const ImysModel& m, const TiledModel& tm, uint8_t* fine, uint8_t* coarse, PassShared& sh, Scratch& s)
+      : m_(m), tm_(tm), fine_(fine), coarse_(coarse), sh_(sh), s_(s), active_(s.active) {
     acc_shift_ = m.n_chunks ? m.shifts[0] : 0;
     std::fill(s.acc32.get(), s.acc32.get() + kCells, 0);
     std::fill(s.tacc.get(), s.tacc.get() + kTiles, 0);
@@ -918,7 +948,7 @@ class Pass {
   void run(size_t t, size_t n_threads, Pool& pool) {
     // -- phase A: bin (features round robin), then the coarse tier on this thread's units ------
     if (!sh_.prebinned) {
-      bin_tiles(m_, tm_, sh_.xn, offset_, fine_, coarse_, t, n_threads, /*skip_side64=*/sh_.lazy);
+      bin_tiles(m_, tm_, sh_.src, fine_, coarse_, t, n_threads, /*skip_side64=*/sh_.lazy, s_.vals.get());
       pool.barrier();
     }
     const size_t lo = t * kUnits / n_threads * kUnit, hi = (t + 1) * kUnits / n_threads * kUnit;
@@ -933,7 +963,7 @@ class Pass {
     // -- phase B: a balanced block of the packs alive after the coarse tier --------------------
     take_share(t, n_threads);
     if (sh_.lazy && !sh_.prebinned && !active_.empty())
-      bin_side64_lazy(m_, tm_, sh_.xn, offset_, active_.data(), active_.size(), fine_, s_.vals.get(), s_.bins.get());
+      bin_side64_lazy(m_, tm_, sh_.src, active_.data(), active_.size(), fine_, s_.vals.get(), s_.bins.get());
     run_chunks(sh_.split_chunk, m_.n_chunks);
     fold();
     for (const uint16_t first : active_) finish_pack(first);
@@ -1094,7 +1124,6 @@ class Pass {
 
   const ImysModel& m_;
   const TiledModel& tm_;
-  const std::vector<size_t>& offset_;
   uint8_t* const fine_;
   uint8_t* const coarse_;
   PassShared& sh_;
@@ -1111,6 +1140,7 @@ struct FastdetHandle {
   ImysModel model;
   TiledModel tiled;
   std::vector<size_t> offset;
+  std::vector<fastdet_source> packed;  // the sources of the packed fixture being scored
   hwy::AlignedFreeUniquePtr<uint8_t[]> fine, coarse;
   hwy::AlignedFreeUniquePtr<int64_t[]> total;
   hwy::AlignedFreeUniquePtr<float[]> prob;
@@ -1125,6 +1155,7 @@ struct FastdetHandle {
       : model(std::move(m)),
         tiled(build_tiled(model)),
         offset(native_offsets(model)),
+        packed(model.n_features),
         fine(hwy::AllocateAligned<uint8_t>(static_cast<size_t>(tiled.n_fine) * kCells + 64)),
         coarse(hwy::AllocateAligned<uint8_t>(static_cast<size_t>(tiled.n_coarse) * kTiles + 64)),
         total(hwy::AllocateAligned<int64_t>(kCells)),
@@ -1137,11 +1168,29 @@ struct FastdetHandle {
 
   size_t threads() const { return pool.size(); }
 
+  // The sources of a packed fixture: every feature contiguous, in model order.
+  void fill_packed(const float* xn) {
+    for (uint32_t f = 0; f < model.n_features; ++f)
+      packed[f] = {xn + offset[f], static_cast<ptrdiff_t>(native_side(model, f)), 1};
+  }
+
   // Scores one native fixture into out (kCells probabilities, row-major grid).
   void score(const float* xn, float* out, const ScoreOptions& opt) {
     const std::lock_guard<std::mutex> lk(busy);
+    fill_packed(xn);
+    score_sources(packed.data(), out, opt);
+  }
+
+  // Scores one image read through src (one source per feature) into out.
+  void score(const fastdet_source* src, float* out, const ScoreOptions& opt) {
+    const std::lock_guard<std::mutex> lk(busy);
+    score_sources(src, out, opt);
+  }
+
+ private:
+  void score_sources(const fastdet_source* src, float* out, const ScoreOptions& opt) {
     PassShared sh;
-    sh.xn = xn;
+    sh.src = src;
     sh.total = total.get();
     sh.prob = prob.get();
     sh.alive = alive.data();
@@ -1161,9 +1210,9 @@ struct FastdetHandle {
     const size_t n = pool.size();
     pool.run([&](size_t t) {
       if (model.leaf_bits == 4)
-        Pass<1>(model, tiled, offset, fine.get(), coarse.get(), sh, scratch[t]).run(t, n, pool);
+        Pass<1>(model, tiled, fine.get(), coarse.get(), sh, scratch[t]).run(t, n, pool);
       else
-        Pass<2>(model, tiled, offset, fine.get(), coarse.get(), sh, scratch[t]).run(t, n, pool);
+        Pass<2>(model, tiled, fine.get(), coarse.get(), sh, scratch[t]).run(t, n, pool);
     });
     if (opt.packs_finished) *opt.packs_finished = sh.finished.load();
     for (size_t r = 0; r < kGrid; ++r)  // tile-major probabilities to the row-major grid, a tile row at a time
@@ -1209,10 +1258,9 @@ std::vector<Stage> parse_stages(const char* text, bool* ok) {
 }  // namespace
 
 // ---------------------------------------------------------------------------------------------
-// C API wrapped by the nanobind module in bindings.cpp (the module and this file are one build).
+// C API (fastdet_api.h) wrapped by the nanobind module in bindings.cpp (the module and this file
+// are one build).
 
-// Parses an FDT1 container (or a bare IMSY blob) from memory and builds its scorer with `threads`
-// threads (clamped to 1..16); nullptr on failure.
 extern "C" void* fastdet_open(const uint8_t* bytes, size_t size, size_t threads) {
   const std::string raw(reinterpret_cast<const char*>(bytes), size);
   const uint8_t* blob = nullptr;
@@ -1227,7 +1275,6 @@ extern "C" void fastdet_close(void* handle) {
   delete static_cast<FastdetHandle*>(handle);
 }
 
-// Number of floats the native fixture holds (Detector.native_matrix), and the grid's cell count.
 extern "C" size_t fastdet_native_size(void* handle) {
   return static_cast<FastdetHandle*>(handle)->offset.back();
 }
@@ -1237,21 +1284,37 @@ extern "C" size_t fastdet_cells(void*) {
 extern "C" size_t fastdet_threads(void* handle) {
   return static_cast<FastdetHandle*>(handle)->threads();
 }
+extern "C" size_t fastdet_n_features(void* handle) {
+  return static_cast<FastdetHandle*>(handle)->model.n_features;
+}
+extern "C" unsigned fastdet_feature_side(void* handle, size_t f) {
+  const ImysModel& m = static_cast<FastdetHandle*>(handle)->model;
+  return f < m.n_features ? native_side(m, static_cast<uint32_t>(f)) : 0u;
+}
 extern "C" const char* fastdet_target() {
   return hwy::TargetName(HWY_TARGET);
 }
 
-// Scores one image: `native` holds fastdet_native_size floats, `out` receives kCells probabilities
-// in row-major grid order.  With use_exit the model's calibrated stages apply (lazy binning, coarse
-// tier once per tile, early exit); without, every tree runs on every cell.  Returns 0 on success.
-extern "C" int fastdet_score(void* handle, const float* native, float* out, int use_exit) {
-  auto* h = static_cast<FastdetHandle*>(handle);
+namespace {
+ScoreOptions shipped_options(const FastdetHandle& h, int use_exit) {
   ScoreOptions opt;
-  if (use_exit && !h->model.stages.empty()) {
-    opt.stages = &h->model.stages;
+  if (use_exit && !h.model.stages.empty()) {
+    opt.stages = &h.model.stages;
     opt.lazy = true;
   }
-  h->score(native, out, opt);
+  return opt;
+}
+}  // namespace
+
+extern "C" int fastdet_score(void* handle, const float* native, float* out, int use_exit) {
+  auto* h = static_cast<FastdetHandle*>(handle);
+  h->score(native, out, shipped_options(*h, use_exit));
+  return 0;
+}
+
+extern "C" int fastdet_score_sources(void* handle, const fastdet_source* sources, float* out, int use_exit) {
+  auto* h = static_cast<FastdetHandle*>(handle);
+  h->score(sources, out, shipped_options(*h, use_exit));
   return 0;
 }
 
@@ -1378,6 +1441,37 @@ int main(int argc, char** argv) {
     std::printf("GATE FAILED\n");
     return 5;
   }
+  // -- the same fixture as a host's maps: per side one cell-major block (a record of every
+  // feature of that side per cell, as imfeat lays its levels out), read through sources --------
+  std::vector<std::vector<float>> blocks(kMaxShift / 2 + 1);
+  std::vector<fastdet_source> sources(model.n_features);
+  {
+    std::vector<uint32_t> width(blocks.size(), 0), column(model.n_features);
+    for (uint32_t f = 0; f < model.n_features; ++f) column[f] = width[model.level_shift[f] / 2]++;
+    for (size_t s = 0; s < blocks.size(); ++s) {
+      const size_t side = kGrid >> s;
+      blocks[s].assign(side * side * width[s], 0.0f);
+    }
+    for (uint32_t f = 0; f < model.n_features; ++f) {
+      const size_t s = model.level_shift[f] / 2, side = native_side(model, f), w = width[s];
+      for (size_t i = 0; i < side * side; ++i) blocks[s][i * w + column[f]] = xn[offset[f] + i];
+      sources[f] = {blocks[s].data() + column[f], static_cast<ptrdiff_t>(side * w), static_cast<ptrdiff_t>(w)};
+    }
+  }
+  {
+    std::vector<float> from_maps(kCells);
+    float dmap = 0.0f;
+    for (FastdetHandle* h : {&single, &multi, &many}) {
+      h->score(sources.data(), from_maps.data(), plain);
+      for (size_t i = 0; i < kCells; ++i) dmap = std::max(dmap, std::fabs(from_maps[i] - simd_out[i]));
+    }
+    std::printf("cell-major maps vs packed fixture, 1, %zu and %zu threads: max|dprob| = %.3e  %s\n", multi.threads(),
+                many.threads(), dmap, dmap == 0.0f ? "BIT-IDENTICAL" : "DIVERGED");
+    if (dmap != 0.0f) {
+      std::printf("GATE FAILED\n");
+      return 5;
+    }
+  }
   // -- early exit, as the model ships (or the override): the same scorer, stages applied ------------
   ScoreOptions exit_opt;
   size_t finished = 0;
@@ -1403,19 +1497,36 @@ int main(int argc, char** argv) {
         "probability among the rest %.4f; %zu and %zu threads vs 1: %s\n",
         finished, kPacks, same, kCells, top_cut, multi.threads(), many.threads(),
         de == 0.0f ? "BIT-IDENTICAL" : "DIVERGED");
-    if (de != 0.0f) {
+    // the lazy binner reads the alive packs' side-64 values through the sources too
+    float dmap = 0.0f;
+    for (FastdetHandle* h : {&single, &multi, &many}) {
+      h->score(sources.data(), exit_multi.data(), exit_opt);
+      for (size_t i = 0; i < kCells; ++i) dmap = std::max(dmap, std::fabs(exit_multi[i] - exit_out[i]));
+    }
+    std::printf("early exit from cell-major maps, 1, %zu and %zu threads: %s\n", multi.threads(), many.threads(),
+                dmap == 0.0f ? "BIT-IDENTICAL" : "DIVERGED");
+    if (de != 0.0f || dmap != 0.0f) {
       std::printf("GATE FAILED\n");
       return 5;
     }
   }
   // -- timings --------------------------------------------------------------------------------
   const double probes = static_cast<double>(model.n_trees) * model.depth;
+  std::vector<float> tmp(kCells);
+  single.fill_packed(xn.data());
   const double ms_bin = time_it(
-      [&] { bin_tiles(model, tiled, xn.data(), offset, single.fine.get(), single.coarse.get(), 0, 1, false); }, iters);
+      [&] {
+        bin_tiles(model, tiled, single.packed.data(), single.fine.get(), single.coarse.get(), 0, 1, false, tmp.data());
+      },
+      iters);
+  const double ms_bin_maps = time_it(
+      [&] { bin_tiles(model, tiled, sources.data(), single.fine.get(), single.coarse.get(), 0, 1, false, tmp.data()); },
+      iters);
   const double ms_scalar =
       time_it([&] { score_cells_scalar(model, full_bins.data(), kCells, scalar_out.data()); }, iters);
   const double ms_full = time_it([&] { single.score(xn.data(), simd_out.data(), plain); }, iters);
-  std::printf("tile binner      : %8.3f ms (p50, %d iters)\n", ms_bin, iters);
+  std::printf("tile binner      : %8.3f ms (p50, %d iters); %8.3f ms from cell-major maps\n", ms_bin, iters,
+              ms_bin_maps);
   std::printf("scalar traversal : %8.3f ms (%.3f ns/probe)\n", ms_scalar, 1e6 * ms_scalar / (probes * kCells));
   ScoreOptions walk_only = plain;
   walk_only.prebinned = true;  // the planes hold this image's bins from the run above
@@ -1436,6 +1547,12 @@ int main(int argc, char** argv) {
     if (multi.threads() > 1) {
       const double ms_exit_multi = time_it([&] { multi.score(xn.data(), exit_out.data(), exit_opt); }, iters);
       std::printf("model, as shipped, %zu threads: %8.3f ms\n", multi.threads(), ms_exit_multi);
+    }
+    const double ms_exit_maps = time_it([&] { single.score(sources.data(), exit_out.data(), exit_opt); }, iters);
+    std::printf("model, as shipped, from cell-major maps: %8.3f ms (no packed copy to make first)\n", ms_exit_maps);
+    if (multi.threads() > 1) {
+      const double ms = time_it([&] { multi.score(sources.data(), exit_out.data(), exit_opt); }, iters);
+      std::printf("model, as shipped, from cell-major maps, %zu threads: %8.3f ms\n", multi.threads(), ms);
     }
   }
   return 0;

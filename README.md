@@ -146,7 +146,10 @@ How the scorer splits a pass, in three phases separated by barriers, with no thr
 reading what another writes inside a phase:
 
 1. **Binning by feature.** The threads take the features round robin and bin whole
-   planes (side-32 and coarse features; side-64 features wait for the exit).
+   planes (side-32 and coarse features; side-64 features wait for the exit), reading
+   each feature where the front-end left it -- a column of imfeat's cell-major map, a
+   context plane, an entry of the broadcast vector -- through a base pointer and two
+   strides, so no packed copy of the features is made.
 2. **Coarse tier by unit.** A unit is one vector of tiles (32 with 256-bit vectors,
    64 with 512-bit); each thread runs the tile-constant trees on its own units,
    applies the coarse tier's exit stage to its packs and writes the probabilities of
@@ -154,8 +157,8 @@ reading what another writes inside a phase:
 3. **Fine tier by block.** The packs still alive are dealt out again in balanced,
    cache-line-aligned blocks -- text clusters, so the fine tier's work does not
    follow the tile layout -- and each thread bins its packs' side-64 features
-   lazily, runs the fine trees and the remaining exit stages on them, and writes
-   their probabilities.
+   lazily (a tile's 16 cells, read straight from the map), runs the fine trees and the
+   remaining exit stages on them, and writes their probabilities.
 
 Every cell's total is the same integer sum whichever thread adds it up, and the
 integer-to-probability step is one vector expression, so the output does not depend
@@ -173,8 +176,9 @@ fastdet-demo --model model.fdt --source 0              # webcam 0, live
 Left: the frame with the cell probabilities blended over it (JET colormap, opacity
 following the probability). Right: latency -- for an image the two numbers, for a
 video or webcam a live time series over the last 240 frames of (1) feature
-extraction (resize, colour conversion, imfeat, context banks, packing) and (2) the
-model (binning, coarse tier, fine trees, sigmoid), plus the total and the frame rate.
+extraction (resize, colour conversion, imfeat, context banks) and (2) the model
+(binning straight from the maps, coarse tier, fine trees, sigmoid), plus the total and
+the frame rate.
 Frames are scored as they arrive; nothing is buffered ahead. The window is
 matplotlib's (`pip install -e ".[tune]"`), so it works with `opencv-python-headless`;
 OpenCV only decodes, resizes and colours. Keys: `q`/`Esc` quit, `space` pause, `s`
@@ -230,10 +234,11 @@ original frame's height and width, which the global feature block records. A mod
 `extra_results`. The map is the same as `predict_proba(frame)`, through the same C++
 scorer, and a detector used only this way never builds its own imfeat computers (they
 are made on the first `predict_proba`), so the host's pool is the only one. Both paths
-pack the scorer's input into one buffer the detector keeps (`Detector.pack_native`, a
-few megabytes written in place each frame rather than allocated and faulted in afresh;
-`native_matrix` hands out a fresh array for callers that keep it), as imfeat itself
-derives each frame's pyramid into a pooled block that the returned arrays hand back.
+hand the scorer the level maps as they are (`Detector.score_maps`): it bins each kept
+column where it lies, in imfeat's cell-major maps, the context banks' planes and the
+broadcast vector, so nothing is packed per frame (`Detector.pack_native` /
+`native_matrix` still build the packed matrix, for the C++ harness's fixtures and for
+callers that want the features as one array; the scores are the same bytes either way).
 `FeatureExtractor.run_imfeat` / `.compose` are the two halves fastdet itself uses, if a
 host wants to share at a different point. framegate does exactly this: a `text.fdt` in
 its `models/` folder (or `GateConfig(models={"text": path})`) replaces its heuristic
@@ -276,7 +281,17 @@ concatenates the features of all levels into one row (1178 columns):
 - `global` — imfeat's whole-image block plus the original frame's aspect ratio
   and log area, broadcast to every cell;
 - `context`, `ctx2` — small- and large-scale surround, ring, and range of
-  imfeat's per-cell luminance mean.
+  imfeat's per-cell luminance mean: 3×3, 5×5 and 9×9 box means and 3×3 and 5×5
+  max-minus-min over the 64×64 (and coarser) grids of cell means. They are computed by
+  the C++ extension in one call per level, into a `(7, grid, grid)` buffer the extractor
+  keeps per level (the banks are views of it; a frame whose banks a caller still holds
+  gets a fresh one), bit for bit what the OpenCV calls they were first written as give —
+  `cv2.boxFilter`'s double sums and single rounding, `cv2.dilate` / `erode`'s max and min
+  — so models trained through those score identically (`compute_context_values` /
+  `compute_context2_values` remain as that reference, and the tests pin the bytes on every
+  grid size). On maps this small the cost was the 32 OpenCV calls a frame and their
+  allocations, not the arithmetic; the C++ is written in Highway, so it vectorises the
+  same under every compiler (every lane does the scalar operation in the scalar order).
 
 **fastdet computes no image features of its own.** Every per-pixel quantity
 comes from imfeat in a single pass; the banks above are cheap reductions of its
@@ -548,13 +563,17 @@ What it does, in order:
 1. **Binning.** Each feature is binned once per distinct value (a level-L feature
    has L×L values), by comparing against its cut list in SIMD and counting; the
    bins are written as one byte plane per feature in **tile-major** order (a 4×4
-   tile is 16 consecutive bytes), coarse features as one byte per tile.
+   tile is 16 consecutive bytes), coarse features as one byte per tile. A feature's
+   values are read through a `fastdet_source` (`cpp/fastdet_api.h`: a base pointer
+   and a row and column stride), so the fixture's contiguous layout and a host's
+   cell-major maps are the same code path; the gate scores the fixture both ways and
+   requires the same bytes.
 2. **Coarse tier.** Trees that split only on tile-constant features are evaluated
    once per tile: their leaf index is built with byte shuffles over the coarse
    planes and the leaf code gathered per tile.
 3. **Early exit and lazy binning.** After the coarse tier's stage, only the packs
-   of tiles still alive get their side-64 features binned, and only they are
-   scored by the fine trees.
+   of tiles still alive get their side-64 features binned (their 16 cells read from
+   wherever the feature lies), and only they are scored by the fine trees.
 4. **Fine trees.** Splits that vary inside a tile take the low bits of the leaf
    index and are looked up with one byte shuffle each over 32 cells; the
    tile-constant splits select the leaf group per tile. Each nibble plane of the
@@ -564,10 +583,12 @@ What it does, in order:
 5. **Score.** `sigmoid(sum(offsets) + total * 2**e_min)` per cell (Highway's vector
    `Exp`, within 1 ulp of `std::exp`), written the moment a pack's total is final.
 
-Timings printed: `tile binner`, `simd traversal` (every tree on every cell),
-`model total` (binning + full traversal) and `model, as shipped` (lazy binning,
-coarse tier per tile, early exit) -- the last one is the production number -- each
-followed by the same pass on `threads` threads (see [Threads](#threads)).
+Timings printed: `tile binner` (from the fixture, and from the same values laid out
+as cell-major maps), `simd traversal` (every tree on every cell), `model total`
+(binning + full traversal) and `model, as shipped` (lazy binning, coarse tier per
+tile, early exit) -- the last one is the production number, also given from the
+cell-major maps, which is how a host's frames reach the scorer -- each followed by
+the same pass on `threads` threads (see [Threads](#threads)).
 
 ## Training time and memory
 

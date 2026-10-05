@@ -55,7 +55,7 @@ _MODEL_COLOUR = "#78dc78"  # green
 _IMAGE_TYPES = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff"}
 
 
-STAGES = ("imfeat pass", "context banks", "packing")  # the front-end's parts, as timed
+STAGES = ("imfeat pass", "context banks")  # the front-end's parts, as timed
 
 
 def score_frame(
@@ -64,9 +64,9 @@ def score_frame(
     """``(probability map, feature ms, model ms)`` for one BGR frame.
 
     Feature extraction is the front-end (resize, colour conversion, imfeat, context
-    banks, packing); the model is the C++ scorer on that input.  With ``stages`` (lists
-    keyed by :data:`STAGES`) each part's milliseconds are appended to its list, so a run
-    can say where the front-end's time goes.
+    banks); the model is the C++ scorer reading those maps where they lie.  With
+    ``stages`` (lists keyed by :data:`STAGES`) each part's milliseconds are appended to
+    its list, so a run can say where the front-end's time goes.
     """
     if det.native is None:
         msg = "detector is not fitted; call fit() or load()"
@@ -76,13 +76,11 @@ def score_frame(
     result, extra = extractor.run_imfeat(frame)
     ta = time.perf_counter()
     level_maps, broadcast_vecs = extractor.compose(result, frame.shape[:2], extra)
-    tb = time.perf_counter()
-    native = det.pack_native(level_maps, broadcast_vecs)  # one buffer, reused per frame
     t1 = time.perf_counter()
-    probs = det.native.score(native, use_exit=det.config.model.use_exit)
+    probs = det.score_maps(level_maps, broadcast_vecs)
     t2 = time.perf_counter()
     if stages is not None:
-        for name, ms in zip(STAGES, (ta - t0, tb - ta, t1 - tb), strict=True):
+        for name, ms in zip(STAGES, (ta - t0, t1 - ta), strict=True):
             stages[name].append(1e3 * ms)
     return probs.reshape(GRID, GRID).astype(np.float32), 1e3 * (t1 - t0), 1e3 * (t2 - t1)
 

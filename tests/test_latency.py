@@ -7,8 +7,8 @@ Two totals are reported separately because they scale with different things:
   kept column count, the tree count and the depth, and is **the same for any input
   image size**.
 * **front-end** -- turning an image into those features: resize, colour conversion,
-  imfeat's pass, the context banks, and packing the result for the scorer.  This is
-  what the input size changes.
+  imfeat's pass and the context banks (the scorer reads the maps as they are, so
+  nothing is packed for it).  This is what the input size changes.
 
 By default the model is random (``random_model.py``: splits, thresholds and leaves are
 drawn, then written by the real blob exporter and scored by the real C++ scorer), so
@@ -34,7 +34,14 @@ import numpy as np
 import pytest
 
 from fastdet import Config
-from fastdet.features import GRID, FeatureExtractor
+from fastdet.features import (
+    GRID,
+    N_BANK_PLANES,
+    FeatureExtractor,
+    compute_context2_values,
+    compute_context_values,
+    context_banks,
+)
 from fastdet.runtime import parse_blob
 from random_model import DEPTH, N_TREES, random_model
 
@@ -202,9 +209,29 @@ def test_front_end_latency(size: int, stride: int) -> None:
     on_thumb_ms, _ = _p50_min(lambda: on_thumb.features(thumb))
     fused_ms, _ = _p50_min(lambda: extractor.run_imfeat(image))
     extract_ms, _ = _p50_min(lambda: extractor.extract(image))
+    # the packed matrix is no longer on the live path (the scorer reads the maps): timed
+    # for reference, as what a caller of native_matrix / pack_native pays
     native_ms, _ = _p50_min(lambda: extractor.native(level_maps, broadcast))
     buf = np.empty(extractor.native_size(), np.float32)  # what Detector.pack_native keeps
     reused_ms, _ = _p50_min(lambda: extractor.native(level_maps, broadcast, out=buf))
+    # the compose stage's parts: the C++ banks alone (one call per level, on the pooled
+    # means), and the cv2 route they replaced, on the same means
+    result, extra = extractor.run_imfeat(image)
+    pooled = {lvl: extractor._lum_cell_mean(banks[0]) for lvl, banks in level_maps.items()}
+    bank_bufs = {lvl: np.zeros((N_BANK_PLANES, lvl, lvl), np.float32) for lvl in pooled}
+
+    def banks_cpp() -> None:
+        for lvl, means in pooled.items():
+            context_banks(means, bank_bufs[lvl])
+
+    def banks_cv2() -> None:
+        for lvl, means in pooled.items():
+            compute_context_values(means, lvl)
+            compute_context2_values(means, lvl)
+
+    banks_ms, _ = _p50_min(banks_cpp)
+    banks_cv2_ms, _ = _p50_min(banks_cv2)
+    compose_ms, _ = _p50_min(lambda: extractor.compose(result, image.shape[:2], extra))
     print(
         f"\n[fastdet-lat] FRONT-END -- {SOURCE_HW[1]}x{SOURCE_HW[0]} frame -> {size}x{size}x3"
         f" thumbnail, HSV, {len(cfg.train.levels)} pyramid levels, stride {cfg.train.stride}"
@@ -218,12 +245,14 @@ def test_front_end_latency(size: int, stride: int) -> None:
         f" {cv2_threads} thread(s), {resize_1_ms:6.3f} on one; a separate cvtColor {cvt_ms:6.3f})"
     )
     print(
-        f"   context banks + level assembly {extract_ms - fused_ms:6.3f} ms | "
-        f"pack features for the scorer {native_ms:6.3f} ms into a fresh array,"
-        f" {reused_ms:6.3f} into the reused buffer ({buf.nbytes / 1e6:.1f} MB)"
+        f"   context banks + level assembly {compose_ms:6.3f} ms (the C++ banks alone"
+        f" {banks_ms:6.3f}, against {banks_cv2_ms:6.3f} through cv2; the rest is Python"
+        f" assembling the levels) | packing the features as one matrix, which scoring no"
+        f" longer needs: {native_ms:6.3f} ms into a fresh array, {reused_ms:6.3f} into a"
+        f" reused buffer ({buf.nbytes / 1e6:.1f} MB)"
     )
     print(
-        f"   {'':<22s} front-end total (frame -> features ready to score)"
-        f" {extract_ms + reused_ms:6.3f} ms"
+        f"   {'':<22s} front-end total (frame -> maps ready to score)"
+        f" {extract_ms:6.3f} ms ({fused_ms:6.3f} + {compose_ms:6.3f} by parts)"
     )
     assert extract_ms > 0.0

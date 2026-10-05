@@ -392,24 +392,41 @@ class Detector:
     def _predict_from_maps(
         self, level_maps: dict[int, LevelBanks], broadcast_vecs: dict[int, FloatArray]
     ) -> NDArray[np.floating[Any]]:
-        if self.runtime is None:
-            msg = "detector is not fitted; call fit() or load()"
-            raise RuntimeError(msg)
+        return self.score_maps(level_maps, broadcast_vecs).reshape(GRID, GRID)
+
+    def score_maps(
+        self, level_maps: dict[int, LevelBanks], broadcast_vecs: dict[int, FloatArray]
+    ) -> NDArray[np.float32]:
+        """The scorer on these maps, read where they lie: the live path.
+
+        The kept columns are binned straight from the level maps (imfeat's cell-major
+        maps, the context banks' planes, the broadcast vector), so no packed copy of the
+        features is made per frame; :meth:`NativeScorer.score_maps`, with the layout set on
+        the scorer the first time.  Returns the ``GRID * GRID`` probabilities, row-major --
+        the same bytes as :meth:`pack_native` followed by :meth:`NativeScorer.score`.
+        """
         if self.native is None:
             msg = "detector is not fitted; call fit() or load()"
             raise RuntimeError(msg)
-        native = self.pack_native(level_maps, broadcast_vecs)
-        return self.native.score(native, use_exit=self.config.model.use_exit).reshape(GRID, GRID)
+        scorer = self.native
+        sources = scorer.sources
+        if sources is None:
+            sources = self.extractor.map_sources(self.col_keep)
+            scorer.set_sources(sources)
+        arrays = sources.arrays(level_maps, broadcast_vecs)
+        return scorer.score_maps(arrays, use_exit=self.config.model.use_exit)
 
     def pack_native(
         self, level_maps: dict[int, LevelBanks], broadcast_vecs: dict[int, FloatArray]
     ) -> FloatArray:
-        """The scorer's input for these maps, in a buffer this detector reuses.
+        """The scorer's input for these maps, packed into a buffer this detector reuses.
 
         :meth:`FeatureExtractor.native` into one array kept across calls (a few megabytes,
         allocated once, so a stream faults no fresh pages per frame): the result is valid
         until the next call, which overwrites it.  :meth:`native_matrix` returns a fresh
-        array instead, for callers that keep it.
+        array instead, for callers that keep it.  Scoring itself no longer needs the packed
+        matrix (:meth:`score_maps` reads the maps directly); this is for callers that want
+        the matrix as such, the C++ harness's fixtures among them.
         """
         want = self.extractor.native_size(self.col_keep)
         if self._native_buf is None or self._native_buf.shape[0] != want:

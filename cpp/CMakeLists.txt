@@ -46,7 +46,7 @@ if(SKBUILD OR FASTDET_BUILD_PYTHON)
   find_package(Python 3.10 COMPONENTS Interpreter Development.Module REQUIRED)
   find_package(nanobind CONFIG REQUIRED)
   # NOMINSIZE: nanobind builds for size (-Os) by default; the scorer is compute-bound.
-  nanobind_add_module(_native_ext NOMINSIZE fastdet_score.cpp bindings.cpp)
+  nanobind_add_module(_native_ext NOMINSIZE fastdet_score.cpp context_banks.cpp bindings.cpp)
   target_compile_definitions(_native_ext PRIVATE FASTDET_LIBRARY=1)
   target_link_libraries(_native_ext PRIVATE hwy)
   install(TARGETS _native_ext LIBRARY DESTINATION fastdet)
