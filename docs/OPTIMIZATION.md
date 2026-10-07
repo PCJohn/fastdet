@@ -64,11 +64,11 @@ compose 0.42 → 0.14 ms, pack 0.44 → none, score 0.23 → 0.33, and `gate.fra
 | the banks of every level in one call | 0.45 ms | 0.33 | compose 0.10 ms |
 | the banks computed inside the scorer, overlapped with binning | **0.37 ms** | 0.34 | 0.03 ms of Python |
 | a model fitted on the current front end, another clip | 0.22 ms | 0.19 | more tiles exit early |
-| mainline as pushed on 7 October, the tuning sweep's model `de716422c0b5`, the earlier clip, the scorer on 8 threads | 0.39 ms | 0.35 | gate frame 2.66 ms (p90 3.72); on 16 threads 0.47 / 0.43; the 2-thread run read 0.54 / 0.49, but in a session where every stage was slower (step 12) |
+| mainline as pushed on 7 October, the tuning sweep's model `de716422c0b5`, the earlier clip, the scorer on 2 threads | 0.37 ms | 0.33–0.34 | three runs: 0.37 / 0.37 / 0.37; gate frame 2.65–2.73 ms (p90 3.6–3.9); on 8 threads 0.35–0.41, on 16 threads 0.47 (step 12) |
 
 The whole gate frame around it was 2.9 ms on the earlier clip and 2.14 ms (p90 2.38) on
-the later one, the imfeat pass being the rest (2.66 ms, p90 3.72, with the tuning sweep's
-model on the earlier clip on 7 October); framegate's `examples/visualize.py` reports
+the later one, the imfeat pass being the rest (2.47–2.75 ms over five back-to-back runs
+with the tuning sweep's model on the earlier clip on 7 October); framegate's `examples/visualize.py` reports
 a higher model-stage figure (0.58 ms over 561 frames, 0.64 over 2037) because it draws
 between frames and measures with cold caches. The scorer's own benchmark
 (`pytest -s tests/test_latency.py`: a random 1178-column model, 4-bit leaves, 1000 trees
@@ -127,7 +127,7 @@ development machine's.
 | 9 | The context banks in C++ (Highway; one call for every level, reading the mean column where it lies), and the scorer reading imfeat's maps in place | laptop model stage 0.82 → 0.47 ms |
 | 10 | Every level's banks in one extension call; the global vector by one extension call; `log1p` cached per frame size | 0.47 → 0.45 ms |
 | 11 | The banks computed inside the scorer by the calling thread while the others bin; the columns that read them binned after | 0.45 → 0.37 ms |
-| 12 | A separate thread count for the scorer in framegate (`model_threads`) | laptop, the text model (a 0.2 ms pass): 2 threads 0.23 ms, 8 threads 0.31, 16 threads 0.40 — a control, not a lever. On 7 October with the tuning sweep's model `de716422c0b5` (a 0.35–0.5 ms pass): 8 threads 0.39 ms (score 0.35), 16 threads 0.47 (0.43), and 2 threads 0.54 (0.49) in a run whose whole frame read 1.5 ms slower than the other two (4.20 against 2.66 and 2.86 ms, the lazy maps 0.42 against 0.31), so the 2-thread point of that model is not settled; the best count follows the length of the pass |
+| 12 | A separate thread count for the scorer in framegate (`model_threads`) | laptop, the text model (a 0.2 ms pass): 2 threads 0.23 ms, 8 threads 0.31, 16 threads 0.40 — a control, not a lever. The tuning sweep's model `de716422c0b5` (a 0.33 ms pass) on the pushed mainline, 7 October, five runs back to back with the gate frame steady at 2.47–2.75 ms: 2 threads 0.37 / 0.37 / 0.37 ms (score_maps 0.33–0.34), 8 threads 0.41 / 0.35 (0.37 / 0.32), and 16 threads 0.47 (0.43) in an earlier run — two and eight within noise of each other, sixteen worse, the same shape as the text model's |
 | 13 | Training: the pool quantised once and reused by every stage and chunk; CatBoost on the GPU when it sees one | the quantisation-aware fit is 63 chunked fits for 1000 trees; on the GPU each uploads the quantised pool once |
 
 **Step 2, the leaf grid.** Leaf magnitudes shrink as boosting proceeds, so one global step
@@ -256,11 +256,11 @@ vector and nothing else per frame.
 5. **Exactness comes from integer sums.** Leaf codes summed as integers, converted once,
    are what make three implementations and any thread count agree to the bit; a float
    accumulation per thread would not.
-6. **A control is not a lever.** The scorer's pass is a few hundred microseconds; for the
-   0.2 ms text model its synchronisation cost more than a wider split saved above two
-   threads on the laptop, and for a 0.4 ms model eight threads read 0.08 ms better than
-   sixteen (step 12). Measure the thread count on the machine, with the model in hand;
-   do not raise it on principle.
+6. **A control is not a lever.** The scorer's pass is a few hundred microseconds; its
+   synchronisation costs more than a wider split saves above two threads on the laptop,
+   for the 0.2 ms text model as for the tuning sweep's 0.33 ms one (step 12: two and eight
+   threads within noise, sixteen worse). Measure the thread count on the machine, do not
+   raise it.
 7. **Width is not free at training time.** The design matrix's width sets the fit's memory
    (1.3–2.3× the float32 matrix) and its CPU-side quantisation time, and more columns do not
    mean a better model (the `all` front end).
@@ -312,10 +312,10 @@ vector and nothing else per frame.
 Inference:
 
 * `Detector.load(path, threads=n)` with `n` = 2 when the machine is shared, up to 4 when
-  it is not; the gain flattens past that for imfeat. In framegate, `feat_threads=2`, and
-  `model_threads` measured with the model in hand (`examples/gate_loop.py --model-threads
-  N`): 2 was best for the 0.2 ms text model, 8 for the tuning sweep's heavier one, 16
-  worse than 8 for both.
+  it is not; the gain flattens past that for imfeat and does not reward the scorer past
+  two. In framegate, `feat_threads=2` and `model_threads` left at 0 (= 2): two threads
+  were best or equal-best for both models measured and sixteen worse for both;
+  `examples/gate_loop.py --model-threads N` checks another model or machine.
 * Inside a host that already runs imfeat's pass, `Detector.score_raw(result, (h, w))`
   (what framegate does); the detector then never builds its own imfeat computers. On its
   own, `predict_proba(frame)` with the frame whole — the thumbnail and the HSV conversion
