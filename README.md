@@ -604,7 +604,7 @@ the same pass on `threads` threads (see [Threads](#threads)).
 ## Training time and memory
 
 The fit is dominated by CatBoost on the training matrix (`n_cells x n_features`
-float32: 6.7 M cells x 1178 columns is 32 GiB). What the pipeline does about it, and
+float32: 6.7 M cells x 1178 columns is about 30 GiB). What the pipeline does about it, and
 the knobs that matter:
 
 * **The matrix is quantised once.** `fit()` builds one CatBoost `Pool` and quantises it

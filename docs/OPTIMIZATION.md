@@ -51,7 +51,11 @@ features where imfeat left them.
 ## Result
 
 The model stage per 720p frame on the laptop, two imfeat threads and two scorer threads,
-the frame scored inside framegate's gate (`gate_loop.py`, medians over 100–600 frames):
+the frame scored inside framegate's gate (its `examples/gate_loop.py`, medians over
+100–600 frames; the maintainer's runs of 5 October 2026, the first two rows also recorded
+in the message of the commit *Model stage without the copies*, with the stage's parts:
+compose 0.42 → 0.14 ms, pack 0.44 → none, score 0.23 → 0.33, and `gate.frame()`
+3.40 → 2.80 ms):
 
 | state | model stage | of which C++ | note |
 |---|---|---|---|
@@ -62,12 +66,14 @@ the frame scored inside framegate's gate (`gate_loop.py`, medians over 100–600
 | a model fitted on the current front end, another clip | 0.22 ms | 0.19 | more tiles exit early |
 
 The whole gate frame around it was 2.9 ms on the earlier clip and 2.14 ms (p90 2.38) on
-the later one, the imfeat pass being the rest; `examples/visualize.py` reports a higher
-model-stage figure (0.58–0.60 ms) because it draws between frames and measures with cold
-caches. On the development VM the scorer's own benchmark (`pytest -s tests/test_latency.py`,
-a random 1178-column model, 4-bit leaves, 1000 trees of depth 5) puts binning plus full
-traversal at about 0.27 ms on one thread and the shipped pass (coarse tier, exit, lazy
-binning) at 0.2–0.3 ms, on an AVX-512 build.
+the later one, the imfeat pass being the rest; framegate's `examples/visualize.py` reports
+a higher model-stage figure (0.58 ms over 561 frames, 0.64 over 2037) because it draws
+between frames and measures with cold caches. The scorer's own benchmark
+(`pytest -s tests/test_latency.py`: a random 1178-column model, 4-bit leaves, 1000 trees
+of depth 5, no host) on the laptop puts binning plus full traversal at 0.42–0.43 ms on one
+thread and the shipped pass (coarse tier, exit, lazy binning) at 0.39 ms, in two October
+runs; on the development VM the same rows wander between 0.3 and 0.7 ms with the machine's
+load, which is why no VM figure is quoted for the model stage.
 
 Against the research floor (3.71 ms for binning and traversal on one thread): fewer and
 shallower trees chosen by the quality sweeps (d5 × 1000 against d7 × 1200), two thirds of
@@ -112,7 +118,7 @@ development machine's.
 | 2 | Leaves on a low-bit grid (4 bits) with a quantisation-aware chunked fit | fine-tree work became one byte shuffle per nibble plane of codes instead of four per float leaf; quality equal to 8-bit leaves (`--leaf-bits 4 / 8` in the tuning table) |
 | 3 | Resolution-tiered boosting (two thirds of the trees split only on tile-constant columns, evaluated once per tile), exit stages calibrated at fit time, lazy binning of side-64 columns | the coarse tier costs a fifth of a fine tree or less; tiles that exit skip the fine tier and their side-64 binning; quality 0.9012 against 0.9014 untiered on the synthetic set |
 | 4 | The scorer as an in-process extension (nanobind + Highway, built by `pip install`), GIL released during a pass | no subprocess, no fixture file, no copy of the features into another process |
-| 5 | Thread pools with parked workers, in imfeat and in the scorer; one wake-up per pass | laptop, 1080p at 1024 px: the pass 11.1 / 5.6 / 3.4 ms on 1 / 2 / 4 threads; the scorer's random-model benchmark 0.45 → 0.35 ms on the VM's two threads |
+| 5 | Thread pools with parked workers, in imfeat and in the scorer; one wake-up per pass | laptop, 1080p at 1024 px: the pass 11.1 / 5.6 / 3.4 ms on 1 / 2 / 4 threads (the README's figures of September; the October run reads 10.3 / 5.4 / 3.3); the scorer's random-model benchmark 0.45 → 0.35 ms on the VM's two threads |
 | 6 | imfeat's computers built lazily, on first use | a detector used through `score_raw` never spawns its own pool |
 | 7 | The front end moved into imfeat: BGR → HSV inside the pass, then the `INTER_AREA` thumbnail, then the thumbnail sized from the frame (`"pow2"`, `"pow2-fit"`) | the two OpenCV passes over the frame are gone (imfeat's log has the numbers); a 720p frame runs at 512×320 instead of being upscaled to 1024 |
 | 8 | The packed matrix written into a pinned, reused buffer | removed the per-frame allocation on the path that still packed |
@@ -259,7 +265,7 @@ vector and nothing else per frame.
 
 ## Measuring
 
-* **The gate loop** (`gate_loop.py`, delivered alongside the patches; `python gate_loop.py
+* **The gate loop** (framegate's `examples/gate_loop.py`: `python examples/gate_loop.py
   clip.mp4 --model text.fdt --threads 2 --model-threads 2 --frames 200`): framegate's
   `gate.frame()` per frame with the model loaded, the model stage and `score_maps` timed by
   monkey-patching `ModelBank.maps` and `NativeScorer.score_maps`, medians and p90, the GC
@@ -345,7 +351,8 @@ Training:
   that produced the level, or imfeat handing the scorer the maps band by band, would remove
   it; both cross the library boundary.
 * **A model fitted on the current front end** with a regenerated ranking and pruning to
-  512 columns would halve the binning (the benchmark's 512-column row).
+  512 columns would cut the binning by half or more (the benchmark's 512-column row against
+  its 1178-column one on the laptop: 0.14 against 0.40 ms).
 * **imfeat's remaining exact items** (its log): batched folds with the roll-up fused in,
   and the serial tail at two threads. The pass is 85% of a gate frame; the model stage is
   10%.

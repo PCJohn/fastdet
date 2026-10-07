@@ -41,6 +41,7 @@
 // The vector path must be bit-identical to the scalar path.
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <climits>
@@ -72,7 +73,8 @@ constexpr size_t kCells = kGrid * kGrid;  // 4096 cells per image
 constexpr uint8_t kMaxBin = 15;           // bins are table indices: at most 16 per feature
 constexpr uint8_t kMaxShift = 12;         // level_shift of an image-wide (1x1) feature
 
-std::string read_all(const char* path) {
+// The harness's helpers and references: compiled in the library build too, which does not call them.
+[[maybe_unused]] std::string read_all(const char* path) {
   FILE* f = std::fopen(path, "rb");
   if (!f) return std::string();
   std::fseek(f, 0, SEEK_END);
@@ -163,10 +165,11 @@ bool load_imys(const uint8_t* p, size_t size, ImysModel* m) {
   if (m->depth == 0 || m->depth > 7 || (m->leaf_bits != 4 && m->leaf_bits != 8) || m->leaf_chunk == 0 ||
       m->leaf_chunk > 17)
     return false;
-  m->tree_offsets.resize(m->n_trees + 1);
-  std::memcpy(m->tree_offsets.data(), take(4 * (m->n_trees + 1)), 4 * (m->n_trees + 1));
-  m->tree_base.resize(m->n_trees + 1);
-  std::memcpy(m->tree_base.data(), take(4 * (m->n_trees + 1)), 4 * (m->n_trees + 1));
+  const size_t n_trees = m->n_trees, n_features = m->n_features;
+  m->tree_offsets.resize(n_trees + 1);
+  std::memcpy(m->tree_offsets.data(), take(4 * (n_trees + 1)), 4 * (n_trees + 1));
+  m->tree_base.resize(n_trees + 1);
+  std::memcpy(m->tree_base.data(), take(4 * (n_trees + 1)), 4 * (n_trees + 1));
   const size_t n_splits = static_cast<size_t>(m->n_trees) * m->depth;
   m->split_feat.resize(n_splits);
   m->split_bin.resize(n_splits);
@@ -177,8 +180,8 @@ bool load_imys(const uint8_t* p, size_t size, ImysModel* m) {
   }
   m->codes.resize(m->n_leafs_total);
   std::memcpy(m->codes.data(), take(m->n_leafs_total), m->n_leafs_total);
-  m->offsets.resize(m->n_trees);
-  std::memcpy(m->offsets.data(), take(4 * m->n_trees), 4 * m->n_trees);
+  m->offsets.resize(n_trees);
+  std::memcpy(m->offsets.data(), take(4 * n_trees), 4 * n_trees);
   m->shifts.resize(m->n_chunks);
   std::memcpy(m->shifts.data(), take(m->n_chunks), m->n_chunks);
   for (uint32_t i = 0; i < n_stages; ++i) {
@@ -188,8 +191,8 @@ bool load_imys(const uint8_t* p, size_t size, ImysModel* m) {
     std::memcpy(&s.theta, q + 4, 4);
     m->stages.push_back(s);
   }
-  m->n_borders.resize(m->n_features);
-  std::memcpy(m->n_borders.data(), take(4 * m->n_features), 4 * m->n_features);
+  m->n_borders.resize(n_features);
+  std::memcpy(m->n_borders.data(), take(4 * n_features), 4 * n_features);
   m->border_offset.resize(m->n_features + 1);
   size_t total = 0;
   for (uint32_t f = 0; f < m->n_features; ++f) {
@@ -202,8 +205,10 @@ bool load_imys(const uint8_t* p, size_t size, ImysModel* m) {
   std::memcpy(m->borders.data(), take(4 * total), 4 * total);
   m->level_shift.resize(m->n_features);
   std::memcpy(m->level_shift.data(), take(m->n_features), m->n_features);
-  for (const uint8_t shift : m->level_shift)
-    if (shift > kMaxShift || shift % 2) return false;  // sides 64, 32, ..., 1: even shifts up to 12
+  // sides 64, 32, ..., 1: even shifts up to 12
+  if (!std::all_of(m->level_shift.begin(), m->level_shift.end(),
+                   [](uint8_t shift) { return shift <= kMaxShift && shift % 2 == 0; }))
+    return false;
   if (off != size) {
     std::fprintf(stderr, "IMSY blob: %zu trailing bytes\n", size - off);
     return false;
@@ -247,7 +252,7 @@ inline uint8_t bin_one(const ImysModel& m, uint32_t f, float x) {
   return (uint8_t)lo;
 }
 
-void bin_full(const ImysModel& m, const float* X, size_t n_cells, uint8_t* B) {
+[[maybe_unused]] void bin_full(const ImysModel& m, const float* X, size_t n_cells, uint8_t* B) {
   for (size_t c = 0; c < n_cells; ++c) {
     const float* row = X + c * m.n_features;
     for (uint32_t f = 0; f < m.n_features; ++f) B[(size_t)f * n_cells + c] = bin_one(m, f, row[f]);
@@ -335,7 +340,8 @@ void bin_run(const float* x, uint32_t n, const float* cuts, uint32_t k, uint8_t*
 }
 
 // Reference-only: expand a native fixture to the dense cells x features matrix.
-std::vector<float> expand_native(const ImysModel& m, const float* xn, const std::vector<size_t>& offset) {
+[[maybe_unused]] std::vector<float> expand_native(const ImysModel& m, const float* xn,
+                                                  const std::vector<size_t>& offset) {
   const uint32_t nf = m.n_features;
   std::vector<float> x(kCells * nf);
   for (uint32_t f = 0; f < nf; ++f) {
@@ -385,7 +391,7 @@ void probabilities(const ImysModel& m, const int64_t* total, float* prob, size_t
 }
 
 // Reference: every tree on every cell in order, integer codes, no SIMD.
-void score_cells_scalar(const ImysModel& m, const uint8_t* B, size_t n_cells, float* out) {
+[[maybe_unused]] void score_cells_scalar(const ImysModel& m, const uint8_t* B, size_t n_cells, float* out) {
   std::vector<int64_t> total(n_cells, 0);
   for (uint32_t t = 0; t < m.n_trees; ++t) {
     const size_t s0 = static_cast<size_t>(t) * m.depth;
@@ -557,10 +563,10 @@ void bin_feature(const ImysModel& m, const TiledModel& tm, const fastdet_source*
         const uint8_t* row[kTile];
         const uint8_t* src = binned + static_cast<size_t>(tr) * per_tile_row * side;
         if (side == kGrid) {
-          for (uint32_t i = 0; i < kTile; ++i) row[i] = src + i * side;
+          for (size_t i = 0; i < kTile; ++i) row[i] = src + i * side;
         } else {
-          for (uint32_t i = 0; i < 2; ++i) {
-            for (uint32_t c = 0; c < kGrid / 2; c += 16) {
+          for (size_t i = 0; i < 2; ++i) {
+            for (size_t c = 0; c < kGrid / 2; c += 16) {
               const auto v = hn::LoadU(db, src + i * side + c);
               hn::StoreU(hn::InterleaveLower(db, v, v), db, rows[i] + 2 * c);
               hn::StoreU(hn::InterleaveUpper(db, v, v), db, rows[i] + 2 * c + 16);
@@ -602,8 +608,8 @@ void bin_feature(const ImysModel& m, const TiledModel& tm, const fastdet_source*
 }
 
 // Every feature, on one thread (the harness's timing of the binner).
-void bin_all(const ImysModel& m, const TiledModel& tm, const fastdet_source* sources, uint8_t* fine, uint8_t* coarse,
-             bool skip_side64, float* tmp) {
+[[maybe_unused]] void bin_all(const ImysModel& m, const TiledModel& tm, const fastdet_source* sources, uint8_t* fine,
+                              uint8_t* coarse, bool skip_side64, float* tmp) {
   BinScratch bs;
   bs.tmp = tmp;
   for (uint32_t f = 0; f < m.n_features; ++f) bin_feature(m, tm, sources, f, fine, coarse, skip_side64, bs);
@@ -638,7 +644,7 @@ HWY_NOINLINE void tree_codes_over_packs(const TiledTree& tr, const uint16_t* act
   const PackB db;
   hn::VFromD<PackB> table[V];
   const uint8_t* plane[V];
-  for (uint32_t j = 0; j < V; ++j) {
+  for (size_t j = 0; j < V; ++j) {
     table[j] = hn::LoadDup128(db, tr.table + j * 16);
     plane[j] = tr.fine[j];
   }
@@ -652,7 +658,7 @@ HWY_NOINLINE void tree_codes_over_packs(const TiledTree& tr, const uint16_t* act
     for (uint32_t j = 1; j < V; ++j) idx = hn::Or(idx, hn::TableLookupBytes(table[j], hn::LoadU(db, plane[j] + cell0)));
     const uint8_t* base[kPack];
     for (size_t k = 0; k < kPack; ++k) base[k] = nib + static_cast<size_t>(group[tile + k]) * NP * width;
-    hn::VFromD<PackB> sel[3];
+    hn::VFromD<PackB> sel[3];  // NOLINT(misc-const-correctness): filled when V > 4
     if constexpr (V > 4) {
       for (uint32_t b = 4; b < V; ++b)
         sel[b - 4] = hn::VecFromMask(db, hn::TestBit(idx, hn::Set(db, static_cast<uint8_t>(1u << b))));
@@ -742,7 +748,7 @@ HWY_NOINLINE void coarse_trees_codes(const ImysModel& m, const TiledModel& tm, c
         g = hn::Or(g, hn::TableLookupBytes(hn::LoadDup128(d8, tm.table.get() + (s0 + j) * 16),
                                            hn::LoadU(d8, coarse + static_cast<size_t>(tm.plane[s0 + j]) * kTiles + i)));
       const uint8_t* nib = tm.nib.get() + static_cast<size_t>(m.tree_offsets[trees[a]]) * NP;
-      for (uint32_t k = 0; k < NP; ++k) sum[k] = hn::Add(sum[k], lookup_codes(nib + k * width, width, g));
+      for (size_t k = 0; k < NP; ++k) sum[k] = hn::Add(sum[k], lookup_codes(nib + k * width, width, g));
     }
     for (uint32_t k = 0; k < NP; ++k) hn::StoreU(sum[k], d8, tsum + k * kTiles + i);
   }
@@ -845,6 +851,7 @@ class Pool {
     }
     {
       const std::lock_guard<std::mutex> lk(mu_);
+      // cppcheck-suppress danglingLifetime ; the captures outlive the job: run() returns once every thread is done
       job_ = std::move(fn);
       pending_.store(threads_ - 1);
       ++epoch_;
@@ -857,6 +864,7 @@ class Pool {
       std::unique_lock<std::mutex> lk(mu_);
       cv_done_.wait(lk, [&] { return pending_.load() == 0; });
     }
+    job_ = nullptr;  // every worker has returned from it; its captures live in the caller's frame
   }
 
   // Inside a job: wait until every thread of the job has arrived.  A spin, not a park: the threads
@@ -1012,11 +1020,11 @@ class Pass {
   // Block t of the alive packs, in tile order, cut only between cache lines of the tile-major
   // planes (4 tiles): the lazy binning then writes no line two threads share.
   void take_share(size_t t, size_t n_threads) {
-    uint16_t all[kPacks];
+    std::array<uint16_t, kPacks> all;
     size_t n = 0;
     for (size_t i = 0; i < n_threads; ++i) {
       const uint16_t* from = sh_.alive + (i * kUnits / n_threads) * (kUnit / kPack);
-      std::copy(from, from + sh_.n_alive[i], all + n);
+      std::copy(from, from + sh_.n_alive[i], all.begin() + n);
       n += sh_.n_alive[i];
     }
     auto cut = [&](size_t b) {
@@ -1024,7 +1032,7 @@ class Pass {
       return b;
     };
     const size_t b0 = cut(n * t / n_threads), b1 = cut(n * (t + 1) / n_threads);
-    active_.assign(all + b0, all + b1);
+    active_.assign(all.begin() + b0, all.begin() + b1);
   }
 
   // The trees of chunks [c0, c1) on the active packs.  Their per-tile work covers the units the
@@ -1096,7 +1104,7 @@ class Pass {
     }
     for (const uint16_t first : active_) {
       for (size_t tile = first; tile < first + kPack; ++tile) {
-        int32_t tile_code = tsum[tile];
+        int32_t tile_code = tsum[tile];  // NOLINT(misc-const-correctness): the NP == 2 term below
         if constexpr (NP == 2) tile_code += static_cast<int32_t>(tsum[kTiles + tile]) << 4;
         tacc[tile] += tile_code;
         if (!fine_trees) continue;
@@ -1295,7 +1303,7 @@ double time_it(Fn fn, int iters) {
   return ms[ms.size() / 2];
 }
 
-std::vector<Stage> parse_stages(const char* text, bool* ok) {
+[[maybe_unused]] std::vector<Stage> parse_stages(const char* text, bool* ok) {
   std::vector<Stage> stages;
   *ok = true;
   for (const char* q = text; *q;) {
@@ -1509,6 +1517,7 @@ int main(int argc, char** argv) {
   }
   // -- the same fixture as a host's maps: per side one cell-major block (a record of every
   // feature of that side per cell, as imfeat lays its levels out), read through sources --------
+  // cppcheck-suppress variableScope ; `sources` points into `blocks` for the rest of main
   std::vector<std::vector<float>> blocks(kMaxShift / 2 + 1);
   std::vector<fastdet_source> sources(model.n_features);
   {

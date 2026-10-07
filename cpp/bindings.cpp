@@ -66,17 +66,17 @@ class Scorer {
   // array feature_slot[f]; its side must be the slot's.  Set once, checked here, so a call
   // only checks each array's shape against its slot.
   void set_sources(const Int32Vector& slot_side, const Int32Vector& feature_slot, const Int32Vector& feature_index) {
-    const size_t n = n_features(), n_slots = slot_side.shape(0);
+    const size_t n = n_features(), slots = slot_side.shape(0);
     if (feature_slot.shape(0) != n || feature_index.shape(0) != n)
       throw std::invalid_argument("feature_slot and feature_index must have one entry per model feature (" +
                                   std::to_string(n) + ")");
-    std::vector<int32_t> sides(slot_side.data(), slot_side.data() + n_slots), max_index(n_slots, -1);
-    for (size_t s = 0; s < n_slots; ++s)
+    std::vector<int32_t> sides(slot_side.data(), slot_side.data() + slots), max_index(slots, -1);
+    for (size_t s = 0; s < slots; ++s)
       if (sides[s] < 1 || sides[s] > 64 || (sides[s] & (sides[s] - 1)))
         throw std::invalid_argument("slot " + std::to_string(s) + ": side must be 64, 32, ..., 1");
     for (size_t f = 0; f < n; ++f) {
       const int32_t s = feature_slot.data()[f], i = feature_index.data()[f];
-      if (s < 0 || static_cast<size_t>(s) >= n_slots || i < 0)
+      if (s < 0 || static_cast<size_t>(s) >= slots || i < 0)
         throw std::invalid_argument("feature " + std::to_string(f) + ": slot or index out of range");
       if (sides[static_cast<size_t>(s)] != side_[f])
         throw std::invalid_argument("feature " + std::to_string(f) + " is a side-" + std::to_string(side_[f]) +
@@ -88,7 +88,7 @@ class Scorer {
     slot_max_index_ = std::move(max_index);
     feature_slot_.assign(feature_slot.data(), feature_slot.data() + n);
     feature_index_.assign(feature_index.data(), feature_index.data() + n);
-    banks_.assign(n_slots, Bank{});
+    banks_.assign(slots, Bank{});
     after_jobs_.assign(n, 0);
   }
 
@@ -98,9 +98,9 @@ class Scorer {
   // every call, planes 0 and 1 (the cell coordinates) are the caller's to fill once.  The
   // slot's features index the planes.  score_maps then takes None for the slot.
   void set_bank_slot(size_t slot, size_t raw_slot, size_t column, const BankBuffer& buffer) {
-    const size_t n_slots = this->n_slots();
-    if (n_slots == 0) throw std::runtime_error("set_sources() first");
-    if (slot >= n_slots || raw_slot >= n_slots || raw_slot == slot)
+    const size_t slots = n_slots();
+    if (slots == 0) throw std::runtime_error("set_sources() first");
+    if (slot >= slots || raw_slot >= slots || raw_slot == slot)
       throw std::invalid_argument("set_bank_slot: slot and raw_slot must be distinct slots of set_sources");
     const int64_t side = slot_side_[slot];
     if (slot_side_[raw_slot] != side)
@@ -121,19 +121,19 @@ class Scorer {
   // Probabilities from the host's arrays, one per slot of set_sources, read where they lie: the
   // same bytes as score() on the packed matrix of the same values, and no packed copy.
   nb::ndarray<nb::numpy, float, nb::ndim<1>> score_maps(const nb::sequence& arrays, bool use_exit) {
-    const size_t n_slots = this->n_slots();
-    if (n_slots == 0) throw std::runtime_error("set_sources() first: the scorer does not know the arrays' layout");
-    if (nb::len(arrays) != n_slots)
-      throw std::invalid_argument("expected " + std::to_string(n_slots) + " arrays, got " +
+    const size_t slots = n_slots();
+    if (slots == 0) throw std::runtime_error("set_sources() first: the scorer does not know the arrays' layout");
+    if (nb::len(arrays) != slots)
+      throw std::invalid_argument("expected " + std::to_string(slots) + " arrays, got " +
                                   std::to_string(nb::len(arrays)));
     struct View {
       const float* data;
       int64_t row, col, feature;  // strides, in floats
     };
-    std::vector<View> views(n_slots);
+    std::vector<View> views(slots);
     std::vector<AnyFloat> keep;  // the arrays stay alive (and their buffers) until the pass is over
-    keep.reserve(n_slots);
-    for (size_t s = 0; s < n_slots; ++s) {
+    keep.reserve(slots);
+    for (size_t s = 0; s < slots; ++s) {
       const int64_t side = slot_side_[s], last = slot_max_index_[s];
       if (banks_[s].set) {  // the scorer's own buffer: its planes are the features
         if (!arrays[s].is_none())
@@ -179,7 +179,7 @@ class Scorer {
     }
     // the banks the pass computes first, from the raw slots' arrays as given this call
     std::vector<fastdet_bank_job> jobs;
-    for (size_t s = 0; s < n_slots; ++s) {
+    for (size_t s = 0; s < slots; ++s) {
       const Bank& bank = banks_[s];
       if (!bank.set) continue;
       const View& raw = views[bank.raw_slot];
@@ -199,7 +199,7 @@ class Scorer {
   nb::ndarray<nb::numpy, float, nb::ndim<1>> run(Fn fn) {
     const size_t n = cells();
     float* out = new float[n];
-    nb::capsule owner(out, [](void* p) noexcept { delete[] static_cast<float*>(p); });
+    const nb::capsule owner(out, [](void* p) noexcept { delete[] static_cast<float*>(p); });
     int status = 0;
     {
       const nb::gil_scoped_release nogil;
