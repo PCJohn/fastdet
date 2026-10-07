@@ -500,7 +500,10 @@ Symmetric trees turn scoring into independent work, which the runtime exploits:
 - the binner is fused over coarse cells because the design matrix repeats
   coarse-level columns about 4.3×.
 
-The layered optimizations and their measurements are in research report §3.8.
+The layered optimizations and their measurements are in research report §3.8 for the
+modelling phase and in [docs/OPTIMIZATION.md](docs/OPTIMIZATION.md) for the engineering
+since (the in-process scorer, threads, the front end shared with framegate, the banks and
+the maps read in place, what was tried and dropped, and the settings to run with).
 The approach follows Aggregated Channel Features (see
 [Piotr Dollár's toolbox](https://pdollar.github.io/toolbox/)).
 
@@ -604,13 +607,18 @@ The fit is dominated by CatBoost on the training matrix (`n_cells x n_features`
 float32: 6.7 M cells x 1178 columns is 32 GiB). What the pipeline does about it, and
 the knobs that matter:
 
-* **The matrix is quantised once and released.** `fit()` builds one CatBoost `Pool`,
-  quantises it to `border_count` bins (4 bits per value) and drops the float matrix;
-  every stage and chunk of the fit reuses it. Peak memory is roughly the float
-  matrix plus a quarter, for the moment the pool is built. `fit()` prints the
-  matrix size; above 8 GiB it also prints the knobs below. A "CatBoost is using
-  more CPU RAM than the limit" warning means the machine is swapping: shrink the
-  matrix.
+* **The matrix is quantised once.** `fit()` builds one CatBoost `Pool` and quantises it
+  to `border_count` bins (one byte per value); every stage and chunk of the fit reuses
+  it. Measured on a 100k × 5252 float32 matrix: `Pool()` copies the C-ordered matrix into
+  its own storage (+1.0× the matrix, 6 s), the quantisation adds 0.30×, and CatBoost keeps
+  the matrix for as long as the pool lives, so a fit peaks at about **2.3× the float
+  matrix** and holds 1.3× for the rest of the fit (1 M cells × 1178 columns: 4.4 GiB of
+  matrix, about 10 GiB at the peak). `fit()` prints the matrix size; above 8 GiB it also
+  prints the knobs below. A "CatBoost is using more CPU RAM than the limit" warning means
+  the machine is swapping: shrink the matrix. Nothing touches the GPU until that CPU-side
+  quantisation is done, which takes minutes for a matrix of tens of GiB.
+  ([docs/OPTIMIZATION.md](docs/OPTIMIZATION.md) has the measurements and the Fortran-order
+  layout that would halve the peak.)
 * **Fewer cells** (`TrainConfig`): `neg_pos_ratio=3` keeps three negatives per
   positive (about a quarter of the cells at a 7% positive rate), `max_train_cells`
   caps the total; both are sweepable (`fastdet-tune --neg-pos-ratio none,3,5`), and
@@ -749,4 +757,5 @@ fastdet/
   src/fastdet/data/          # bundled frozen feature ranking
   tests/                     # end-to-end round-trip + C++ runtime gate
   research_report.md         # full research log and negative results
+  docs/OPTIMIZATION.md       # the latency engineering log: what worked, what did not
 ```
