@@ -639,8 +639,12 @@ the knobs that matter:
   one-matrix (`block_gib=0`) run before relying on it.
 * **Fewer cells** (`TrainConfig`): `neg_pos_ratio=3` keeps three negatives per
   positive (about a quarter of the cells at a 7% positive rate), `max_train_cells`
-  caps the total; both are sweepable (`fastdet-tune --neg-pos-ratio none,3,5`), and
-  `scale_pos_weight` re-weights positives without discarding data.
+  caps the total (no cap by default: blocks handle memory, so the cap only saves training
+  time); the sampler prints how many cells each left out. Both are sweepable
+  (`fastdet-tune --neg-pos-ratio none,3,5`), and `scale_pos_weight` re-weights positives
+  without discarding data. `neg_pos_ratio=5` stays the default on quality grounds (the
+  trends table below: `none` measured worse at a fixed cell budget); whether that holds
+  with no budget is worth one re-sweep on your data.
 * **GPU** (`ModelConfig.task_type="GPU"`): CatBoost trains on any CUDA GPU its wheel
   can see (Windows and Linux, no toolkit install), several times faster on millions
   of cells; the quantised pool must fit in GPU memory (4 bits per value: 6.7 M x 1178
@@ -713,7 +717,7 @@ them with their current defaults). The ones worth sweeping:
 | `--gt-cell-thresh` | 0.10 | mask coverage at which a cell is a positive |
 | `--val-frac`, `--split-seed`, `--max-hamming` | 0.15, 42, 8 | held-out share of near-duplicate groups, the split seed, the perceptual-hash distance that makes two images a group |
 | `--neg-pos-ratio` | 5 | negatives kept per positive in the training sample (`none` keeps all); rebalances the classes by discarding negatives, which shifts the probability scale (use `thr*`) |
-| `--max-train-cells` | 1,000,000 | cap on sampled training cells (RAM: ~4.4 GiB per million cells as float32 before quantisation) |
+| `--max-train-cells` | none | cap on sampled training cells, applied after `--neg-pos-ratio`; was 1,000,000 when the matrix had to fit in RAM (~4.4 GiB per million cells as float32), which `--block-gib` now handles, so it only trades cells for training time; the fit prints what either knob left out |
 | `--block-gib` | none (auto) | out-of-core fit: largest float32 block of cells in memory at once, in GiB; `none` sizes it from the free host (and GPU) memory when the fit starts, `0` never blocks (see Training time and memory) |
 
 ### Trends on an OCR dataset (1,925 images, 6.8% positive cells)

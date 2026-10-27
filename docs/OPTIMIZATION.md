@@ -343,8 +343,8 @@ Training:
   (`block_gib=None`) `fit()` sizes the matrix it holds at once from the memory free when it
   starts and, when the cells do not fit, trains in equal random blocks with the trees spread
   over them (`training.fit_booster_blocks`; the README's "Training time and memory" has the
-  rules), so `max_train_cells` and `neg_pos_ratio` now trade training time for memory rather
-  than cells for memory; the fit records `train_blocks` in the artifact, and a blocked fit is
+  rules), so `max_train_cells` (no cap by default now) and `neg_pos_ratio` trade cells for
+  training time rather than for memory; the fit records `train_blocks` in the artifact, and a blocked fit is
   worth checking against a one-matrix one (`block_gib=0`) on a sample.
 * `task_type="GPU"` trains several times faster on millions of cells, but nothing touches
   the GPU until CatBoost's CPU-side quantisation of the matrix (or of the first block) is

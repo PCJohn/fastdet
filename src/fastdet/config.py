@@ -176,7 +176,10 @@ class TrainConfig:
     neg_pos_ratio: float | None = (
         5.0  # Negatives kept per positive in the training sample; None = all.
     )
-    max_train_cells: int | None = 1_000_000  # Cap on sampled training cells; None = no cap.
+    # Cap on sampled training cells; None = no cap.  It was 1_000_000 when the whole matrix had
+    # to fit in RAM; block_gib (below) handles memory now, so the cap only trades cells for
+    # training time.  The sampler prints what either knob left out.
+    max_train_cells: int | None = None
     # Out-of-core fit: the float32 training matrix is fitted in equal random blocks of at most
     # this many GiB, one in memory at a time, with the trees spread over the blocks
     # (training.fit_booster_blocks).  Peak RAM is about 2.3x one block, whatever the cell count,

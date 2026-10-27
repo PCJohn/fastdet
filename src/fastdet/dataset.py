@@ -274,9 +274,19 @@ def sample_training_cells(
 
     perm = rng.permutation(len(img_ids))
     img_ids, local_ids, labels = img_ids[perm], local_ids[perm], labels[perm]
+    total = n_pos_total + n_neg_total
+    dropped = (
+        ""
+        if len(labels) == total
+        else (
+            f" of {total:,} ({n_pos_total - n_pos:,} positives and {n_neg_total - n_neg:,} "
+            f"negatives left out: neg_pos_ratio={cfg.neg_pos_ratio}, "
+            f"max_train_cells={cfg.max_train_cells}; None keeps all)"
+        )
+    )
     print(
         f"  [{desc}] sampled cells={len(labels):,} positive={int(labels.sum()):,} "
-        f"({100.0 * labels.mean():.2f}%)"
+        f"({100.0 * labels.mean():.2f}%){dropped}"
     )
     return img_ids, local_ids, labels
 
