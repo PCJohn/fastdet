@@ -338,12 +338,19 @@ Training:
 * Keep `feature_mode` at its default (`raw_plus_global_context_ext`, 1178 columns).
 * Memory: a fit holds about 2.3× the float32 design matrix at its peak as the tree stands
   (CatBoost copies the C-ordered matrix, then quantises it) and 1.3× for the rest of the
-  fit; `max_train_cells` and `neg_pos_ratio` are the knobs (1 M cells × 1178 columns is
-  4.4 GiB of matrix, so about 10 GiB at the peak). A "CatBoost is using more CPU RAM than
-  the limit" warning means paging.
+  fit (1 M cells × 1178 columns is 4.4 GiB of matrix, so about 10 GiB at the peak). A
+  "CatBoost is using more CPU RAM than the limit" warning means paging. By default
+  (`block_gib=None`) `fit()` sizes the matrix it holds at once from the memory free when it
+  starts and, when the cells do not fit, trains in equal random blocks with the trees spread
+  over them (`training.fit_booster_blocks`; the README's "Training time and memory" has the
+  rules), so `max_train_cells` and `neg_pos_ratio` now trade training time for memory rather
+  than cells for memory; the fit records `train_blocks` in the artifact, and a blocked fit is
+  worth checking against a one-matrix one (`block_gib=0`) on a sample.
 * `task_type="GPU"` trains several times faster on millions of cells, but nothing touches
-  the GPU until CatBoost's CPU-side quantisation of the whole matrix is done — minutes for a
-  20 GiB matrix — so an idle `nvidia-smi` early in a fit is normal.
+  the GPU until CatBoost's CPU-side quantisation of the matrix (or of the first block) is
+  done — minutes for a 20 GiB matrix — so an idle `nvidia-smi` early in a fit is normal.
+  The auto block size also reads `nvidia-smi` (the card `CUDA_VISIBLE_DEVICES` gives
+  CatBoost's device 0) and keeps the quantised pool to 40% of the card's free memory.
 * `quantisation_aware=False` is the fast path for 8-bit leaves (one fit per stage instead
   of 63 chunks); keep it on for 4-bit leaves.
 

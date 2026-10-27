@@ -177,6 +177,17 @@ class TrainConfig:
         5.0  # Negatives kept per positive in the training sample; None = all.
     )
     max_train_cells: int | None = 1_000_000  # Cap on sampled training cells; None = no cap.
+    # Out-of-core fit: the float32 training matrix is fitted in equal random blocks of at most
+    # this many GiB, one in memory at a time, with the trees spread over the blocks
+    # (training.fit_booster_blocks).  Peak RAM is about 2.3x one block, whatever the cell count,
+    # so `neg_pos_ratio=None, max_train_cells=None` (every cell) fits in memory.
+    #   None (default) = decide from the memory that is free when the fit starts: host RAM, and
+    #                    the GPU's when task_type is GPU; one matrix when it fits, blocks if not.
+    #   0              = never block: one matrix, one fit (can run out of memory).
+    #   > 0            = this block size in GiB.
+    # Every block must start at least one chunk of leaf_chunk trees or the fit is refused (a
+    # block no chunk starts in is never seen); the fit records train_blocks in the artifact.
+    block_gib: float | None = None
 
     def __post_init__(self) -> None:
         """Normalize multi-valued fields and validate the front-end knobs."""
@@ -207,6 +218,13 @@ class TrainConfig:
             raise ValueError(msg)
         if not 0.0 < self.val_frac < 1.0:
             msg = "val_frac must be in (0, 1)"
+            raise ValueError(msg)
+        self._validate_sampling()
+
+    def _validate_sampling(self) -> None:
+        """Check the sampling and out-of-core knobs."""
+        if self.block_gib is not None and self.block_gib < 0.0:
+            msg = "block_gib must be >= 0 (0 = never block, None = size blocks from free memory)"
             raise ValueError(msg)
 
 

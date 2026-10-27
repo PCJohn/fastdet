@@ -4,6 +4,11 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -13,7 +18,7 @@ from catboost import CatBoostClassifier
 from numpy.typing import NDArray  # noqa: TC002 -- used in dataclass field annotations at runtime
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Callable, Mapping, Sequence
 
     from catboost import Pool
 
@@ -21,16 +26,24 @@ if TYPE_CHECKING:
 
 __all__ = [
     "LeafGrid",
+    "auto_block_gib",
+    "bin_bits",
     "build_ranking",
     "calibrate_exit_stages",
+    "cuda_device_id",
     "default_feature_ranks_path",
     "fit_booster",
+    "fit_booster_blocks",
+    "gpu_free_gib",
+    "host_available_gib",
     "leaf_grid",
     "load_ranking",
+    "plan_blocks",
     "quantise_leaves",
     "resolve_task_type",
     "select_columns",
     "stage_tree_counts",
+    "unused_blocks",
 ]
 
 _DATA_DIR = Path(__file__).resolve().parent / "data"
@@ -217,22 +230,362 @@ def make_pool(
     features: NDArray[np.floating],
     labels: NDArray[np.bool_] | NDArray[np.integer[Any]],
     model_cfg: ModelConfig,
+    input_borders: str | Path | None = None,
 ) -> Pool:
     """The training set as a CatBoost ``Pool`` quantised once (``border_count`` cuts per column).
 
     Quantising up front turns the ``n_cells x n_features`` float32 matrix into 4-bit
     bins, so the float matrix can be released and every stage and chunk of the fit
     skips its own border search; the borders are the same the fit would find.
+    ``input_borders`` (a file from ``Pool.save_quantization_borders``) quantises with
+    those cut points instead of searching for new ones.
     """
     from catboost import Pool  # noqa: PLC0415 -- optional heavy import
 
     pool = Pool(features, labels)
-    pool.quantize(border_count=int(model_cfg.border_count))
+    if input_borders is None:
+        pool.quantize(border_count=int(model_cfg.border_count))
+    else:
+        pool.quantize(border_count=int(model_cfg.border_count), input_borders=str(input_borders))
     return pool
 
 
+def plan_blocks(n_cells: int, width: int, block_gib: float | None) -> int:
+    """Blocks needed to keep each block's float32 matrix within ``block_gib`` GiB (1 = no blocking)."""
+    if block_gib is None or block_gib <= 0.0 or n_cells <= 0:
+        return 1
+    gib = n_cells * width * 4 / 2**30
+    return max(1, math.ceil(gib / block_gib))
+
+
+# -- sizing blocks from the memory that is free right now ---------------------------------------
+# Peak host RAM while a pool is built, in float32 matrices: the matrix, CatBoost's Pool copy of
+# it (+1.0x) and the bins (+0.3x), measured in README "Training time and memory".  If the
+# Fortran-order layout docs/OPTIMIZATION.md describes lands, halve this.
+_HOST_PEAK = 2.3
+_HOST_USE = 0.8  # share of the free host RAM a fit may plan on
+_GPU_USE = 0.4  # share of the free GPU memory the quantised pool may take (rest: histograms etc.)
+_FLOAT32_BITS = 32
+_NVIDIA_SMI_WINDOWS = (  # where the driver puts nvidia-smi.exe when it is not on PATH
+    ("SystemRoot", r"System32\nvidia-smi.exe"),
+    ("ProgramFiles", r"NVIDIA Corporation\NVSMI\nvidia-smi.exe"),
+)
+
+
+def bin_bits(border_count: int) -> int:
+    """Bits CatBoost's quantised pool spends per value for ``border_count`` cuts (15 -> 4)."""
+    return max(1, math.ceil(math.log2(border_count + 1)))
+
+
+def _cgroup_headroom_gib(limit_file: str, used_file: str) -> float | None:
+    """Headroom under one cgroup memory limit, or ``None`` if there is none (or no cgroup)."""
+    try:
+        limit = Path(limit_file).read_text(encoding="ascii").strip()
+        used = int(Path(used_file).read_text(encoding="ascii").strip())
+        if limit == "max" or int(limit) >= 1 << 60:
+            return None
+        return max(0.0, (int(limit) - used) / 2**30)
+    except (OSError, ValueError):
+        return None
+
+
+def _cgroup_available_gib() -> float | None:
+    """Headroom under a container's memory limit (cgroup v2, then v1), or ``None`` if unlimited."""
+    v2 = _cgroup_headroom_gib("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory.current")
+    v1 = _cgroup_headroom_gib(
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes", "/sys/fs/cgroup/memory/memory.usage_in_bytes"
+    )
+    found = [v for v in (v2, v1) if v is not None]
+    return min(found) if found else None
+
+
+def _meminfo_available_gib() -> float | None:
+    """Linux: the kernel's ``MemAvailable`` estimate from ``/proc/meminfo``."""
+    try:
+        for line in Path("/proc/meminfo").read_text(encoding="ascii").splitlines():
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) / 2**20  # kB -> GiB
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def _sysconf_available_gib() -> float | None:
+    """POSIX: free physical pages (Linux without ``/proc``, the BSDs; not macOS)."""
+    try:
+        return os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") / 2**30
+    except (AttributeError, ValueError, OSError):
+        return None
+
+
+def _vm_stat_available_gib() -> float | None:
+    """macOS: free + inactive + speculative pages from ``vm_stat`` (there is no MemAvailable)."""
+    exe = shutil.which("vm_stat")
+    if exe is None:
+        return None
+    try:
+        out = subprocess.run(  # noqa: S603 -- fixed arguments, no shell
+            [exe], capture_output=True, text=True, timeout=15, check=False
+        ).stdout
+        header, *lines = out.splitlines()
+        page = int(header.split("page size of")[1].split()[0])
+        pages = 0
+        for line in lines:
+            key, _, value = line.partition(":")
+            if key.strip() in {"Pages free", "Pages inactive", "Pages speculative"}:
+                pages += int(value.strip().rstrip("."))
+        return pages * page / 2**30
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+        return None
+
+
+def _windows_available_gib() -> float | None:  # pragma: no cover -- Windows only
+    """Windows: ``ullAvailPhys`` from ``GlobalMemoryStatusEx``."""
+    import ctypes  # noqa: PLC0415 -- Windows only
+
+    class _MemStatus(ctypes.Structure):
+        _fields_ = (
+            ("length", ctypes.c_ulong),
+            ("load", ctypes.c_ulong),
+            ("total_phys", ctypes.c_ulonglong),
+            ("avail_phys", ctypes.c_ulonglong),
+            ("total_page", ctypes.c_ulonglong),
+            ("avail_page", ctypes.c_ulonglong),
+            ("total_virtual", ctypes.c_ulonglong),
+            ("avail_virtual", ctypes.c_ulonglong),
+            ("avail_extended", ctypes.c_ulonglong),
+        )
+
+    status = _MemStatus()
+    status.length = ctypes.sizeof(_MemStatus)
+    kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+    if not kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+        return None
+    return float(status.avail_phys) / 2**30
+
+
+def host_available_gib() -> float | None:
+    """GiB of host RAM a process can still take right now, or ``None`` if it cannot be read.
+
+    The smaller of the OS's "available" figure (Linux ``/proc/meminfo``, else free pages from
+    ``sysconf``, macOS ``vm_stat``, Windows ``GlobalMemoryStatusEx``) and the headroom under a
+    container (cgroup) limit.
+    """
+    available: float | None = None
+    if sys.platform == "win32":  # pragma: no cover -- Windows only
+        available = _windows_available_gib()
+    elif sys.platform == "darwin":  # pragma: no cover -- macOS only
+        available = _vm_stat_available_gib()
+    else:
+        available = _meminfo_available_gib()
+        if available is None:
+            available = _sysconf_available_gib()
+    capped = _cgroup_available_gib()
+    if available is None:
+        return capped
+    return available if capped is None else min(available, capped)
+
+
+def _nvidia_smi() -> str | None:
+    """Path of ``nvidia-smi``: on PATH, else where the Windows driver installs it."""
+    exe = shutil.which("nvidia-smi")
+    if exe is None and sys.platform == "win32":  # pragma: no cover -- Windows only
+        for var, tail in _NVIDIA_SMI_WINDOWS:
+            root = os.environ.get(var)
+            if root and (Path(root) / tail).is_file():
+                return str(Path(root) / tail)
+    return exe
+
+
+def cuda_device_id(device: int = 0, visible: str | None = None) -> str:
+    """What ``nvidia-smi -i`` should be given for CUDA device ``device``.
+
+    CatBoost numbers devices the way CUDA does, after ``CUDA_VISIBLE_DEVICES`` (``visible``,
+    read from the environment when ``None``) has been applied; ``nvidia-smi`` numbers the
+    physical GPUs.  The entry is an index or a ``GPU-``/``MIG-`` UUID, both of which
+    ``nvidia-smi -i`` accepts.
+    """
+    if visible is None:
+        visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if visible is None or not visible.strip():
+        return str(device)
+    entries = [e.strip() for e in visible.split(",") if e.strip()]
+    if device >= len(entries):
+        return str(device)  # CUDA would see no such device; let nvidia-smi say so
+    return entries[device]
+
+
+def gpu_free_gib(device: int = 0) -> float | None:
+    """GiB of free memory on CUDA device ``device`` right now (``nvidia-smi``), or ``None``."""
+    exe = _nvidia_smi()
+    if exe is None:
+        return None
+    try:
+        out = subprocess.run(  # noqa: S603 -- fixed arguments, no shell
+            [
+                exe,
+                "--query-gpu=memory.free",
+                "--format=csv,noheader,nounits",
+                "-i",
+                cuda_device_id(device),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        return float(out.stdout.strip().splitlines()[0]) / 1024  # MiB -> GiB
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+        return None
+
+
+def auto_block_gib(
+    host_gib: float | None, gpu_gib: float | None, *, gpu_bits: int = 4
+) -> tuple[float | None, str]:
+    """Largest float32 block (GiB) the free memory allows, and why; ``None`` = nothing to go on.
+
+    Host RAM: building a pool peaks at ``_HOST_PEAK`` times its float32 matrix, so a block may be
+    ``_HOST_USE * host_gib / _HOST_PEAK``.  GPU (when training on it): the quantised pool,
+    ``gpu_bits`` a value (:func:`bin_bits` of ``border_count``), may take ``_GPU_USE`` of the
+    free GPU memory.  The smaller bound wins.
+    """
+    bounds: list[tuple[float, str]] = []
+    if host_gib is not None:
+        limit = _HOST_USE * host_gib / _HOST_PEAK
+        bounds.append((limit, f"{host_gib:.1f} GiB host RAM free -> blocks <= {limit:.1f} GiB"))
+    if gpu_gib is not None:
+        limit = _GPU_USE * gpu_gib * _FLOAT32_BITS / gpu_bits
+        bounds.append((limit, f"{gpu_gib:.1f} GiB GPU memory free -> blocks <= {limit:.1f} GiB"))
+    if not bounds:
+        return None, "free memory could not be read"
+    best = min(bounds, key=lambda b: b[0])
+    return best[0], "; ".join(why for _, why in bounds)
+
+
+def unused_blocks(model_cfg: ModelConfig, n_blocks: int) -> int:
+    """Blocks of ``n_blocks`` that no chunk of the fit would start in (their cells go unused).
+
+    The trees are laid out evenly over the blocks and a chunk is fitted on the block its
+    first tree falls in (see :class:`_PoolFeed`), so a block narrower than a chunk can be
+    skipped.  Chunks are ``leaf_chunk`` trees, restarting at the coarse/fine boundary, when
+    the fit is quantisation-aware; otherwise one per block, so every block is used as long as
+    it holds a tree.
+    """
+    n_trees = model_cfg.n_trees
+    if n_blocks <= 1 or n_trees <= 0:
+        return 0
+    layout = _PoolFeed(n_blocks=n_blocks, total_trees=n_trees)
+    if not model_cfg.quantisation_aware:
+        return max(0, n_blocks - n_trees)
+    coarse = model_cfg.coarse_trees if model_cfg.coarse_trees < n_trees else 0
+    starts = {
+        *range(0, coarse, model_cfg.leaf_chunk),
+        *range(coarse, n_trees, model_cfg.leaf_chunk),
+    }
+    return n_blocks - len({layout.block_of(s) for s in starts})
+
+
+class _PoolFeed:
+    """The pool boosting trains on, and (optionally) the blocks of cells it moves through.
+
+    *Fixed* (``_PoolFeed(pool)``): one quantised pool for the whole fit, as ``fit_booster``
+    has always done.
+
+    *Blocked* (``_PoolFeed(provider=..., ...)``): the cells arrive in ``n_blocks`` blocks and
+    block ``b`` serves the chunks that start at tree ``b * total_trees // n_blocks`` on, so the
+    float matrix of only one block exists at a time and the whole training set is never in
+    memory.  Every block is quantised with the cut points of the first, so all the trees share
+    one set of ``border_count`` borders per column (the export format has a 4-bit bin).  A
+    block is a fresh sample, so it starts from the score of every tree fitted so far (the
+    quantised leaves, when ``bits`` is set) as its CatBoost baseline: the trees of the next
+    block fit what the earlier ones have not explained, on cells they never saw.
+    """
+
+    def __init__(  # noqa: PLR0913 -- one fixed-pool argument plus the blocked-mode settings
+        self,
+        pool: Pool | None = None,
+        *,
+        provider: Callable[[int], tuple[NDArray[np.floating], NDArray[np.bool_]]] | None = None,
+        n_blocks: int = 1,
+        total_trees: int = 0,
+        model_cfg: ModelConfig | None = None,
+        borders: Path | None = None,
+    ) -> None:
+        """Hold ``pool`` (fixed), or build blocks on demand from ``provider`` (blocked)."""
+        self._pool = pool
+        self.provider = provider
+        self.n_blocks = n_blocks
+        self.total_trees = total_trees
+        self.model_cfg = model_cfg
+        self.borders = borders
+        self.block = -1
+        self.history: list[tuple[CatBoostClassifier, NDArray[np.float64]]] = []
+
+    @property
+    def blocked(self) -> bool:
+        """Whether the cells arrive block by block."""
+        return self.provider is not None
+
+    @property
+    def pool(self) -> Pool:
+        """The pool of the current block (the only pool, when fixed)."""
+        if self._pool is None:
+            msg = "no block is loaded yet"
+            raise RuntimeError(msg)
+        return self._pool
+
+    def block_of(self, tree: int) -> int:
+        """The block that serves a chunk starting at global tree index ``tree``."""
+        return min(self.n_blocks - 1, tree * self.n_blocks // max(self.total_trees, 1))
+
+    def trees_left(self, tree: int) -> int:
+        """Trees from ``tree`` to the end of its block (unbounded when fixed)."""
+        if not self.blocked:
+            return 1 << 62
+        following = self.block_of(tree) + 1
+        if following >= self.n_blocks:
+            return self.total_trees - tree
+        return -(-following * self.total_trees // self.n_blocks) - tree
+
+    def start_stage(self, score: NDArray[np.float64]) -> None:
+        """Put the running score on the pool as its baseline (a blocked feed does so on load)."""
+        if not self.blocked:
+            self.pool.set_baseline(np.asarray(score, dtype=np.float64).reshape(-1, 1))
+
+    def advance(self, tree: int, score: NDArray[np.float64]) -> NDArray[np.float64]:
+        """Make the pool current for a chunk starting at ``tree``; return the score on its cells."""
+        block = self.block_of(tree)
+        if not self.blocked or block == self.block:
+            return score
+        assert self.provider is not None  # noqa: S101 -- narrows the type; blocked implies it
+        assert self.model_cfg is not None  # noqa: S101
+        self._pool = None  # free the last block (float copy and bins) before the next is built
+        features, labels = self.provider(block)
+        first = self.block < 0
+        pool = make_pool(
+            features, labels, self.model_cfg, input_borders=None if first else self.borders
+        )
+        del features
+        if first and self.borders is not None:
+            pool.save_quantization_borders(str(self.borders))
+        self._pool, self.block = pool, block
+        score = np.zeros(pool.num_row(), dtype=np.float64)
+        for model, table in self.history:
+            size = table.shape[0]
+            indexes = model.calc_leaf_indexes(pool)
+            scale, bias = model.get_scale_and_bias()
+            score += scale * table[np.arange(size)[None, :], indexes].sum(axis=1) + bias
+        pool.set_baseline(score.reshape(-1, 1))
+        return score
+
+    def record(self, model: CatBoostClassifier, table: NDArray[np.float64]) -> None:
+        """Remember a fitted chunk and its leaves so the next block can be scored with them."""
+        if self.blocked:
+            self.history.append((model, table))
+
+
 def _fit_stage(  # noqa: PLR0913 -- a private helper with one call site per stage
-    pool: Pool,
+    feed: _PoolFeed,
     params: Mapping[str, Any],
     *,
     n_trees: int,
@@ -240,6 +593,7 @@ def _fit_stage(  # noqa: PLR0913 -- a private helper with one call site per stag
     bits: int | None,
     running: NDArray[np.float64],
     ignored: list[int] | None,
+    first_tree: int = 0,
 ) -> tuple[list[CatBoostClassifier], NDArray[np.float64]]:
     """Fit ``n_trees`` on top of ``running``; return the models and the new score.
 
@@ -248,47 +602,39 @@ def _fit_stage(  # noqa: PLR0913 -- a private helper with one call site per stag
     -- and correct -- the rounding of earlier ones.  The grid is the one
     :func:`leaf_grid` builds for this stage on export (chunks counted from the
     stage's first tree), so the fitted model is the shipped model.  Without
-    ``bits`` the stage is one fit.  ``ignored`` hides feature columns from this
-    stage (resolution tiering).
+    ``bits`` the stage is one fit (one per block, when the feed is blocked).
+    ``ignored`` hides feature columns from this stage (resolution tiering).
+    ``first_tree`` is the stage's first tree among all the model's, which the blocks
+    are laid out over.
     """
     stage = dict(params)
     if ignored:
         stage["ignored_features"] = list(ignored)
-    step = chunk if bits is not None else n_trees
     models: list[CatBoostClassifier] = []
     score = running
-    pool.set_baseline(np.asarray(score, dtype=np.float64).reshape(-1, 1))
-    for start in range(0, n_trees, step):
-        size = min(step, n_trees - start)
+    feed.start_stage(score)
+    start = 0
+    while start < n_trees:
+        tree = first_tree + start
+        score = feed.advance(tree, score)
+        size = min(n_trees - start, chunk if bits is not None else feed.trees_left(tree))
         fitted = CatBoostClassifier(iterations=size, boost_from_average=False, **stage)
-        fitted.fit(pool)
+        fitted.fit(feed.pool)
         table = _leaf_table(fitted, size)
         if bits is not None:
             table = quantise_leaves(table, bits, chunk)
-        indexes = fitted.calc_leaf_indexes(pool)
+        indexes = fitted.calc_leaf_indexes(feed.pool)
         scale, bias = fitted.get_scale_and_bias()
         score = score + scale * table[np.arange(size)[None, :], indexes].sum(axis=1) + bias
-        pool.set_baseline(np.asarray(score, dtype=np.float64).reshape(-1, 1))
+        feed.pool.set_baseline(np.asarray(score, dtype=np.float64).reshape(-1, 1))
+        feed.record(fitted, table)
         models.append(fitted)
+        start += size
     return models, score
 
 
-def fit_booster(
-    features: NDArray[np.floating],
-    labels: NDArray[np.bool_] | NDArray[np.integer[Any]],
-    model_cfg: ModelConfig,
-    feature_sides: list[int] | None = None,
-) -> CatBoostClassifier:
-    """Fit the frozen symmetric CatBoost booster and return it.
-
-    Three knobs change how the trees are grown, and they compose:
-
-    * ``quantisation_aware`` fits in chunks against the quantised running score,
-      so the model is trained for the leaf grid the exporter writes;
-    * ``coarse_trees`` grows the first trees on tile-constant features only
-      (``feature_sides`` says which), leaving the rest to the fine stage;
-    * neither set, a single ordinary fit -- unchanged from before.
-    """
+def _booster_params(model_cfg: ModelConfig) -> dict[str, Any]:
+    """The CatBoost parameters every fit of the frozen booster shares."""
     params: dict[str, Any] = {
         "loss_function": model_cfg.loss_function,
         "depth": model_cfg.depth,
@@ -308,19 +654,23 @@ def fit_booster(
     }
     if params["task_type"] == "GPU":
         params["devices"] = "0"
-    bits = model_cfg.leaf_bits if model_cfg.quantisation_aware else None
-    coarse_trees = model_cfg.coarse_trees if model_cfg.coarse_trees < model_cfg.n_trees else 0
-    pool = make_pool(features, labels, model_cfg)
-    del features  # the quantised pool is the training set from here on (4 bits per value)
-    if bits is None and not coarse_trees:
-        booster = CatBoostClassifier(iterations=model_cfg.n_trees, **params)
-        booster.fit(pool)
-        return booster
+    return params
 
+
+def _fit_tiers(
+    feed: _PoolFeed,
+    params: Mapping[str, Any],
+    model_cfg: ModelConfig,
+    feature_sides: list[int] | None,
+    n_cells: int,
+) -> CatBoostClassifier:
+    """Fit the coarse then the fine stage on ``feed`` and return the summed booster."""
     from catboost import sum_models  # noqa: PLC0415 -- optional heavy import
 
+    bits = model_cfg.leaf_bits if model_cfg.quantisation_aware else None
+    coarse_trees = model_cfg.coarse_trees if model_cfg.coarse_trees < model_cfg.n_trees else 0
     models: list[CatBoostClassifier] = []
-    score = np.zeros(len(labels), dtype=np.float64)
+    score = np.zeros(n_cells, dtype=np.float64)
     if coarse_trees:
         if feature_sides is None:
             msg = "coarse_trees needs feature_sides (the pyramid side of each column)"
@@ -330,7 +680,7 @@ def fit_booster(
             msg = f"no column has side <= coarse_max_side={model_cfg.coarse_max_side}"
             raise ValueError(msg)
         coarse, score = _fit_stage(
-            pool,
+            feed,
             params,
             n_trees=coarse_trees,
             chunk=model_cfg.leaf_chunk,
@@ -340,16 +690,81 @@ def fit_booster(
         )
         models += coarse
     fine, _score = _fit_stage(
-        pool,
+        feed,
         params,
         n_trees=model_cfg.n_trees - coarse_trees,
         chunk=model_cfg.leaf_chunk,
         bits=bits,
         running=score,
         ignored=None,
+        first_tree=coarse_trees,
     )
     models += fine
     return models[0] if len(models) == 1 else sum_models(models)
+
+
+def fit_booster(
+    features: NDArray[np.floating],
+    labels: NDArray[np.bool_] | NDArray[np.integer[Any]],
+    model_cfg: ModelConfig,
+    feature_sides: list[int] | None = None,
+) -> CatBoostClassifier:
+    """Fit the frozen symmetric CatBoost booster and return it.
+
+    Three knobs change how the trees are grown, and they compose:
+
+    * ``quantisation_aware`` fits in chunks against the quantised running score,
+      so the model is trained for the leaf grid the exporter writes;
+    * ``coarse_trees`` grows the first trees on tile-constant features only
+      (``feature_sides`` says which), leaving the rest to the fine stage;
+    * neither set, a single ordinary fit -- unchanged from before.
+    """
+    params = _booster_params(model_cfg)
+    bits = model_cfg.leaf_bits if model_cfg.quantisation_aware else None
+    coarse_trees = model_cfg.coarse_trees if model_cfg.coarse_trees < model_cfg.n_trees else 0
+    n_cells = len(labels)
+    pool = make_pool(features, labels, model_cfg)
+    del features  # the quantised pool is the training set from here on (4 bits per value)
+    if bits is None and not coarse_trees:
+        booster = CatBoostClassifier(iterations=model_cfg.n_trees, **params)
+        booster.fit(pool)
+        return booster
+    return _fit_tiers(_PoolFeed(pool), params, model_cfg, feature_sides, n_cells)
+
+
+def fit_booster_blocks(
+    provider: Callable[[int], tuple[NDArray[np.floating], NDArray[np.bool_]]],
+    n_blocks: int,
+    model_cfg: ModelConfig,
+    feature_sides: list[int] | None = None,
+) -> CatBoostClassifier:
+    """Fit the booster on more cells than fit in memory, one block of them at a time.
+
+    ``provider(b)`` returns the ``(features, labels)`` of block ``b``; it is called once
+    per block, in order, and the block is released before the next one is built, so peak
+    memory is one block (about 2.3x its float32 size while the pool is built) however many
+    blocks there are.  Blocks must be random samples of the same cells, each with both
+    classes: block 0 also fixes the cut points every later block is quantised with.
+
+    This is out-of-core boosting, not the same fit as one pool of every cell: the trees
+    are laid out evenly over the blocks (block ``b`` serves trees ``b * n_trees // n_blocks``
+    on), each chunk is fitted on one block with the score of all earlier trees as its
+    baseline, and a block no chunk starts in is never used (``n_trees`` should be at least
+    ``n_blocks`` chunks of ``leaf_chunk``).  With ``n_blocks == 1`` it is :func:`fit_booster`.
+    """
+    if n_blocks < 1:
+        msg = "n_blocks must be >= 1"
+        raise ValueError(msg)
+    params = _booster_params(model_cfg)
+    with tempfile.TemporaryDirectory() as tmp:
+        feed = _PoolFeed(
+            provider=provider,
+            n_blocks=n_blocks,
+            total_trees=model_cfg.n_trees,
+            model_cfg=model_cfg,
+            borders=Path(tmp) / "borders.tsv",
+        )
+        return _fit_tiers(feed, params, model_cfg, feature_sides, 0)
 
 
 def build_ranking(booster: CatBoostClassifier, feature_names: Sequence[str]) -> dict[str, Any]:

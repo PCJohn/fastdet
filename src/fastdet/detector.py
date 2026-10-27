@@ -12,6 +12,7 @@ import dataclasses
 import json
 import os
 import tempfile
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -36,11 +37,19 @@ from .metrics import pooled_pr_auc, score_validation_per_image
 from .native import NativeScorer, load_scorer
 from .runtime import ImysModel, parse_blob
 from .training import (
+    auto_block_gib,
+    bin_bits,
     calibrate_exit_stages,
     fit_booster,
+    fit_booster_blocks,
+    gpu_free_gib,
+    host_available_gib,
     load_ranking,
+    plan_blocks,
+    resolve_task_type,
     select_columns,
     stage_tree_counts,
+    unused_blocks,
 )
 
 if TYPE_CHECKING:
@@ -215,23 +224,43 @@ class Detector:
         img_ids, local_ids, labels = sample_training_cells(
             train_cache, cfg.train, seed=cfg.model.random_seed
         )
-        design = gather_training_matrix(train_cache, img_ids, local_ids, self.col_keep)
-        gib = design.nbytes / 2**30
+        width = len(self.col_keep) if self.col_keep is not None else train_cache.total_width()
+        gib = len(labels) * width * 4 / 2**30
+        block_gib = self._block_gib()
+        n_blocks = plan_blocks(len(labels), width, block_gib)
+        # how the matrix was fitted travels with the model: blocked boosting is not the same
+        # fit as one pool, and an auto-sized block count depends on the machine
+        self.metrics["train_cells"] = len(labels)
+        self.metrics["train_blocks"] = int(n_blocks)
+        self.metrics["block_gib"] = None if block_gib is None else float(block_gib)
+        kept = self.col_keep if self.col_keep is not None else np.arange(len(self.base_names))
+        sides = [feature_level_bits(self.base_names[int(i)])[0] for i in kept]
         print(
-            f"[fastdet] training matrix: {design.shape[0]:,} cells x {design.shape[1]} features, "
+            f"[fastdet] training matrix: {len(labels):,} cells x {width} features, "
             f"{int(labels.sum()):,} positives, {gib:.1f} GiB as float32 (CatBoost bins every feature into "
             f"border_count={cfg.model.border_count} intervals for training and this copy is then freed; "
             f"leaf values are stored at {cfg.model.leaf_bits} bits)"
         )
-        if gib > _LARGE_MATRIX_GIB:
-            print(
-                f"[fastdet] {gib:.0f} GiB is a large training matrix: neg_pos_ratio or max_train_cells "
-                "(TrainConfig) keep it in RAM, task_type='GPU' (ModelConfig) fits it faster"
+        if n_blocks > 1:
+            self.booster = self._fit_blocks(
+                cache=train_cache,
+                img_ids=img_ids,
+                local_ids=local_ids,
+                labels=labels,
+                n_blocks=n_blocks,
+                sides=sides,
+                auto=cfg.train.block_gib is None,
             )
-        kept = self.col_keep if self.col_keep is not None else np.arange(len(self.base_names))
-        sides = [feature_level_bits(self.base_names[int(i)])[0] for i in kept]
-        self.booster = fit_booster(design, labels, cfg.model, feature_sides=sides)
-        del design
+        else:
+            if gib > _LARGE_MATRIX_GIB:
+                print(
+                    f"[fastdet] {gib:.0f} GiB is a large training matrix: block_gib (fit in blocks, "
+                    "any cell count), neg_pos_ratio or max_train_cells (TrainConfig) keep it in "
+                    "RAM, task_type='GPU' (ModelConfig) fits it faster"
+                )
+            design = gather_training_matrix(train_cache, img_ids, local_ids, self.col_keep)
+            self.booster = fit_booster(design, labels, cfg.model, feature_sides=sides)
+            del design
         self.exit_stages = []
         runtime = self._refresh_runtime()
         if cfg.model.use_exit:
@@ -253,6 +282,88 @@ class Detector:
             self.val_ids = [Path(pair[0]).name for pair in val_pairs]
             print(f"[fastdet] validation pooled PR-AUC = {pr_auc:.4f}")
         return self
+
+    def _block_gib(self) -> float | None:
+        """The block size to fit with: the configured one, or one sized from the free memory.
+
+        ``block_gib=None`` looks at the host RAM (and the GPU's free memory when training on
+        the GPU) as the fit starts, so the cache and anything else already loaded are counted.
+        If neither can be read, the matrix is fitted whole, as before.
+        """
+        setting = self.config.train.block_gib
+        if setting is not None:
+            return setting
+        on_gpu = resolve_task_type(self.config.model.task_type) == "GPU"
+        budget, why = auto_block_gib(
+            host_available_gib(),
+            gpu_free_gib() if on_gpu else None,
+            gpu_bits=bin_bits(self.config.model.border_count),
+        )
+        print(f"[fastdet] block size, auto: {why}")
+        return budget
+
+    def _fit_blocks(  # noqa: PLR0913 -- the sampled cells and the plan travel together
+        self,
+        *,
+        cache: FeatureCache,
+        img_ids: NDArray[np.int32],
+        local_ids: NDArray[np.int64],
+        labels: NDArray[np.bool_],
+        n_blocks: int,
+        sides: list[int],
+        auto: bool,
+    ) -> CatBoostClassifier:
+        """Fit on ``n_blocks`` equal slices of the (already shuffled) sampled cells.
+
+        Every block must hold both classes and be the start of at least one chunk of trees,
+        or the fit is refused: a block no chunk starts in would be gathered for nothing (or,
+        with the layout the trees have, never gathered at all).  ``auto`` says the block
+        count came from the free memory rather than ``block_gib``, for the message.
+        """
+        edges = np.linspace(0, len(labels), n_blocks + 1).astype(np.int64)
+        for b in range(n_blocks):
+            lo, hi = edges[b], edges[b + 1]
+            positives = int(labels[lo:hi].sum())
+            if positives == 0 or positives == hi - lo:
+                msg = (
+                    f"block {b} of {n_blocks} has only one class ({hi - lo:,} cells); "
+                    "raise block_gib so each block holds enough cells of both classes"
+                )
+                raise ValueError(msg)
+        per_block = int(edges[1] - edges[0])
+        width = len(self.col_keep) if self.col_keep is not None else cache.total_width()
+        model = self.config.model
+        skipped = unused_blocks(model, n_blocks)
+        if skipped:
+            how = (
+                f"{model.n_trees} trees in chunks of leaf_chunk={model.leaf_chunk}"
+                if model.quantisation_aware
+                else f"{model.n_trees} trees"
+            )
+            msg = (
+                f"{n_blocks} blocks but {how} start a chunk in only {n_blocks - skipped} of them, "
+                f"so {skipped} block(s) of cells would never be seen: fit more trees or a smaller "
+                "leaf_chunk, sample fewer cells (neg_pos_ratio, max_train_cells), raise block_gib "
+                "(0 = one matrix, whatever it takes)"
+                + (" -- block_gib=None sized the blocks from the free memory" if auto else "")
+            )
+            raise ValueError(msg)
+        print(
+            f"[fastdet] fitting in {n_blocks} blocks of ~{per_block:,} cells "
+            f"(~{per_block * width * 4 / 2**30:.1f} GiB each); trees are spread over the blocks"
+        )
+
+        def provider(b: int) -> tuple[NDArray[np.floating[Any]], NDArray[np.bool_]]:
+            sel = slice(int(edges[b]), int(edges[b + 1]))
+            start = time.time()
+            design = gather_training_matrix(cache, img_ids[sel], local_ids[sel], self.col_keep)
+            print(
+                f"  [train] block {b + 1}/{n_blocks}: gathered {design.shape[0]:,} cells "
+                f"({time.time() - start:.1f}s)"
+            )
+            return design, labels[sel]
+
+        return fit_booster_blocks(provider, n_blocks, self.config.model, feature_sides=sides)
 
     def _calibrate_exit(self, runtime: ImysModel, cache: FeatureCache) -> list[tuple[int, float]]:
         """Stage thresholds from the training images (see :func:`calibrate_exit_stages`)."""

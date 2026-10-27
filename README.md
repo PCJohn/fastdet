@@ -613,12 +613,30 @@ the knobs that matter:
   its own storage (+1.0× the matrix, 6 s), the quantisation adds 0.30×, and CatBoost keeps
   the matrix for as long as the pool lives, so a fit peaks at about **2.3× the float
   matrix** and holds 1.3× for the rest of the fit (1 M cells × 1178 columns: 4.4 GiB of
-  matrix, about 10 GiB at the peak). `fit()` prints the matrix size; above 8 GiB it also
-  prints the knobs below. A "CatBoost is using more CPU RAM than the limit" warning means
+  matrix, about 10 GiB at the peak). `fit()` prints the matrix size; when it fits a matrix
+  above 8 GiB whole it also prints the knobs below. A "CatBoost is using more CPU RAM than the limit" warning means
   the machine is swapping: shrink the matrix. Nothing touches the GPU until that CPU-side
   quantisation is done, which takes minutes for a matrix of tens of GiB.
   ([docs/OPTIMIZATION.md](docs/OPTIMIZATION.md) has the measurements and the Fortran-order
   layout that would halve the peak.)
+* **Blocks** (`TrainConfig.block_gib`, `--block-gib`): any number of cells fits. The matrix
+  is fitted in equal random blocks of at most `block_gib` GiB, one in memory at a time, with
+  the trees spread over them (peak RAM is about 2.3x one block, whatever the cell count, so
+  `neg_pos_ratio=None, max_train_cells=None` -- every cell -- fits). The default (`None`)
+  sizes the blocks from the memory that is free when the fit starts, after the feature cache
+  is built: 80% of the host RAM the OS reports available (under a container's cgroup limit
+  when there is one) divided by the 2.3x peak, and, when training on the GPU, 40% of the
+  card's free memory for the quantised pool (`bin_bits(border_count)` bits a value, 4 at the
+  default 15); the tighter bound wins, a matrix that fits is fitted whole, as before, and
+  `fit()` prints how it decided. `0` never blocks (one matrix, however large); a number sets
+  the block size in GiB. It is out-of-core boosting, not the same fit as one pool of every
+  cell: each chunk of `leaf_chunk` trees is fitted on one block with the score of every
+  earlier tree as its baseline, every block is quantised with the cut points of the first,
+  and a block that no chunk starts in would never be seen, so `fit()` refuses a block count
+  the trees cannot cover (more trees, a smaller `leaf_chunk`, fewer cells or a larger block
+  fix it). The exported model records `train_cells`, `train_blocks` and the `block_gib` it
+  was fitted with, since an auto-sized fit depends on the machine; compare PR-AUC against a
+  one-matrix (`block_gib=0`) run before relying on it.
 * **Fewer cells** (`TrainConfig`): `neg_pos_ratio=3` keeps three negatives per
   positive (about a quarter of the cells at a 7% positive rate), `max_train_cells`
   caps the total; both are sweepable (`fastdet-tune --neg-pos-ratio none,3,5`), and
@@ -696,6 +714,7 @@ them with their current defaults). The ones worth sweeping:
 | `--val-frac`, `--split-seed`, `--max-hamming` | 0.15, 42, 8 | held-out share of near-duplicate groups, the split seed, the perceptual-hash distance that makes two images a group |
 | `--neg-pos-ratio` | 5 | negatives kept per positive in the training sample (`none` keeps all); rebalances the classes by discarding negatives, which shifts the probability scale (use `thr*`) |
 | `--max-train-cells` | 1,000,000 | cap on sampled training cells (RAM: ~4.4 GiB per million cells as float32 before quantisation) |
+| `--block-gib` | none (auto) | out-of-core fit: largest float32 block of cells in memory at once, in GiB; `none` sizes it from the free host (and GPU) memory when the fit starts, `0` never blocks (see Training time and memory) |
 
 ### Trends on an OCR dataset (1,925 images, 6.8% positive cells)
 
