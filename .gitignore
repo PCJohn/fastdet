@@ -13,3 +13,7 @@ dist/
 *.exe
 *.obj
 .phash_cache.json
+
+# local datasets and sweep outputs; never check in
+/data/
+/tune_report/
