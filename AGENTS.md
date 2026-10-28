@@ -135,8 +135,10 @@ For every task:
 
 **Do this when I say "optimize"**
 - Run linters with max strictness and verbose mode. Incorporate all feedback. Use (1) cppcheck, clang-tidy, clang-format for C/C++ (2) Ruff, MyPy for Python (3) ESLint for Javascript and (4) Clippy for Rust.
-- Run profilers to identify bottlenecks and potential system optimizations. Use (1) Valgrind for C/C++/Rust (2) py-spy and cProfile for Python (3) Node.js profiler for Javascript. Use the reports to identify "lossless" optimizations. These might be algorithmic (like using a different data structure) or systems (like better memory management). Each of these should improve some aspect of program while guaranteeing overall program behaviour does not change (or changes very mildly, within tolerance).
+- Run profilers to identify bottlenecks and potential system optimizations. Use (1) Valgrind for C/C++/Rust (2) py-spy and cProfile for Python (3) Node.js profiler for Javascript. Use the reports to identify "lossless" optimizations. These might be algorithmic (like using a different data structure, really good approximation, etc.) or systems (like better memory management, etc.). Each of these should improve some aspect of program while guaranteeing overall program behaviour does not change (or changes very mildly, within tolerance).
 - Maintain OPTIMIZATIONS.md as a log to record your optimization ideas, what worked, what did not work and suggestions to users for efficient use.
+- All CPU code **must** be cross-platform. Everything should run on Windows, Linux, Mac, Android, iPhone, Raspberry Pi, etc. out-of-the-box. Raw performance numbers might vary across machines, but this means your optimizations must improve the core algorithm, not hack their way to somehow boost efficiency numbers on the current hardware.
+- GPU code should be as generic as possible for portability, but can have some GPU-specific parts for now.
 
 ---
 
